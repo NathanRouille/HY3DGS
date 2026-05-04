@@ -19,6 +19,7 @@ from typing import Union, List
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import yaml
 
 from .attention_blocks import FourierEmbedder, Transformer, CrossAttentionDecoder, PointCrossAttentionEncoder
@@ -296,3 +297,240 @@ class ShapeVAE(VectsetVAE):
         latents = self.post_kl(latents)
         latents = self.transformer(latents)
         return latents
+
+
+# ---------------------------------------------------------------------------
+# Point Cloud → 3D Gaussian Splatting Autoencoder
+# ---------------------------------------------------------------------------
+
+class ShapeGSAE(nn.Module):
+    """Deterministic autoencoder: colored point cloud → 3D Gaussian Splatting.
+
+    Input surface tensor layout: [B, N, 9] = xyz(0:3) | normals(3:6) | rgb(6:9).
+    The first pc_size rows are uniform samples; the next pc_sharpedge_size rows
+    are sharp-edge samples (same convention as SharpEdgeSurfaceLoader).
+
+    Output: a tuple (means, scales, rotations, opacities, colors) where each
+    element is a per-Gaussian parameter tensor of shape [B, num_latents, C].
+    """
+
+    @classmethod
+    @synchronize_timer('ShapeGSAE Model Loading')
+    def from_single_file(
+        cls,
+        ckpt_path,
+        config_path,
+        device='cuda',
+        dtype=torch.float32,
+        use_safetensors=None,
+        **kwargs,
+    ):
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+
+        if use_safetensors:
+            ckpt_path = ckpt_path.replace('.ckpt', '.safetensors')
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"Model file {ckpt_path} not found")
+
+        logger.info(f"Loading ShapeGSAE from {ckpt_path}")
+        if use_safetensors:
+            import safetensors.torch
+            ckpt = safetensors.torch.load_file(ckpt_path, device='cpu')
+        else:
+            ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)
+
+        model_kwargs = config.get('params', config)
+        model_kwargs.update(kwargs)
+        model = cls(**model_kwargs)
+        model.load_state_dict(ckpt, strict=False)
+        model.to(device=device, dtype=dtype)
+        return model
+
+    def __init__(
+        self,
+        *,
+        num_latents: int,
+        embed_dim: int,
+        width: int,
+        heads: int,
+        num_decoder_layers: int,
+        num_encoder_layers: int = 8,
+        pc_size: int = 5120,
+        pc_sharpedge_size: int = 5120,
+        point_feats: int = 6,       # normals(3) + rgb(3)
+        downsample_ratio: int = 20,
+        num_freqs: int = 8,
+        include_pi: bool = True,
+        qkv_bias: bool = True,
+        qk_norm: bool = False,
+        drop_path_rate: float = 0.0,
+        use_ln_post: bool = True,
+        scale_factor: float = 1.0,
+        ckpt_path=None,
+    ):
+        super().__init__()
+
+        self.num_latents = num_latents
+        self.embed_dim = embed_dim
+        self.scale_factor = scale_factor
+        self.latent_shape = (num_latents, embed_dim)
+
+        self.fourier_embedder = FourierEmbedder(num_freqs=num_freqs, include_pi=include_pi)
+
+        self.encoder = PointCrossAttentionEncoder(
+            fourier_embedder=self.fourier_embedder,
+            num_latents=num_latents,
+            downsample_ratio=downsample_ratio,
+            pc_size=pc_size,
+            pc_sharpedge_size=pc_sharpedge_size,
+            point_feats=point_feats,
+            width=width,
+            heads=heads,
+            layers=num_encoder_layers,
+            qkv_bias=qkv_bias,
+            use_ln_post=use_ln_post,
+            qk_norm=qk_norm,
+        )
+
+        # Deterministic bottleneck (no KL, no sampling)
+        self.bottleneck_down = nn.Linear(width, embed_dim)
+        self.bottleneck_up = nn.Linear(embed_dim, width)
+
+        self.transformer = Transformer(
+            n_ctx=num_latents,
+            width=width,
+            layers=num_decoder_layers,
+            heads=heads,
+            qkv_bias=qkv_bias,
+            qk_norm=qk_norm,
+            drop_path_rate=drop_path_rate,
+        )
+
+        # 3DGS parameter head: 3 (pos delta) + 3 (log-scale) + 4 (quaternion) + 1 (opacity) + 3 (RGB) = 14
+        self.gs_head = nn.Linear(width, 14)
+
+        # Initialise GS head so opacities start near 0.5 and scales start small
+        nn.init.zeros_(self.gs_head.weight)
+        nn.init.zeros_(self.gs_head.bias)
+        # Slight positive bias on opacity logit → sigmoid ≈ 0.6 at init
+        self.gs_head.bias.data[10] = 0.4
+        # Negative bias on log-scale → small Gaussians at init
+        self.gs_head.bias.data[3:6] = -3.0
+
+        if ckpt_path is not None:
+            self._init_from_ckpt(ckpt_path)
+
+    def _init_from_ckpt(self, path, ignore_keys=()):
+        state_dict = torch.load(path, map_location='cpu')
+        state_dict = state_dict.get('state_dict', state_dict)
+        for k in list(state_dict.keys()):
+            if any(k.startswith(ik) for ik in ignore_keys):
+                del state_dict[k]
+        missing, unexpected = self.load_state_dict(state_dict, strict=False)
+        logger.info(
+            f"Restored from {path} — {len(missing)} missing, {len(unexpected)} unexpected keys"
+        )
+
+    # ------------------------------------------------------------------
+    # Core forward methods
+    # ------------------------------------------------------------------
+
+    def encode(self, surface: torch.FloatTensor):
+        """Encode a colored surface point cloud to compact latents.
+
+        Args:
+            surface: [B, N, 9]  xyz | normals | rgb
+
+        Returns:
+            latents        : [B, num_latents, embed_dim]
+            query_positions: [B, num_latents, 3]  FPS anchor XYZ coordinates
+        """
+        pc = surface[:, :, :3]
+        feats = surface[:, :, 3:]           # normals(3) + rgb(3) = 6 channels
+        latents, pc_infos = self.encoder(pc, feats)
+        query_positions = pc_infos[0]       # concatenated random + sharpedge FPS queries
+        latents = self.bottleneck_down(latents)
+        return latents, query_positions
+
+    def decode(
+        self,
+        latents: torch.FloatTensor,
+        query_positions: torch.FloatTensor,
+    ):
+        """Decode compact latents + FPS anchors into 3DGS parameters.
+
+        Args:
+            latents        : [B, num_latents, embed_dim]
+            query_positions: [B, num_latents, 3]
+
+        Returns:
+            means     : [B, num_latents, 3]
+            scales    : [B, num_latents, 3]  (always positive)
+            rotations : [B, num_latents, 4]  (unit quaternion, wxyz)
+            opacities : [B, num_latents, 1]  (in [0, 1])
+            colors    : [B, num_latents, 3]  (RGB in [0, 1])
+        """
+        latents = self.bottleneck_up(latents)
+        latents = self.transformer(latents)
+        raw = self.gs_head(latents)
+        return self._parse_gaussians(raw, query_positions)
+
+    def _parse_gaussians(self, raw: torch.FloatTensor, query_positions: torch.FloatTensor):
+        """Apply per-parameter activations and anchor means to FPS positions."""
+        means = query_positions + raw[..., :3]
+        # exp(clamp) keeps scales in (e^-5, e^2) ≈ (0.007, 7.4)
+        scales = torch.exp(raw[..., 3:6].clamp(-5.0, 2.0))
+        rotations = F.normalize(raw[..., 6:10], dim=-1)
+        opacities = torch.sigmoid(raw[..., 10:11])
+        colors = torch.sigmoid(raw[..., 11:14])
+        return means, scales, rotations, opacities, colors
+
+    def forward(self, surface: torch.FloatTensor):
+        """Full encode → decode pass.
+
+        Args:
+            surface: [B, N, 9]
+
+        Returns:
+            (means, scales, rotations, opacities, colors)
+        """
+        latents, query_positions = self.encode(surface)
+        return self.decode(latents, query_positions)
+
+    # ------------------------------------------------------------------
+    # Warm-start from a ShapeVAE geometry-only checkpoint
+    # ------------------------------------------------------------------
+
+    def load_shapevae_encoder(self, shapevae_ckpt_path: str, zero_pad_rgb: bool = True):
+        """Partially initialise the encoder from a ShapeVAE checkpoint.
+
+        The geometry encoder (FourierEmbedder, cross-attention, self-attention)
+        transfers directly.  The input_proj weight is zero-padded to accommodate
+        the extra RGB channels (last 3 columns of the weight matrix set to 0).
+
+        Args:
+            shapevae_ckpt_path: path to the .ckpt or .safetensors file.
+            zero_pad_rgb      : if True, zero-initialise the new RGB input columns
+                                in encoder.input_proj; otherwise skip that weight.
+        """
+        ckpt = torch.load(shapevae_ckpt_path, map_location='cpu', weights_only=True)
+        ckpt = ckpt.get('state_dict', ckpt)
+
+        # Isolate encoder weights
+        enc_prefix = 'encoder.'
+        enc_ckpt = {k[len(enc_prefix):]: v for k, v in ckpt.items() if k.startswith(enc_prefix)}
+
+        # Handle input_proj weight dimension mismatch (point_feats changed)
+        ip_key = 'input_proj.weight'
+        if ip_key in enc_ckpt and zero_pad_rgb:
+            old_w = enc_ckpt[ip_key]          # (width, fourier_dim + old_point_feats)
+            new_w = self.encoder.input_proj.weight.data.clone()
+            cols = min(old_w.shape[1], new_w.shape[1])
+            new_w[:, :cols] = old_w[:, :cols]
+            enc_ckpt[ip_key] = new_w
+
+        missing, unexpected = self.encoder.load_state_dict(enc_ckpt, strict=False)
+        logger.info(
+            f"Loaded ShapeVAE encoder — {len(missing)} missing, {len(unexpected)} unexpected"
+        )

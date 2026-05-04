@@ -12,6 +12,9 @@
 # fine-tuning enabling code and other elements of the foregoing made publicly available
 # by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
 
-from .pipelines import Hunyuan3DDiTPipeline, Hunyuan3DDiTFlowMatchingPipeline
-from .postprocessors import FaceReducer, FloaterRemover, DegenerateFaceRemover, MeshSimplifier
 from .preprocessors import ImageProcessorV2, IMAGE_PROCESSORS, DEFAULT_IMAGEPROCESSOR
+from .surface_loaders import (
+    RGBSharpEdgeSurfaceLoader,
+    SharpEdgeSurfaceLoader,
+    SurfaceLoader,
+)
