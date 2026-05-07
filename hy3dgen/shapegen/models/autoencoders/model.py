@@ -148,13 +148,13 @@ class VectsetVAE(nn.Module):
         for k in keys:
             for ik in ignore_keys:
                 if k.startswith(ik):
-                    print("Deleting key {} from state_dict.".format(k))
+                    logger.info(f"Deleting key {k} from state_dict.")
                     del state_dict[k]
         missing, unexpected = self.load_state_dict(state_dict, strict=False)
-        print(f"Restored from {path} with {len(missing)} missing and {len(unexpected)} unexpected keys")
+        logger.info(f"Restored from {path} with {len(missing)} missing and {len(unexpected)} unexpected keys")
         if len(missing) > 0:
-            print(f"Missing Keys: {missing}")
-            print(f"Unexpected Keys: {unexpected}")
+            logger.warning(f"Missing Keys: {missing}")
+            logger.warning(f"Unexpected Keys: {unexpected}")
 
     def __init__(
         self,
@@ -373,7 +373,7 @@ class ShapeGSAE(nn.Module):
 
         self.num_latents = num_latents
         self.embed_dim = embed_dim
-        self.scale_factor = scale_factor
+        self.scale_factor = scale_factor  # kept for config/checkpoint compat; not used in forward
         self.latent_shape = (num_latents, embed_dim)
 
         self.fourier_embedder = FourierEmbedder(num_freqs=num_freqs, include_pi=include_pi)
@@ -417,6 +417,8 @@ class ShapeGSAE(nn.Module):
         self.gs_head.bias.data[10] = 0.4
         # Negative bias on log-scale → small Gaussians at init
         self.gs_head.bias.data[3:6] = -3.0
+        # Identity quaternion (w=1, x=y=z=0) to avoid zero-norm rotations at init.
+        self.gs_head.bias.data[6] = 1.0
 
         if ckpt_path is not None:
             self._init_from_ckpt(ckpt_path)
@@ -481,7 +483,11 @@ class ShapeGSAE(nn.Module):
         means = query_positions + raw[..., :3]
         # exp(clamp) keeps scales in (e^-5, e^2) ≈ (0.007, 7.4)
         scales = torch.exp(raw[..., 3:6].clamp(-5.0, 2.0))
-        rotations = F.normalize(raw[..., 6:10], dim=-1)
+        quat_raw = raw[..., 6:10]
+        quat_norm = quat_raw.norm(dim=-1, keepdim=True)
+        quat_identity = torch.zeros_like(quat_raw)
+        quat_identity[..., 0] = 1.0
+        rotations = torch.where(quat_norm > 1e-8, quat_raw / quat_norm, quat_identity)
         opacities = torch.sigmoid(raw[..., 10:11])
         colors = torch.sigmoid(raw[..., 11:14])
         return means, scales, rotations, opacities, colors

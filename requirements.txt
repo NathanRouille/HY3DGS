@@ -5,12 +5,12 @@ diffusers
 einops
 opencv-python
 numpy
-torch
+#torch
 transformers
-torchvision
+#torchvision
 
 # 3DGS training
-gsplat
+#gsplat
 pyrender
 #taming-transformers-rom1504
 #ConfigArgParse

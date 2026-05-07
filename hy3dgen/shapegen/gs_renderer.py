@@ -13,12 +13,11 @@ Camera convention used throughout:
 from __future__ import annotations
 
 import math
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 
 # ---------------------------------------------------------------------------
 # SSIM (lightweight, no external dependency)
@@ -182,23 +181,6 @@ class GaussianRenderer(nn.Module):
         self.cx = cx
         self.cy = cy
 
-    def _build_proj_matrix(self, device, dtype):
-        fx, fy = self.fx, self.fy
-        cx, cy = self.cx, self.cy
-        H, W = self.height, self.width
-        n, f = self.near, self.far
-
-        # OpenGL-style projection for gsplat (NDC z in [-1,1])
-        proj = torch.zeros(4, 4, device=device, dtype=dtype)
-        proj[0, 0] = 2 * fx / W
-        proj[1, 1] = 2 * fy / H
-        proj[0, 2] = 1 - 2 * cx / W
-        proj[1, 2] = 2 * cy / H - 1
-        proj[2, 2] = -(f + n) / (f - n)
-        proj[2, 3] = -2 * f * n / (f - n)
-        proj[3, 2] = -1.0
-        return proj
-
     def forward(
         self,
         means: torch.Tensor,        # (N, 3)
@@ -224,21 +206,26 @@ class GaussianRenderer(nn.Module):
             ) from e
 
         device, dtype = means.device, means.dtype
+        # gsplat expects a world-to-camera matrix in OpenCV-like camera coordinates.
+        # Our orbit/pyrender poses are OpenGL-style c2w, so convert GL->CV first.
+        gl_to_cv = torch.tensor(
+            [[1.0, 0.0, 0.0, 0.0],
+             [0.0, -1.0, 0.0, 0.0],
+             [0.0, 0.0, -1.0, 0.0],
+             [0.0, 0.0, 0.0, 1.0]],
+            device=device,
+            dtype=dtype,
+        )
+        c2w_cv = c2w.to(dtype) @ gl_to_cv
+        viewmat = torch.linalg.inv(c2w_cv).unsqueeze(0)  # (1, 4, 4)
 
-        # World-to-camera: invert c2w
-        w2c = torch.inverse(c2w.to(dtype))   # (4, 4)
-        viewmat = w2c.unsqueeze(0)            # (1, 4, 4)
-
-        proj = self._build_proj_matrix(device, dtype).unsqueeze(0)  # (1, 4, 4)
-
-        # gsplat expects (C, N, ...) where C = number of cameras
-        N = means.shape[0]
-        means_ = means.unsqueeze(0)        # (1, N, 3)
-        scales_ = scales.unsqueeze(0)      # (1, N, 3)
-        quats_ = rotations.unsqueeze(0)    # (1, N, 4)
-        opacs_ = opacities.squeeze(-1).unsqueeze(0)   # (1, N)
-        colors_ = colors.unsqueeze(0)      # (1, N, 3)
-
+        # Keep gaussian tensors unbatched: (N, ...)
+        # gsplat treats camera count via viewmats/Ks, not via gaussian leading dim.
+        means_ = means                      # (N, 3)
+        scales_ = scales                    # (N, 3)
+        quats_ = rotations                  # (N, 4)
+        opacs_ = opacities.squeeze(-1)      # (N,)
+        colors_ = colors                    # (N, 3)
         renders, alphas, meta = rasterization(
             means=means_,
             quats=quats_,
@@ -255,6 +242,7 @@ class GaussianRenderer(nn.Module):
             near_plane=self.near,
             far_plane=self.far,
             backgrounds=self.bg.unsqueeze(0).to(dtype),
+            packed=False,
             render_mode='RGB+D' if self.render_depth else 'RGB',
         )
 
@@ -279,32 +267,53 @@ class GaussianRenderer(nn.Module):
 class RGBDLoss(nn.Module):
     """Multi-view RGBD reconstruction loss for 3DGS.
 
-    Loss = L1(rgb) + lambda_ssim*(1-SSIM(rgb)) + lambda_d*L1(depth)[valid]
-         + lambda_scale * mean(log_scale)
-         + lambda_opa * mean(-log(opacity + eps))
+    Loss = fg_weight*L1(rgb)[fg] + (1-fg_weight)*L1(rgb)[bg]
+         + lambda_ssim*(1-SSIM(rgb, foreground-masked))
+         + lambda_d*L1(depth)[valid]       (skipped if valid_ratio < min_valid_ratio)
+         + lambda_alpha*(1-pred_alpha)^2   (on foreground pixels; prevents collapse)
+         + lambda_scale * (log_scale - target_log_scale)^2
+         + lambda_opa   * (opacity    - target_opacity)^2
+
+    SSIM is computed with background pixels replaced by GT background in the
+    prediction, so the network receives no SSIM gradient from background regions.
 
     Args:
-        lambda_ssim  : weight for SSIM term (default 0.2).
-        lambda_d     : weight for depth L1 term (default 0.5).
-        lambda_scale : regulariser on log-scale (default 0.01).
-        lambda_opa   : regulariser pulling opacities away from 0 (default 0.01).
-        eps          : numerical epsilon for opacity log (default 1e-6).
+        lambda_ssim       : weight for SSIM term (default 0.2).
+        lambda_d          : weight for depth L1 term (default 1.0).
+        lambda_alpha      : weight for alpha supervision on fg pixels (default 0.05).
+                            Creates a direct gradient signal preventing opacity collapse.
+        lambda_scale      : regulariser on log-scale (default 0.01).
+        lambda_opa        : regulariser pulling opacities toward target (default 0.01).
+        target_log_scale  : target for log-scale regulariser (default -3.0, scale≈0.05).
+        target_opacity    : target for opacity regulariser (default 0.5).
+        fg_weight         : fraction of RGB L1 allocated to foreground pixels (default 0.75).
+                            Ensures the model focuses on object appearance, not background.
+        min_valid_ratio   : if foreground pixel fraction falls below this, the depth
+                            loss is disabled for that view (degenerate camera / bad mesh).
     """
 
     def __init__(
         self,
         lambda_ssim: float = 0.2,
-        lambda_d: float = 0.5,
+        lambda_d: float = 1.0,
+        lambda_alpha: float = 0.05,
         lambda_scale: float = 0.01,
         lambda_opa: float = 0.01,
-        eps: float = 1e-6,
+        target_log_scale: float = -3.0,
+        target_opacity: float = 0.5,
+        fg_weight: float = 0.75,
+        min_valid_ratio: float = 0.02,
     ):
         super().__init__()
         self.lambda_ssim = lambda_ssim
         self.lambda_d = lambda_d
+        self.lambda_alpha = lambda_alpha
         self.lambda_scale = lambda_scale
         self.lambda_opa = lambda_opa
-        self.eps = eps
+        self.target_log_scale = target_log_scale
+        self.target_opacity = target_opacity
+        self.fg_weight = fg_weight
+        self.min_valid_ratio = min_valid_ratio
 
     def forward(
         self,
@@ -312,8 +321,9 @@ class RGBDLoss(nn.Module):
         gt_rgb: torch.Tensor,
         pred_depth: torch.Tensor,       # (H, W, 1) or (B, H, W, 1)
         gt_depth: torch.Tensor,
+        pred_alpha: Optional[torch.Tensor] = None,  # same spatial shape as depth, float [0,1]
         valid_mask: Optional[torch.Tensor] = None,  # same shape as depth, bool
-        scales: Optional[torch.Tensor] = None,      # (N, 3) or (B, N, 3)
+        scales: Optional[torch.Tensor] = None,      # (N, 3) or (B, N, 3) log-scales
         opacities: Optional[torch.Tensor] = None,   # (N, 1) or (B, N, 1)
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Compute combined loss and return (total, component_dict)."""
@@ -326,41 +336,84 @@ class RGBDLoss(nn.Module):
             gt_depth = gt_depth.unsqueeze(0)
             if valid_mask is not None:
                 valid_mask = valid_mask.unsqueeze(0)
+            if pred_alpha is not None:
+                pred_alpha = pred_alpha.unsqueeze(0)
 
-        # Permute (B, H, W, C) → (B, C, H, W)
-        pred_rgb_nchw = pred_rgb.permute(0, 3, 1, 2).contiguous()
-        gt_rgb_nchw = gt_rgb.permute(0, 3, 1, 2).contiguous()
-
-        # ---- RGB losses ----
-        loss_l1 = F.l1_loss(pred_rgb_nchw, gt_rgb_nchw)
-        loss_ssim = 1.0 - _ssim(pred_rgb_nchw, gt_rgb_nchw)
-
-        # ---- Depth loss ----
         if valid_mask is None:
             valid_mask = gt_depth > 0
-        depth_l1 = F.l1_loss(pred_depth[valid_mask], gt_depth[valid_mask])
-        loss_depth = depth_l1 if valid_mask.any() else pred_depth.new_zeros(1).squeeze()
+
+        valid_ratio = float(valid_mask.float().mean().item())
+
+        # ---- Foreground-weighted RGB L1 ----
+        # Use a pixel-wise weight map so the gradient scale is preserved
+        # regardless of what fraction of pixels are foreground.
+        # Weight is normalised so mean(weight) == 1 (same total magnitude as unweighted L1).
+        fg_float = valid_mask.float().expand_as(pred_rgb)  # (B, H, W, 3)
+        weight = fg_float * self.fg_weight + (1.0 - fg_float) * (1.0 - self.fg_weight)
+        n_fg_px = fg_float.sum()
+        n_bg_px = (1.0 - fg_float).sum()
+        if n_fg_px > 0 and n_bg_px > 0:
+            per_px_l1 = (pred_rgb - gt_rgb).abs()
+            loss_l1 = (per_px_l1 * weight).sum() / weight.sum()
+            l1_fg = per_px_l1[fg_float.bool()].mean().detach()
+            l1_bg = per_px_l1[~fg_float.bool()].mean().detach()
+        else:
+            loss_l1 = F.l1_loss(pred_rgb, gt_rgb)
+            l1_fg = loss_l1.detach()
+            l1_bg = loss_l1.detach()
+
+        # ---- SSIM (masked to foreground) ----
+        # Replace background pixels in the prediction with the GT background value.
+        # This zeroes out SSIM gradients from background regions so the network only
+        # receives structural similarity feedback on the actual object pixels.
+        fg_mask_hw1 = valid_mask.float()                             # (B, H, W, 1)
+        pred_rgb_fg = pred_rgb * fg_mask_hw1 + gt_rgb * (1.0 - fg_mask_hw1)
+        pred_rgb_nchw = pred_rgb_fg.permute(0, 3, 1, 2).contiguous()
+        gt_rgb_nchw = gt_rgb.permute(0, 3, 1, 2).contiguous()
+        loss_ssim = 1.0 - _ssim(pred_rgb_nchw, gt_rgb_nchw)
+
+        # ---- Depth loss (skipped for degenerate views) ----
+        if valid_ratio >= self.min_valid_ratio:
+            depth_l1 = F.l1_loss(pred_depth[valid_mask], gt_depth[valid_mask])
+            loss_depth = depth_l1
+        else:
+            loss_depth = pred_depth.new_zeros(())
+
+        # ---- Alpha supervision on foreground pixels ----
+        # Directly penalizes empty renders where the GT mesh is present.
+        # This is the key signal that prevents opacity collapse.
+        if pred_alpha is not None and valid_mask.any() and self.lambda_alpha > 0:
+            fg_alpha_mask = valid_mask  # (B, H, W, 1)
+            loss_alpha = ((1.0 - pred_alpha[fg_alpha_mask]) ** 2).mean()
+        else:
+            loss_alpha = pred_rgb.new_zeros(())
 
         # ---- Regularisers ----
-        loss_scale = scales.mean() if scales is not None else pred_rgb.new_zeros(1).squeeze()
-        loss_opa = (-torch.log(opacities + self.eps)).mean() if opacities is not None \
-            else pred_rgb.new_zeros(1).squeeze()
+        loss_scale = ((scales - self.target_log_scale) ** 2).mean() if scales is not None \
+            else pred_rgb.new_zeros(())
+        loss_opa = ((opacities - self.target_opacity) ** 2).mean() if opacities is not None \
+            else pred_rgb.new_zeros(())
 
         total = (
             loss_l1
             + self.lambda_ssim * loss_ssim
             + self.lambda_d * loss_depth
+            + self.lambda_alpha * loss_alpha
             + self.lambda_scale * loss_scale
             + self.lambda_opa * loss_opa
         )
 
         components = {
             'l1': loss_l1,
+            'l1_fg': l1_fg.detach() if torch.is_tensor(l1_fg) else pred_rgb.new_zeros(()),
+            'l1_bg': l1_bg.detach() if torch.is_tensor(l1_bg) else pred_rgb.new_zeros(()),
             'ssim': loss_ssim,
             'depth': loss_depth,
+            'alpha_sup': loss_alpha,
             'scale_reg': loss_scale,
             'opa_reg': loss_opa,
             'total': total,
+            'valid_ratio': pred_rgb.new_tensor(valid_ratio),
         }
         return total, components
 
@@ -374,7 +427,21 @@ def build_orbit_cameras(
     elevation_deg: float = 20.0,
     radius: float = 2.5,
     device: str = 'cpu',
+    azimuths_deg: Optional[List[float]] = None,
 ) -> list:
-    """Return a list of (4, 4) camera-to-world matrices evenly spaced in azimuth."""
-    azimuths = [360.0 * i / num_views for i in range(num_views)]
-    return [orbit_c2w(elevation_deg, az, radius=radius, device=device) for az in azimuths]
+    """Return a list of (4, 4) camera-to-world matrices.
+
+    If ``azimuths_deg`` is provided it must have exactly ``num_views`` entries;
+    otherwise views are evenly spaced starting at azimuth 0.
+
+    NOTE: The default even-spacing places a camera at azimuth=180° for 2 views,
+    which is the exact rear of most Objaverse objects (no visible geometry).
+    For 2-view training pass ``azimuths_deg=[0.0, 90.0]`` (front + right side).
+    """
+    if azimuths_deg is None:
+        azimuths_deg = [360.0 * i / num_views for i in range(num_views)]
+    if len(azimuths_deg) != num_views:
+        raise ValueError(
+            f"azimuths_deg has {len(azimuths_deg)} entries but num_views={num_views}"
+        )
+    return [orbit_c2w(elevation_deg, az, radius=radius, device=device) for az in azimuths_deg]

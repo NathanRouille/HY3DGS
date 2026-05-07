@@ -26,6 +26,7 @@ from ...utils import logger
 
 scaled_dot_product_attention = nn.functional.scaled_dot_product_attention
 
+
 if os.environ.get('USE_SAGEATTN', '0') == '1':
     try:
         from sageattention import sageattn
@@ -537,11 +538,9 @@ class PointCrossAttentionEncoder(nn.Module):
         self.normal_pe = normal_pe
 
         if pc_sharpedge_size == 0:
-            print(
-                f'PointCrossAttentionEncoder INFO: pc_sharpedge_size is not given, using pc_size as pc_sharpedge_size')
+            logger.info('PointCrossAttentionEncoder: pc_sharpedge_size=0, using pc_size for both splits')
         else:
-            print(
-                f'PointCrossAttentionEncoder INFO: pc_sharpedge_size is given, using pc_size={pc_size}, pc_sharpedge_size={pc_sharpedge_size}')
+            logger.info(f'PointCrossAttentionEncoder: pc_size={pc_size}, pc_sharpedge_size={pc_sharpedge_size}')
 
         self.pc_size = pc_size
         self.pc_sharpedge_size = pc_sharpedge_size
@@ -590,7 +589,7 @@ class PointCrossAttentionEncoder(nn.Module):
                    1] <= self.pc_sharpedge_size, "Sharpedge surface points size must be less than or equal to pc_sharpedge_size"
 
         # Randomly select random surface points and random query points
-        input_random_pc_size = int(num_random_query * self.downsample_ratio)
+        input_random_pc_size = min(int(num_random_query * self.downsample_ratio), random_pc.shape[1])
         random_query_ratio = num_random_query / input_random_pc_size
         idx_random_pc = torch.randperm(random_pc.shape[1], device=random_pc.device)[:input_random_pc_size]
         input_random_pc = random_pc[:, idx_random_pc, :]
@@ -607,6 +606,7 @@ class PointCrossAttentionEncoder(nn.Module):
             input_sharpedge_pc = torch.zeros(B, 0, D, dtype=input_random_pc.dtype).to(pc.device)
             query_sharpedge_pc = torch.zeros(B, 0, D, dtype=query_random_pc.dtype).to(pc.device)
         else:
+            input_sharpedge_pc_size = min(input_sharpedge_pc_size, sharpedge_pc.shape[1])
             sharpedge_query_ratio = num_sharpedge_query / input_sharpedge_pc_size
             idx_sharpedge_pc = torch.randperm(sharpedge_pc.shape[1], device=sharpedge_pc.device)[
                                :input_sharpedge_pc_size]
@@ -665,7 +665,6 @@ class PointCrossAttentionEncoder(nn.Module):
         if input_sharpedge_pc_size == 0:
             query_sharpedge_pc = torch.zeros(B, 1, D).to(pc.device)
             input_sharpedge_pc = torch.zeros(B, 1, D).to(pc.device)
-
         return query.view(B, -1, query.shape[-1]), data.view(B, -1, data.shape[-1]), [query_pc, input_pc,
                                                                                       query_random_pc, input_random_pc,
                                                                                       query_sharpedge_pc,

@@ -22,26 +22,118 @@ import os
 import random
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 import trimesh
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 from hy3dgen.shapegen.models.autoencoders.model import ShapeGSAE
-from hy3dgen.shapegen.surface_loaders import RGBSharpEdgeSurfaceLoader
+from hy3dgen.shapegen.surface_loaders import RGBSharpEdgeSurfaceLoader, normalize_mesh
 from hy3dgen.shapegen.gs_renderer import (
     GaussianRenderer,
     RGBDLoss,
     build_orbit_cameras,
     orbit_c2w,
+    _ssim,
 )
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Evaluation metrics
+# ---------------------------------------------------------------------------
+
+def compute_psnr(pred: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor) -> float:
+    """PSNR (dB) on foreground pixels only. All tensors float in [0, 1]."""
+    pred_fg = pred[mask.expand_as(pred)]
+    gt_fg = gt[mask.expand_as(gt)]
+    if len(pred_fg) == 0:
+        return 0.0
+    mse = F.mse_loss(pred_fg, gt_fg)
+    if mse.item() < 1e-10:
+        return 100.0
+    return float(-10.0 * torch.log10(mse).item())
+
+
+def compute_ssim_fg(pred: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor) -> float:
+    """SSIM on foreground-masked image (0–1 scale, higher is better).
+
+    pred / gt : (H, W, 3) float [0, 1]
+    mask      : (H, W, 1) bool
+    """
+    # Replace background in pred with GT so SSIM window only measures fg quality
+    mask_f = mask.float()
+    pred_m = pred * mask_f + gt * (1.0 - mask_f)
+    pred_nchw = pred_m.unsqueeze(0).permute(0, 3, 1, 2)
+    gt_nchw = gt.unsqueeze(0).permute(0, 3, 1, 2)
+    return float(_ssim(pred_nchw, gt_nchw).item())
+
+
+@torch.no_grad()
+def run_validation(
+    model: torch.nn.Module,
+    renderer: GaussianRenderer,
+    val_dataset,
+    device: torch.device,
+    num_samples: int = 20,
+) -> Dict[str, float]:
+    """Evaluate model on a subset of val_dataset.
+
+    Returns mean PSNR (fg) and mean SSIM (fg) across all samples and views.
+    """
+    model.eval()
+    psnr_list, ssim_list, alpha_list = [], [], []
+
+    indices = list(range(len(val_dataset)))[:num_samples]
+    for idx in indices:
+        try:
+            sample = val_dataset[idx]
+        except Exception as e:
+            logger.warning(f"Val sample {idx} failed: {e}")
+            continue
+
+        surface = sample['surface'].unsqueeze(0).to(device)
+        gt_rgbs = sample['rgbs']
+        gt_depths = sample['depths']
+        c2ws = sample['c2ws']
+
+        means, scales, rotations, opacities, colors = model(surface)
+        means = means[0]
+        scales = scales[0]
+        rotations = rotations[0]
+        opacities = opacities[0]
+        colors = colors[0]
+
+        for gt_rgb, gt_depth, c2w in zip(gt_rgbs, gt_depths, c2ws):
+            valid_mask = (gt_depth > 0)                       # (H, W, 1)
+            if float(valid_mask.float().mean().item()) < 0.02:
+                continue
+            out = renderer(means, scales, rotations, opacities, colors, c2w.to(device))
+            pred_rgb = out['rgb'].cpu()
+            pred_alpha = out['alpha'].cpu()
+
+            psnr_list.append(compute_psnr(pred_rgb, gt_rgb, valid_mask))
+            ssim_list.append(compute_ssim_fg(pred_rgb, gt_rgb, valid_mask))
+            alpha_list.append(float(pred_alpha[valid_mask].mean().item()))
+
+    model.train()
+    if not psnr_list:
+        return {'val/psnr': 0.0, 'val/ssim': 0.0, 'val/alpha_fg_mean': 0.0}
+    return {
+        'val/psnr': float(sum(psnr_list) / len(psnr_list)),
+        'val/ssim': float(sum(ssim_list) / len(ssim_list)),
+        'val/alpha_fg_mean': float(sum(alpha_list) / len(alpha_list)),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +157,7 @@ class GTRGBDRenderer:
         elevation_deg: float = 20.0,
         num_views: int = 8,
         device: str = 'cpu',
+        azimuths_deg: Optional[List[float]] = None,
     ):
         self.height = height
         self.width = width
@@ -73,9 +166,17 @@ class GTRGBDRenderer:
         self.elevation_deg = elevation_deg
         self.num_views = num_views
         self.device = device
+        self.azimuths_deg = azimuths_deg
 
-        # Cache tag encodes the rendering configuration
-        self._tag = f"h{height}w{width}v{num_views}"
+        # Cache tag encodes the rendering configuration so different camera setups
+        # never share the same on-disk cache.
+        # When explicit azimuths are given, embed them directly so "0,90" and "0,180"
+        # always produce separate cache files (critical for multi-view correctness).
+        if azimuths_deg is not None:
+            az_str = '_'.join(str(int(round(a))) for a in azimuths_deg)
+            self._tag = f"h{height}w{width}az{az_str}_normv1"
+        else:
+            self._tag = f"h{height}w{width}v{num_views}_normv1"
 
     # ------------------------------------------------------------------
     # Public API
@@ -92,20 +193,31 @@ class GTRGBDRenderer:
         cache_path = f"{mesh_path}.gt_rgbd_{self._tag}.pt"
         if os.path.exists(cache_path):
             data = torch.load(cache_path, map_location='cpu')
-            return data['rgbs'], data['depths'], data['c2ws']
+            cached_depths = data.get('depths', [])
+            mean_cached_valid_depth_ratio = float(
+                sum(float((d > 0).float().mean().item()) for d in cached_depths)
+                / max(len(cached_depths), 1)
+            )
+            # If cache is effectively empty, force a re-render once instead of
+            # repeatedly training against blank GT targets.
+            if mean_cached_valid_depth_ratio > 0.0:
+                return data['rgbs'], data['depths'], data['c2ws']
+            logger.warning(f"Empty GT cache for {mesh_path}; re-rendering.")
 
         if mesh is None:
             mesh = self._load_mesh(mesh_path)
+        # Match point-cloud loader coordinates: render GT in normalized mesh space.
+        mesh = normalize_mesh(mesh)
 
         c2ws = build_orbit_cameras(
             num_views=self.num_views,
             elevation_deg=self.elevation_deg,
             radius=self.camera_distance,
             device='cpu',
+            azimuths_deg=self.azimuths_deg,
         )
 
         rgbs, depths = self._render_views(mesh, c2ws)
-
         data = {'rgbs': rgbs, 'depths': depths, 'c2ws': c2ws}
         torch.save(data, cache_path)
         return rgbs, depths, c2ws
@@ -118,23 +230,74 @@ class GTRGBDRenderer:
     def _load_mesh(path: str) -> trimesh.Trimesh:
         scene_or_mesh = trimesh.load(path, process=False)
         if isinstance(scene_or_mesh, trimesh.scene.Scene):
-            return scene_or_mesh.dump(concatenate=True)
+            # `Scene.dump(concatenate=True)` is deprecated; use `to_geometry()`.
+            geom = scene_or_mesh.to_geometry()
+            if isinstance(geom, trimesh.Trimesh):
+                return geom
+            if isinstance(geom, dict):
+                meshes = [g for g in geom.values() if isinstance(g, trimesh.Trimesh)]
+            elif isinstance(geom, (list, tuple)):
+                meshes = [g for g in geom if isinstance(g, trimesh.Trimesh)]
+            else:
+                meshes = []
+            if len(meshes) == 0:
+                raise ValueError(f"No mesh geometry found in scene: {path}")
+            if len(meshes) == 1:
+                return meshes[0]
+            return trimesh.util.concatenate(meshes)
         return scene_or_mesh
 
     def _render_views(self, mesh, c2ws):
         """Dispatch to pyrender or vertex-color fallback."""
         try:
-            return self._render_pyrender(mesh, c2ws)
+            rgbs, depths = self._render_pyrender(mesh, c2ws)
+            mean_valid_depth_ratio = float(
+                sum(float((d > 0).float().mean().item()) for d in depths) / max(len(depths), 1)
+            )
+            if mean_valid_depth_ratio > 0.0:
+                return rgbs, depths
+            logger.warning("pyrender produced empty depth; using vertex-color fallback.")
+            return self._render_vertex_color(mesh, c2ws)
         except Exception as e:
             logger.warning(f"pyrender failed ({e}); using vertex-color fallback renderer.")
             return self._render_vertex_color(mesh, c2ws)
 
+    @staticmethod
+    def _mesh_for_pyrender(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+        """Drop GLTF/GLB texture images that pyrender cannot upload (e.g. 2-channel).
+
+        pyrender then rasterizes from simple vertex colors (sampled via trimesh).
+        """
+        m = mesh.copy()
+        try:
+            c = m.visual.to_color()
+            vc = np.asanyarray(c.vertex_colors)
+            if vc.shape[0] != len(m.vertices):
+                raise ValueError("vertex color count mismatch")
+            if vc.shape[1] < 4:
+                alpha = np.full((vc.shape[0], 1), 255, dtype=vc.dtype)
+                vc = np.concatenate([vc[:, :3], alpha], axis=1)
+            m.visual = trimesh.visual.ColorVisuals(mesh=m, vertex_colors=vc)
+        except Exception:
+            gray = np.full((len(m.vertices), 4), 200, dtype=np.uint8)
+            gray[:, 3] = 255
+            m.visual = trimesh.visual.ColorVisuals(mesh=m, vertex_colors=gray)
+        return m
+
     def _render_pyrender(self, mesh, c2ws):
         """GPU-less offscreen RGBD rendering via pyrender + EGL."""
+        # Avoid repetitive optional-acceleration info spam in console output.
+        logging.getLogger("OpenGL.acceleratesupport").setLevel(logging.ERROR)
         import pyrender  # noqa: import inside method so it's optional
 
         # Build pyrender mesh from trimesh
-        pr_mesh = pyrender.Mesh.from_trimesh(mesh, smooth=False)
+        mesh_gl = self._mesh_for_pyrender(mesh)
+        pr_mesh = pyrender.Mesh.from_trimesh(mesh_gl, smooth=False)
+        # Enable double-sided rendering so back faces are visible.
+        # GLB/GLTF meshes commonly use single-sided materials; without this,
+        # cameras at azimuth=180° (back view) see an empty scene.
+        for primitive in pr_mesh.primitives:
+            primitive.material.doubleSided = True
         scene = pyrender.Scene(bg_color=[1.0, 1.0, 1.0, 1.0], ambient_light=[0.5, 0.5, 0.5])
         scene.add(pr_mesh)
 
@@ -157,7 +320,6 @@ class GTRGBDRenderer:
 
             color, depth = renderer.render(scene)
             scene.remove_node(cam_node)
-
             rgb = torch.from_numpy(color.astype(np.float32) / 255.0)   # (H, W, 3)
             dep = torch.from_numpy(depth.astype(np.float32)).unsqueeze(-1)  # (H, W, 1)
             rgbs.append(rgb)
@@ -248,7 +410,7 @@ class MeshDataset(Dataset):
     together with pre-rendered GT RGBD views.
 
     Each item is a dict with:
-        surface  : (1, pc_size+pc_sharpedge_size, 9) float32 tensor
+        surface  : (pc_size+pc_sharpedge_size, 9) float32 tensor
         rgbs     : list of (H, W, 3) float32 tensors
         depths   : list of (H, W, 1) float32 tensors
         c2ws     : list of (4, 4) float32 tensors
@@ -265,8 +427,9 @@ class MeshDataset(Dataset):
         num_views: int = 8,
         camera_distance: float = 2.5,
         elevation_deg: float = 20.0,
-        cache_renders: bool = True,
         max_items: Optional[int] = None,
+        mesh_blacklist: Optional[str] = None,
+        azimuths_deg: Optional[List[float]] = None,
     ):
         self.loader = RGBSharpEdgeSurfaceLoader(
             num_uniform_points=pc_size,
@@ -278,15 +441,33 @@ class MeshDataset(Dataset):
             num_views=num_views,
             camera_distance=camera_distance,
             elevation_deg=elevation_deg,
+            azimuths_deg=azimuths_deg,
         )
-        self.cache_renders = cache_renders
+
+        # Load blacklist of known-bad meshes (one path per line; tab-separated label ignored)
+        blacklist: set = set()
+        if mesh_blacklist and os.path.exists(mesh_blacklist):
+            with open(mesh_blacklist) as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        path_part = line.split('\t')[0].strip()  # ignore optional tab label
+                        if path_part:
+                            blacklist.add(os.path.realpath(path_part))
+            logger.info(f"Blacklist: {len(blacklist)} mesh(es) excluded from {mesh_blacklist}")
 
         # Discover mesh files
         data_path = Path(data_dir)
-        self.mesh_paths = sorted([
+        all_paths = sorted([
             str(p) for p in data_path.rglob('*')
             if p.suffix.lower() in MESH_EXTENSIONS
         ])
+        self.mesh_paths = [
+            p for p in all_paths
+            if os.path.realpath(p) not in blacklist
+        ]
+        if len(blacklist) > 0:
+            logger.info(f"After blacklist filter: {len(self.mesh_paths)}/{len(all_paths)} meshes kept")
         if max_items is not None:
             self.mesh_paths = self.mesh_paths[:max_items]
         logger.info(f"Dataset: {len(self.mesh_paths)} meshes in {data_dir}")
@@ -295,22 +476,22 @@ class MeshDataset(Dataset):
         return len(self.mesh_paths)
 
     def __getitem__(self, idx: int) -> Dict:
-        path = self.mesh_paths[idx]
-        try:
-            surface = self.loader(path)                         # (1, N, 9)
-            rgbs, depths, c2ws = self.gt_renderer.get_or_render(path)
-        except Exception as e:
-            logger.warning(f"Skipping {path}: {e}")
-            # Return a dummy item; DataLoader will average this out
-            return self.__getitem__((idx + 1) % len(self))
-
-        return {
-            'surface': surface.squeeze(0),   # (N, 9) — DataLoader adds batch dim
-            'rgbs': rgbs,
-            'depths': depths,
-            'c2ws': c2ws,
-            'mesh_path': path,
-        }
+        # Iterate forward (non-recursively) to find a working sample
+        for attempt in range(len(self.mesh_paths)):
+            path = self.mesh_paths[(idx + attempt) % len(self.mesh_paths)]
+            try:
+                surface = self.loader(path)                         # (1, N, 9)
+                rgbs, depths, c2ws = self.gt_renderer.get_or_render(path)
+                return {
+                    'surface': surface.squeeze(0),   # (N, 9) — DataLoader adds batch dim
+                    'rgbs': rgbs,
+                    'depths': depths,
+                    'c2ws': c2ws,
+                    'mesh_path': path,
+                }
+            except Exception as e:
+                logger.warning(f"Skipping {path}: {e}")
+        raise RuntimeError(f"All {len(self.mesh_paths)} meshes failed to load")
 
 
 def collate_fn(batch):
@@ -340,8 +521,73 @@ def collate_fn(batch):
 # ---------------------------------------------------------------------------
 
 def train(args):
+    # ---- Parse camera azimuths ----
+    azimuths_deg: Optional[List[float]] = None
+    if args.camera_azimuths:
+        azimuths_deg = [float(a.strip()) for a in args.camera_azimuths.split(',')]
+        if len(azimuths_deg) != args.num_views:
+            raise ValueError(
+                f"--camera_azimuths has {len(azimuths_deg)} values "
+                f"but --num_views={args.num_views}. They must match."
+            )
+        logger.info(f"Camera azimuths: {azimuths_deg}")
+
+    # ---- Pre-cache-only mode: render GT for all meshes then exit ----
+    if args.precache_only:
+        logger.info("Pre-cache mode: rendering GT RGBD for all meshes (no training).")
+        logger.info("Running single-threaded to avoid EGL conflicts.")
+        dataset = MeshDataset(
+            data_dir=args.data_dir,
+            pc_size=args.pc_size,
+            pc_sharpedge_size=args.pc_sharpedge_size,
+            render_height=args.render_height,
+            render_width=args.render_width,
+            num_views=args.num_views,
+            camera_distance=args.camera_distance,
+            elevation_deg=args.elevation_deg,
+            max_items=args.max_items,
+            mesh_blacklist=args.mesh_blacklist,
+            azimuths_deg=azimuths_deg,
+        )
+        n = len(dataset)  
+        logger.info(f"Pre-caching GT for {n} meshes with tag '{dataset.gt_renderer._tag}' ...")
+        ok, failed = 0, []
+        for i in range(n):
+            path = dataset.mesh_paths[i]
+            try:
+                dataset.gt_renderer.get_or_render(path)
+                ok += 1
+                if (i + 1) % 10 == 0 or (i + 1) == n:
+                    logger.info(f"  [{i+1}/{n}] done so far: {ok} ok, {len(failed)} failed")
+            except Exception as e:
+                failed.append(path)
+                logger.warning(f"  [{i+1}/{n}] FAILED {path}: {e}")
+        logger.info(f"Pre-cache complete. {ok}/{n} succeeded, {len(failed)} failed.")
+        if failed:
+            logger.warning("Failed meshes:\n" + "\n".join(f"  {p}" for p in failed))
+        return
+
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     logger.info(f"Training on device: {device}")
+    max_grad_norm = 1.0
+    if args.smoke_overfit:
+        # Minimal learning sanity-check: one view + pure RGB L1 only.
+        args.num_views = 1
+        args.lambda_ssim = 0.0
+        args.lambda_d = 0.0
+        args.lambda_alpha = 0.0
+        args.lambda_scale = 0.0
+        args.lambda_opa = 0.0
+        # Keep smoke test numerically stable to diagnose learnability.
+        args.lr = min(args.lr, 3e-5)
+        args.weight_decay = 0.0
+        max_grad_norm = 0.1
+        logger.info(
+            "Smoke overfit mode enabled: num_views=1, lambda_ssim=0, lambda_d=0, "
+            "lambda_alpha=0, lambda_scale=0, lambda_opa=0, "
+            f"lr={args.lr:.1e}, weight_decay={args.weight_decay:.1e}, "
+            f"max_grad_norm={max_grad_norm:.2f}"
+        )
 
     # ---- Model ----
     model = ShapeGSAE(
@@ -374,8 +620,13 @@ def train(args):
     criterion = RGBDLoss(
         lambda_ssim=args.lambda_ssim,
         lambda_d=args.lambda_d,
+        lambda_alpha=args.lambda_alpha,
         lambda_scale=args.lambda_scale,
         lambda_opa=args.lambda_opa,
+        target_log_scale=args.target_log_scale,
+        target_opacity=args.target_opacity,
+        fg_weight=args.fg_weight,
+        min_valid_ratio=args.min_valid_depth_ratio,
     )
 
     # ---- Data ----
@@ -389,6 +640,8 @@ def train(args):
         camera_distance=args.camera_distance,
         elevation_deg=args.elevation_deg,
         max_items=args.max_items,
+        mesh_blacklist=args.mesh_blacklist,
+        azimuths_deg=azimuths_deg,
     )
     loader = DataLoader(
         dataset,
@@ -400,6 +653,22 @@ def train(args):
         drop_last=True,
     )
 
+    # ---- Optional validation dataset ----
+    val_dataset = None
+    if args.val_dir:
+        val_dataset = MeshDataset(
+            data_dir=args.val_dir,
+            pc_size=args.pc_size,
+            pc_sharpedge_size=args.pc_sharpedge_size,
+            render_height=args.render_height,
+            render_width=args.render_width,
+            num_views=args.num_views,
+            camera_distance=args.camera_distance,
+            elevation_deg=args.elevation_deg,
+            azimuths_deg=azimuths_deg,
+        )
+        logger.info(f"Val set: {len(val_dataset)} meshes in {args.val_dir}")
+
     # ---- Optimiser & LR schedule ----
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -408,9 +677,23 @@ def train(args):
         betas=(0.9, 0.999),
     )
     total_steps = args.max_steps
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=total_steps, eta_min=args.lr * 0.01
-    )
+    warmup_steps = args.warmup_steps if not args.smoke_overfit else 0
+    if warmup_steps > 0:
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps
+        )
+        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(total_steps - warmup_steps, 1), eta_min=args.lr * 0.01
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[warmup_steps],
+        )
+        logger.info(f"LR schedule: {warmup_steps}-step linear warmup → cosine decay to {args.lr * 0.01:.1e}")
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=total_steps, eta_min=args.lr * 0.01
+        )
 
     # ---- Resume ----
     output_dir = Path(args.output_dir)
@@ -424,16 +707,36 @@ def train(args):
         global_step = ckpt['step']
         logger.info(f"Resumed from step {global_step}")
 
+    # ---- Optional Weights & Biases ----
+    use_wandb = bool(args.use_wandb)
+    if use_wandb and wandb is None:
+        raise ImportError("wandb is not installed. Install it with: pip install wandb")
+    if use_wandb:
+        run_name = args.wandb_run_name or output_dir.name
+        wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=run_name,
+            config=vars(args),
+            dir=str(output_dir),
+            resume='allow',
+        )
+        logger.info(f"wandb run: {wandb.run.url if wandb.run else 'unknown'}")
+
     # ---- Training loop ----
     model.train()
     epoch = 0
     t0 = time.time()
+    t_data_start = time.time()
 
     while global_step < total_steps:
         epoch += 1
         for batch in loader:
             if global_step >= total_steps:
                 break
+
+            t_data_end = time.time()
+            t_fwd_start = time.time()
 
             surface = batch['surface'].to(device, non_blocking=True)   # (B, N, 9)
             gt_rgbs = batch['rgbs']     # list of (B, H, W, 3)
@@ -447,7 +750,15 @@ def train(args):
             total_loss = torch.zeros(1, device=device)
             log_components: Dict[str, float] = {}
 
+            # Per-view stats for aggregated logging
+            view_valid_ratios: List[float] = []
+            view_pred_alpha_means: List[float] = []
+            view_pred_alpha_maxes: List[float] = []
+            view_pred_depth_pos_ratios: List[float] = []
+
             B = surface.shape[0]
+            num_views = len(c2ws)
+            num_valid_views = 0  # views with enough foreground GT to be useful
             for view_idx, (gt_rgb_b, gt_depth_b, c2w) in enumerate(
                 zip(gt_rgbs, gt_depths, c2ws)
             ):
@@ -455,8 +766,21 @@ def train(args):
                 gt_depth_b = gt_depth_b.to(device)   # (B, H, W, 1)
                 c2w = c2w.to(device)
 
+                gt_valid_ratio = float((gt_depth_b > 0).float().mean().item())
+                view_valid_ratios.append(gt_valid_ratio)
+
+                # Skip views with no foreground GT: including them in the loss
+                # creates a gradient toward alpha=0 (predicting white bg = 0 loss).
+                if gt_valid_ratio < args.min_valid_depth_ratio:
+                    view_pred_alpha_means.append(-1.0)
+                    view_pred_alpha_maxes.append(-1.0)
+                    view_pred_depth_pos_ratios.append(-1.0)
+                    continue
+
+                num_valid_views += 1
+
                 # Render each item in the batch separately (gsplat is per-scene)
-                pred_rgbs_list, pred_depths_list = [], []
+                pred_rgbs_list, pred_depths_list, pred_alphas_list = [], [], []
                 for b in range(B):
                     out = renderer(
                         means[b], scales[b], rotations[b],
@@ -464,41 +788,112 @@ def train(args):
                     )
                     pred_rgbs_list.append(out['rgb'])
                     pred_depths_list.append(out['depth'])
+                    pred_alphas_list.append(out['alpha'])
 
                 pred_rgb = torch.stack(pred_rgbs_list, dim=0)     # (B, H, W, 3)
                 pred_depth = torch.stack(pred_depths_list, dim=0) # (B, H, W, 1)
+                pred_alpha = torch.stack(pred_alphas_list, dim=0) # (B, H, W, 1)
+
+                # Collect per-view rendering diagnostics
+                view_pred_alpha_means.append(float(pred_alpha.detach().mean().item()))
+                view_pred_alpha_maxes.append(float(pred_alpha.detach().max().item()))
+                view_pred_depth_pos_ratios.append(float((pred_depth.detach() > 0).float().mean().item()))
 
                 valid_mask = gt_depth_b > 0
 
                 view_loss, comps = criterion(
                     pred_rgb, gt_rgb_b,
                     pred_depth, gt_depth_b,
+                    pred_alpha=pred_alpha,
                     valid_mask=valid_mask,
                     scales=scales.view(-1, 3).log(),  # log(scale) for regulariser
                     opacities=opacities.view(-1, 1),
                 )
-                total_loss = total_loss + view_loss / len(c2ws)
+                # Accumulate; divide by valid views below so scale stays consistent
+                total_loss = total_loss + view_loss
 
                 for k, v in comps.items():
-                    log_components[k] = log_components.get(k, 0.0) + v.item() / len(c2ws)
+                    log_components[k] = log_components.get(k, 0.0) + float(v.detach().item())
 
+            # Normalize by number of valid views (avoids collapsed solution when
+            # many views are skipped — loss scale stays constant regardless)
+            if num_valid_views > 0:
+                total_loss = total_loss / num_valid_views
+                log_components = {k: v / num_valid_views for k, v in log_components.items()}
+            log_components['valid_views_fraction'] = num_valid_views / max(num_views, 1)
+
+            t_bwd_start = time.time()
             optimizer.zero_grad()
             total_loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            grad_norm_preclip = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
             optimizer.step()
             scheduler.step()
+            t_step_end = time.time()
 
             global_step += 1
 
             # Logging
+            lr = scheduler.get_last_lr()[0]
+            if use_wandb:
+                wandb_log = {
+                    "train/total_loss": float(total_loss.detach().item()),
+                    "train/lr": float(lr),
+                    "train/grad_norm_preclip": float(
+                        grad_norm_preclip.detach().item()
+                        if torch.is_tensor(grad_norm_preclip) else grad_norm_preclip
+                    ),
+                    # GT valid depth ratios (all views)
+                    "train/mean_view_valid_depth_ratio": float(sum(view_valid_ratios) / max(len(view_valid_ratios), 1)),
+                    "train/min_view_valid_depth_ratio": float(min(view_valid_ratios)) if view_valid_ratios else -1.0,
+                    "train/num_valid_views": float(num_valid_views),
+                    # Pred metrics (only over rendered=valid views; -1 sentinels excluded)
+                    "train/mean_view_pred_alpha_mean": float(
+                        sum(v for v in view_pred_alpha_means if v >= 0) / max(sum(1 for v in view_pred_alpha_means if v >= 0), 1)
+                    ),
+                    "train/min_view_pred_alpha_mean": float(
+                        min((v for v in view_pred_alpha_means if v >= 0), default=-1.0)
+                    ),
+                    "train/mean_view_pred_depth_pos_ratio": float(
+                        sum(v for v in view_pred_depth_pos_ratios if v >= 0) / max(sum(1 for v in view_pred_depth_pos_ratios if v >= 0), 1)
+                    ),
+                    "train/min_view_pred_depth_pos_ratio": float(
+                        min((v for v in view_pred_depth_pos_ratios if v >= 0), default=-1.0)
+                    ),
+                    # First view for backward compat
+                    "train/first_view_valid_depth_ratio": float(view_valid_ratios[0]) if view_valid_ratios else -1.0,
+                    "train/first_view_pred_alpha_mean": float(view_pred_alpha_means[0]) if view_pred_alpha_means else -1.0,
+                    "train/first_view_pred_alpha_max": float(view_pred_alpha_maxes[0]) if view_pred_alpha_maxes else -1.0,
+                    "train/first_view_pred_depth_pos_ratio": float(view_pred_depth_pos_ratios[0]) if view_pred_depth_pos_ratios else -1.0,
+                    # Step timing
+                    "train/time_data_s": float(t_data_end - t_data_start),
+                    "train/time_fwdbwd_s": float(t_step_end - t_fwd_start),
+                }
+                for k, v in log_components.items():
+                    wandb_log[f"train/{k}"] = float(v)
+                wandb.log(wandb_log, step=global_step)
+
             if global_step % args.log_every == 0:
                 elapsed = time.time() - t0
-                lr = scheduler.get_last_lr()[0]
                 parts = ' | '.join(f"{k}={v:.4f}" for k, v in log_components.items())
                 logger.info(
                     f"step={global_step:06d} | lr={lr:.2e} | {parts} | "
+                    f"data={t_data_end - t_data_start:.2f}s | "
+                    f"fwd+bwd={t_step_end - t_fwd_start:.2f}s | "
                     f"{elapsed / global_step:.2f}s/step"
                 )
+
+            # Validation
+            if val_dataset is not None and (
+                global_step % args.val_every == 0 or global_step == total_steps
+            ):
+                val_metrics = run_validation(
+                    model, renderer, val_dataset, device,
+                    num_samples=args.num_val_samples,
+                )
+                val_str = ' | '.join(f"{k}={v:.4f}" for k, v in val_metrics.items())
+                logger.info(f"step={global_step:06d} | VALIDATION | {val_str}")
+                if use_wandb:
+                    wandb.log(val_metrics, step=global_step)
 
             # Checkpoint
             if global_step % args.save_every == 0 or global_step == total_steps:
@@ -512,7 +907,11 @@ def train(args):
                 }, ckpt_path)
                 logger.info(f"Saved checkpoint → {ckpt_path}")
 
+            t_data_start = time.time()
+
     logger.info("Training complete.")
+    if use_wandb:
+        wandb.finish()
 
 
 # ---------------------------------------------------------------------------
@@ -525,8 +924,13 @@ def parse_args():
     # Data
     p.add_argument('--data_dir', required=True)
     p.add_argument('--output_dir', default='runs/gs_ae')
+    p.add_argument('--val_dir', type=str, default=None,
+                   help='Directory of validation meshes (separate from train). '
+                        'GT RGBD must be pre-cached with same camera settings.')
     p.add_argument('--max_items', type=int, default=None,
                    help='Cap dataset size (useful for debugging)')
+    p.add_argument('--mesh_blacklist', type=str, default=None,
+                   help='Path to a text file listing mesh paths to exclude (one per line).')
 
     # Model
     p.add_argument('--num_latents', type=int, default=2048)
@@ -547,16 +951,39 @@ def parse_args():
     p.add_argument('--num_views', type=int, default=8)
     p.add_argument('--camera_distance', type=float, default=2.5)
     p.add_argument('--elevation_deg', type=float, default=20.0)
+    p.add_argument('--camera_azimuths', type=str, default=None,
+                   help='Comma-separated azimuth angles in degrees, one per view. '
+                        'Length must equal --num_views. '
+                        'IMPORTANT: for 2-view training use "0,90" (front + right side) '
+                        'NOT the default "0,180" — the back view (180°) has no geometry '
+                        'for most Objaverse objects. Default: evenly spaced (0,180 for 2 views).')
 
     # Loss weights
-    p.add_argument('--lambda_ssim', type=float, default=0.2)
-    p.add_argument('--lambda_d', type=float, default=0.5)
+    p.add_argument('--lambda_ssim', type=float, default=0.2,
+                   help='SSIM loss weight. Applied only on foreground pixels.')
+    p.add_argument('--lambda_d', type=float, default=1.0,
+                   help='Depth L1 weight. Key lever for Gaussian placement quality.')
+    p.add_argument('--lambda_alpha', type=float, default=0.05,
+                   help='Alpha supervision on fg pixels. Prevents opacity collapse. '
+                        'Critical: do not set to 0 unless debugging.')
     p.add_argument('--lambda_scale', type=float, default=0.01)
     p.add_argument('--lambda_opa', type=float, default=0.01)
+    p.add_argument('--target_log_scale', type=float, default=-3.0,
+                   help='Target log-scale for scale regularizer. -3.0 → scale≈0.05 units. '
+                        'Increase toward -2.0 for coarser Gaussians.')
+    p.add_argument('--target_opacity', type=float, default=0.5,
+                   help='Target opacity for opacity regularizer.')
+    p.add_argument('--fg_weight', type=float, default=0.75,
+                   help='Foreground pixel weight in RGB L1 (0.75 = fg gets 3× bg weight). '
+                        'Gradient scale is preserved regardless of fg ratio.')
+    p.add_argument('--min_valid_depth_ratio', type=float, default=0.02,
+                   help='Skip depth loss for views with fewer than this fraction of valid pixels.')
 
     # Optimiser
     p.add_argument('--lr', type=float, default=1e-4)
     p.add_argument('--weight_decay', type=float, default=1e-2)
+    p.add_argument('--warmup_steps', type=int, default=500,
+                   help='Linear LR warmup steps before cosine decay. Set 0 to disable.')
     p.add_argument('--max_steps', type=int, default=200_000)
     p.add_argument('--batch_size', type=int, default=4)
     p.add_argument('--num_workers', type=int, default=4)
@@ -565,8 +992,26 @@ def parse_args():
     p.add_argument('--device', type=str, default='cuda')
     p.add_argument('--log_every', type=int, default=50)
     p.add_argument('--save_every', type=int, default=5_000)
+    p.add_argument('--val_every', type=int, default=2000,
+                   help='Run validation every N steps (requires --val_dir).')
+    p.add_argument('--num_val_samples', type=int, default=20,
+                   help='Max number of val meshes to evaluate per validation pass.')
     p.add_argument('--resume_ckpt', type=str, default=None)
     p.add_argument('--seed', type=int, default=42)
+    p.add_argument('--smoke_overfit', action='store_true',
+                   help='Minimal learning sanity-check: single view + RGB L1 only.')
+    p.add_argument('--precache_only', action='store_true',
+                   help='Pre-render and cache GT RGBD for all meshes then exit (no training). '
+                        'Run this with CUDA_VISIBLE_DEVICES="" and --num_workers 0 before '
+                        'multi-view training to avoid EGL conflicts during the training loop.')
+    p.add_argument('--use_wandb', action='store_true',
+                   help='Enable Weights & Biases logging.')
+    p.add_argument('--wandb_project', type=str, default='hy3dgs',
+                   help='W&B project name.')
+    p.add_argument('--wandb_entity', type=str, default='nathanr-ntu',
+                   help='W&B entity/team name.')
+    p.add_argument('--wandb_run_name', type=str, default=None,
+                   help='Optional W&B run name (defaults to output_dir basename).')
 
     return p.parse_args()
 
