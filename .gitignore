@@ -171,3 +171,4 @@ gradio_cache/
 runs/
 .cursor/*.log
 **/__pycache__/**
+eval/

@@ -22,7 +22,7 @@ import os
 import random
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional, Set
 
 import numpy as np
 import torch
@@ -47,6 +47,85 @@ from hy3dgen.shapegen.gs_renderer import (
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# ShapeNet categories
+# ---------------------------------------------------------------------------
+
+# Human-readable name → ShapeNet Core v2 synset ID. Folders in the prepared
+# dataset are named "<synset_id>_<model_hash>"; the prefix before the first
+# underscore is matched against these IDs to filter by category.
+CATEGORY_NAME_TO_ID: Dict[str, str] = {
+    "airplane": "02691156",
+    "bench": "02828884",
+    "cabinet": "02933112",
+    "car": "02958343",
+    "chair": "03001627",
+    "lamp": "03636649",
+    "sofa": "04256520",
+    "table": "04379243",
+    "watercraft": "04530566",
+}
+
+
+def resolve_category_ids(categories_str: Optional[str]) -> Optional[Set[str]]:
+    """Parse a comma-separated list of category names and/or 8-digit IDs.
+
+    Returns ``None`` when no value is supplied (=> no filtering), otherwise a
+    set of ShapeNet synset IDs ready to match against folder name prefixes.
+    Raises ``ValueError`` for unknown tokens so typos fail fast instead of
+    silently dropping every sample.
+    """
+    if not categories_str:
+        return None
+    ids: Set[str] = set()
+    for tok in categories_str.split(','):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if tok in CATEGORY_NAME_TO_ID:
+            ids.add(CATEGORY_NAME_TO_ID[tok])
+        elif tok.isdigit() and len(tok) == 8:
+            ids.add(tok)
+        else:
+            raise ValueError(
+                f"Unknown category '{tok}'. Expected a known name "
+                f"({', '.join(sorted(CATEGORY_NAME_TO_ID))}) or an "
+                f"8-digit ShapeNet synset ID."
+            )
+    return ids
+
+
+# The 4-azimuth set used by the prepared ShapeNet GT cache. When training with
+# a subset of these views (e.g. 1 or 2 views), GTRGBDRenderer reuses the
+# 4-view cache and slices it instead of re-rendering.
+SUPERSET_AZIMUTHS_DEG: List[float] = [0.0, 90.0, 180.0, 270.0]
+
+
+def mesh_path_has_usable_gt_cache(
+    mesh_path: str,
+    gt_tag: str,
+    height: int,
+    width: int,
+    azimuths_deg: List[float],
+) -> bool:
+    """True if ``GTRGBDRenderer.get_or_render`` can satisfy GT from disk only.
+
+    Matches the resolution order in ``get_or_render``: exact tag file, else
+    4-view ``normv2`` superset slice (same H×W, azimuths ⊆ {0,90,180,270}).
+    Used by ``visualize_gs_ae`` / ``evaluate_gs_ae`` when filtering with
+    ``--only_cached_gt`` so they stay aligned with training cache layout.
+    """
+    if os.path.exists(f"{mesh_path}.gt_rgbd_{gt_tag}.pt"):
+        return True
+    if not all(a in SUPERSET_AZIMUTHS_DEG for a in azimuths_deg):
+        return False
+    super_az_str = '_'.join(str(int(round(a))) for a in SUPERSET_AZIMUTHS_DEG)
+    super_tag = f"h{height}w{width}az{super_az_str}_normv2"
+    if super_tag == gt_tag:
+        return False
+    return os.path.exists(f"{mesh_path}.gt_rgbd_{super_tag}.pt")
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +238,13 @@ class GTRGBDRenderer:
         device: str = 'cpu',
         azimuths_deg: Optional[List[float]] = None,
     ):
+        # Normalize azimuths to an explicit list so the cache tag is always
+        # in the deterministic "az<a0>_<a1>_..." form. This also lets the
+        # superset-cache fallback in get_or_render know exactly which view
+        # indices to slice.
+        if azimuths_deg is None:
+            azimuths_deg = [360.0 * i / num_views for i in range(num_views)]
+
         self.height = height
         self.width = width
         self.fov_deg = fov_deg
@@ -166,17 +252,15 @@ class GTRGBDRenderer:
         self.elevation_deg = elevation_deg
         self.num_views = num_views
         self.device = device
-        self.azimuths_deg = azimuths_deg
+        self.azimuths_deg = list(azimuths_deg)
 
         # Cache tag encodes the rendering configuration so different camera setups
-        # never share the same on-disk cache.
-        # When explicit azimuths are given, embed them directly so "0,90" and "0,180"
-        # always produce separate cache files (critical for multi-view correctness).
-        if azimuths_deg is not None:
-            az_str = '_'.join(str(int(round(a))) for a in azimuths_deg)
-            self._tag = f"h{height}w{width}az{az_str}_normv1"
-        else:
-            self._tag = f"h{height}w{width}v{num_views}_normv1"
+        # never share the same on-disk cache. "0,90" and "0,180" always produce
+        # separate cache files (critical for multi-view correctness).
+        # ``normv2`` invalidates all caches produced before the orbit_c2w
+        # handedness fix — those files have empty depth for half the azimuths.
+        az_str = '_'.join(str(int(round(a))) for a in self.azimuths_deg)
+        self._tag = f"h{height}w{width}az{az_str}_normv2"
 
     # ------------------------------------------------------------------
     # Public API
@@ -185,24 +269,28 @@ class GTRGBDRenderer:
     def get_or_render(self, mesh_path: str, mesh: Optional[trimesh.Trimesh] = None):
         """Return cached GT RGBD or render it now.
 
+        Resolution order:
+          1. Exact-match cache (``<mesh_path>.gt_rgbd_<self._tag>.pt``).
+          2. Superset slice: if the requested azimuths are all contained in
+             ``SUPERSET_AZIMUTHS_DEG`` (the 4-view set 0/90/180/270) and the
+             corresponding 4-view cache exists, slice it. This lets Phase 1
+             (1 view) and Phase 2a (2 views) experiments reuse the single
+             4-view cache without re-rendering.
+          3. Render from scratch and save under the exact tag.
+
         Returns:
             rgbs   : list of (H, W, 3) float tensors, values in [0, 1]
             depths : list of (H, W, 1) float tensors, values ≥ 0
             c2ws   : list of (4, 4) float tensors (camera-to-world)
         """
         cache_path = f"{mesh_path}.gt_rgbd_{self._tag}.pt"
-        if os.path.exists(cache_path):
-            data = torch.load(cache_path, map_location='cpu')
-            cached_depths = data.get('depths', [])
-            mean_cached_valid_depth_ratio = float(
-                sum(float((d > 0).float().mean().item()) for d in cached_depths)
-                / max(len(cached_depths), 1)
-            )
-            # If cache is effectively empty, force a re-render once instead of
-            # repeatedly training against blank GT targets.
-            if mean_cached_valid_depth_ratio > 0.0:
-                return data['rgbs'], data['depths'], data['c2ws']
-            logger.warning(f"Empty GT cache for {mesh_path}; re-rendering.")
+        cached = self._try_load_cache(cache_path)
+        if cached is not None:
+            return cached
+
+        sliced = self._try_load_superset_slice(mesh_path)
+        if sliced is not None:
+            return sliced
 
         if mesh is None:
             mesh = self._load_mesh(mesh_path)
@@ -221,6 +309,49 @@ class GTRGBDRenderer:
         data = {'rgbs': rgbs, 'depths': depths, 'c2ws': c2ws}
         torch.save(data, cache_path)
         return rgbs, depths, c2ws
+
+    @staticmethod
+    def _try_load_cache(cache_path: str):
+        """Load a cache file or return None if missing/empty.
+
+        An "empty" cache (all-zero depths) is treated as missing so we
+        re-render rather than training against blank GT.
+        """
+        if not os.path.exists(cache_path):
+            return None
+        data = torch.load(cache_path, map_location='cpu')
+        cached_depths = data.get('depths', [])
+        mean_cached_valid_depth_ratio = float(
+            sum(float((d > 0).float().mean().item()) for d in cached_depths)
+            / max(len(cached_depths), 1)
+        )
+        if mean_cached_valid_depth_ratio > 0.0:
+            return data['rgbs'], data['depths'], data['c2ws']
+        logger.warning(f"Empty GT cache at {cache_path}; ignoring.")
+        return None
+
+    def _try_load_superset_slice(self, mesh_path: str):
+        """If our azimuths are a subset of the 4-view cache, load and slice it."""
+        if not all(a in SUPERSET_AZIMUTHS_DEG for a in self.azimuths_deg):
+            return None
+
+        super_az_str = '_'.join(str(int(round(a))) for a in SUPERSET_AZIMUTHS_DEG)
+        super_tag = f"h{self.height}w{self.width}az{super_az_str}_normv2"
+        if super_tag == self._tag:
+            return None  # exact-match path already handled above
+
+        super_cache_path = f"{mesh_path}.gt_rgbd_{super_tag}.pt"
+        cached = self._try_load_cache(super_cache_path)
+        if cached is None:
+            return None
+
+        rgbs, depths, c2ws = cached
+        idx = [SUPERSET_AZIMUTHS_DEG.index(a) for a in self.azimuths_deg]
+        return (
+            [rgbs[i] for i in idx],
+            [depths[i] for i in idx],
+            [c2ws[i] for i in idx],
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -430,6 +561,7 @@ class MeshDataset(Dataset):
         max_items: Optional[int] = None,
         mesh_blacklist: Optional[str] = None,
         azimuths_deg: Optional[List[float]] = None,
+        categories: Optional[Iterable[str]] = None,
     ):
         self.loader = RGBSharpEdgeSurfaceLoader(
             num_uniform_points=pc_size,
@@ -445,7 +577,7 @@ class MeshDataset(Dataset):
         )
 
         # Load blacklist of known-bad meshes (one path per line; tab-separated label ignored)
-        blacklist: set = set()
+        blacklist: Set[str] = set()
         if mesh_blacklist and os.path.exists(mesh_blacklist):
             with open(mesh_blacklist) as f:
                 for line in f:
@@ -454,22 +586,42 @@ class MeshDataset(Dataset):
                         path_part = line.split('\t')[0].strip()  # ignore optional tab label
                         if path_part:
                             blacklist.add(os.path.realpath(path_part))
-            logger.info(f"Blacklist: {len(blacklist)} mesh(es) excluded from {mesh_blacklist}")
+            logger.info(f"Blacklist: {len(blacklist)} mesh(es) loaded from {mesh_blacklist}")
 
-        # Discover mesh files
+        allowed_cats: Optional[Set[str]] = set(categories) if categories else None
+
         data_path = Path(data_dir)
-        all_paths = sorted([
-            str(p) for p in data_path.rglob('*')
-            if p.suffix.lower() in MESH_EXTENSIONS
-        ])
-        self.mesh_paths = [
-            p for p in all_paths
-            if os.path.realpath(p) not in blacklist
-        ]
-        if len(blacklist) > 0:
-            logger.info(f"After blacklist filter: {len(self.mesh_paths)}/{len(all_paths)} meshes kept")
+        self.mesh_paths: List[str] = []
+        skipped_category = 0
+        skipped_blacklist = 0
+        for folder in sorted(data_path.iterdir()):
+            if not folder.is_dir():
+                continue
+            if allowed_cats is not None:
+                # Prepared layout: "<synset_id>_<model_hash>". The prefix before
+                # the first underscore is the category synset ID.
+                cat_id = folder.name.split('_', 1)[0]
+                if cat_id not in allowed_cats:
+                    skipped_category += 1
+                    continue
+            potential_obj = folder / "model_normalized.obj"
+            if not potential_obj.exists():
+                continue
+            if blacklist and os.path.realpath(str(potential_obj)) in blacklist:
+                skipped_blacklist += 1
+                continue
+            self.mesh_paths.append(str(potential_obj))
+
         if max_items is not None:
             self.mesh_paths = self.mesh_paths[:max_items]
+
+        if allowed_cats is not None:
+            logger.info(
+                f"Category filter cats={sorted(allowed_cats)}: kept "
+                f"{len(self.mesh_paths)} mesh(es), skipped {skipped_category} folder(s)"
+            )
+        if skipped_blacklist:
+            logger.info(f"Blacklist filter: {skipped_blacklist} mesh(es) excluded")
         logger.info(f"Dataset: {len(self.mesh_paths)} meshes in {data_dir}")
 
     def __len__(self) -> int:
@@ -532,6 +684,11 @@ def train(args):
             )
         logger.info(f"Camera azimuths: {azimuths_deg}")
 
+    # ---- Resolve category filter ----
+    categories = resolve_category_ids(args.categories)
+    if categories is not None:
+        logger.info(f"Filtering to categories: {sorted(categories)}")
+
     # ---- Pre-cache-only mode: render GT for all meshes then exit ----
     if args.precache_only:
         logger.info("Pre-cache mode: rendering GT RGBD for all meshes (no training).")
@@ -548,8 +705,9 @@ def train(args):
             max_items=args.max_items,
             mesh_blacklist=args.mesh_blacklist,
             azimuths_deg=azimuths_deg,
+            categories=categories,
         )
-        n = len(dataset)  
+        n = len(dataset)
         logger.info(f"Pre-caching GT for {n} meshes with tag '{dataset.gt_renderer._tag}' ...")
         ok, failed = 0, []
         for i in range(n):
@@ -642,6 +800,7 @@ def train(args):
         max_items=args.max_items,
         mesh_blacklist=args.mesh_blacklist,
         azimuths_deg=azimuths_deg,
+        categories=categories,
     )
     loader = DataLoader(
         dataset,
@@ -666,6 +825,7 @@ def train(args):
             camera_distance=args.camera_distance,
             elevation_deg=args.elevation_deg,
             azimuths_deg=azimuths_deg,
+            categories=categories,
         )
         logger.info(f"Val set: {len(val_dataset)} meshes in {args.val_dir}")
 
@@ -931,6 +1091,12 @@ def parse_args():
                    help='Cap dataset size (useful for debugging)')
     p.add_argument('--mesh_blacklist', type=str, default=None,
                    help='Path to a text file listing mesh paths to exclude (one per line).')
+    p.add_argument('--categories', type=str, default=None,
+                   help='Comma-separated category names or 8-digit ShapeNet synset IDs '
+                        'to include (e.g. "chair", "chair,table", or "03001627"). '
+                        'Folders are kept iff their name starts with "<synset_id>_". '
+                        'Known names: ' + ', '.join(sorted(CATEGORY_NAME_TO_ID)) +
+                        '. Default: no filtering.')
 
     # Model
     p.add_argument('--num_latents', type=int, default=2048)

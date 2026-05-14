@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
-"""Visualize ShapeGSAE vs GT (val/train). Run from repo root:
+"""Visualize ShapeGSAE vs GT (val/train). Run from repo root.
 
-    cd /home/nathan/Documents/research/HY3DGS
+Uses the same ``MeshDataset`` layout as ``train_gs_ae.py`` (per-model folders
+with ``model_normalized.obj``). Optional ``--categories chair`` filters by
+ShapeNet synset prefix; ``--only_cached_gt`` accepts either the exact GT cache
+for your view config or the 4-view ``normv2`` superset cache (same as training).
+
+Example (chairs, 1 view, 256² — reuses 4-view precache):
+
     python visualize_gs_ae.py \\
-        --checkpoint runs/YOUR_RUN/ckpt_XXXXXX.pt \\
-        --data_dir runs/safe_glbs_val153 \\
-        --render_height 128 --render_width 128 \\
-        --num_views 2 --camera_azimuths 0,90 \\
-        --num_samples 3
+        --checkpoint runs/p1_baseline_1v/ckpt_020000.pt \\
+        --data_dir ~/datasets/shapenet_prepared/val \\
+        --categories chair \\
+        --render_height 256 --render_width 256 \\
+        --num_views 1 --camera_azimuths "0" \\
+        --num_samples 8
 """
 
 from __future__ import annotations
@@ -18,7 +25,7 @@ import os
 import random
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Set
 
 import matplotlib
 
@@ -35,7 +42,11 @@ if str(ROOT) not in sys.path:
 
 from hy3dgen.shapegen.gs_renderer import GaussianRenderer  # noqa: E402
 from hy3dgen.shapegen.models.autoencoders.model import ShapeGSAE  # noqa: E402
-from train_gs_ae import MeshDataset  # noqa: E402
+from train_gs_ae import (  # noqa: E402
+    MeshDataset,
+    mesh_path_has_usable_gt_cache,
+    resolve_category_ids,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -100,10 +111,6 @@ def _parse_azimuths(s: Optional[str], num_views: int) -> Optional[List[float]]:
     return vals
 
 
-def mesh_paths_with_gt_cache(paths: List[str], tag: str) -> List[str]:
-    return [p for p in paths if os.path.exists(f"{p}.gt_rgbd_{tag}.pt")]
-
-
 def parse_args() -> argparse.Namespace:
     repo = Path(__file__).resolve().parents[0]
     p = argparse.ArgumentParser(description="Visualize ShapeGSAE vs GT RGBD")
@@ -135,6 +142,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--only_cached_gt", action="store_true", default=True)
     p.add_argument("--no_only_cached_gt", action="store_false", dest="only_cached_gt")
     p.add_argument("--mesh_blacklist", type=str, default=None)
+    p.add_argument(
+        "--categories",
+        type=str,
+        default=None,
+        help="Comma-separated ShapeNet category names or 8-digit synset IDs "
+        "(same as train_gs_ae.py --categories), e.g. 'chair' or '03001627'.",
+    )
+    p.add_argument(
+        "--max_items",
+        type=int,
+        default=None,
+        help="Cap dataset size after category filter (same semantics as training).",
+    )
 
     p.add_argument("--num_samples", type=int, default=3)
     p.add_argument("--indices", type=str, default=None)
@@ -150,6 +170,9 @@ def main() -> None:
     torch.manual_seed(args.seed)
 
     azimuths = _parse_azimuths(args.camera_azimuths, args.num_views)
+    categories: Optional[Set[str]] = resolve_category_ids(args.categories)
+    if categories is not None:
+        logger.info("Category filter: %s", sorted(categories))
 
     dataset = MeshDataset(
         data_dir=args.data_dir,
@@ -160,21 +183,38 @@ def main() -> None:
         num_views=args.num_views,
         camera_distance=args.camera_distance,
         elevation_deg=args.elevation_deg,
+        max_items=args.max_items,
         mesh_blacklist=args.mesh_blacklist,
         azimuths_deg=azimuths,
+        categories=categories,
     )
     tag = dataset.gt_renderer._tag
+    az_list = dataset.gt_renderer.azimuths_deg
     mesh_paths = list(dataset.mesh_paths)
     if args.only_cached_gt:
-        mesh_paths = mesh_paths_with_gt_cache(mesh_paths, tag)
-        logger.info(f"GT cache tag '{tag}' — {len(mesh_paths)} mesh(es) avec cache")
+        mesh_paths = [
+            p
+            for p in mesh_paths
+            if mesh_path_has_usable_gt_cache(
+                p, tag, args.render_height, args.render_width, az_list
+            )
+        ]
+        logger.info(
+            "GT usable from disk (exact tag '%s' or 4-view normv2 slice): "
+            "%d mesh(es)",
+            tag,
+            len(mesh_paths),
+        )
         if not mesh_paths:
             raise RuntimeError(
-                "Aucun cache GT. Lance precache avec les mêmes H/W/azimuths, "
-                "ou --no_only_cached_gt."
+                "No usable GT cache on disk for this view/H×W config. "
+                "Run train_gs_ae.py --precache_only with matching settings, "
+                "or pass --no_only_cached_gt to render on the fly."
             )
     if args.shuffle:
         random.shuffle(mesh_paths)
+
+    dataset.mesh_paths = mesh_paths
 
     if args.indices:
         ix = [int(x.strip()) for x in args.indices.split(",")]

@@ -17,7 +17,8 @@ Usage — compare two checkpoints
         --data_dir  data/shapenet/val \\
         --output_dir eval/step10k \\
         --num_samples 50 \\
-        --num_views 4 --camera_azimuths "0,90,180,270"
+        --num_views 4 --camera_azimuths "0,90,180,270" \\
+        --categories chair
 
 Usage — evaluate a single checkpoint on training data (overfit test)
 --------------------------------------------------------------------
@@ -25,7 +26,8 @@ Usage — evaluate a single checkpoint on training data (overfit test)
         --checkpoints runs/debug/ckpt_005000.pt \\
         --data_dir  data/shapenet/train \\
         --output_dir eval/overfit_check \\
-        --num_samples 10 --shuffle
+        --num_samples 10 --shuffle \\
+        --categories chair
 """
 
 from __future__ import annotations
@@ -35,11 +37,10 @@ import csv
 import json
 import logging
 import math
-import os
 import random
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
@@ -55,7 +56,7 @@ if str(ROOT) not in sys.path:
 
 from hy3dgen.shapegen.gs_renderer import GaussianRenderer, _ssim
 from hy3dgen.shapegen.models.autoencoders.model import ShapeGSAE
-from train_gs_ae import MeshDataset
+from train_gs_ae import MeshDataset, mesh_path_has_usable_gt_cache, resolve_category_ids
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -214,7 +215,7 @@ def evaluate_sample(
     opacities = opacities[0]
     colors = colors[0]
 
-    psnr_list, ssim_list, alpha_fg_list, depth_cov_list = [], [], [], []
+    psnr_list, ssim_list, alpha_fg_list, depth_cov_list, depth_l1_list = [], [], [], [], []
     row_images: List[Image.Image] = []
 
     for gt_rgb, gt_depth, c2w in zip(gt_rgbs, gt_depths, c2ws):
@@ -232,6 +233,12 @@ def evaluate_sample(
         ssim_list.append(compute_ssim_fg(pred_rgb, gt_rgb, valid_mask))
         alpha_fg_list.append(float(pred_alpha[valid_mask].mean().item()))
         depth_cov_list.append(float((pred_depth > 0).float().mean().item()))
+        # Same as training RGBDLoss: L1(pred_depth, gt_depth) on GT-valid pixels.
+        depth_l1 = F.l1_loss(
+            pred_depth[valid_mask].float().reshape(-1),
+            gt_depth[valid_mask].float().reshape(-1),
+        )
+        depth_l1_list.append(float(depth_l1.item()))
 
         # Build visual row: GT RGB | Pred RGB | GT depth | Pred depth
         row = _hconcat([
@@ -250,6 +257,7 @@ def evaluate_sample(
         "ssim_fg": _mean(ssim_list),
         "alpha_fg": _mean(alpha_fg_list),
         "depth_coverage": _mean(depth_cov_list),
+        "mean_depth_l1": _mean(depth_l1_list),
         "n_views": len(psnr_list),
     }
     return metrics, row_images
@@ -318,9 +326,10 @@ def evaluate_checkpoint(
         }
         results.append(result)
         logger.info(
-            f"    PSNR={metrics['psnr_fg']:.2f}dB  "
+            f"PSNR={metrics['psnr_fg']:.2f}dB  "
             f"SSIM={metrics['ssim_fg']:.4f}  "
             f"alpha_fg={metrics['alpha_fg']:.3f}  "
+            f"L1depth={metrics['mean_depth_l1']:.4f}  "
             f"depth_cov={metrics['depth_coverage']:.3f}"
         )
 
@@ -331,12 +340,14 @@ def evaluate_checkpoint(
             mean_psnr = sum(r["psnr_fg"] for r in valid) / len(valid)
             mean_ssim = sum(r["ssim_fg"] for r in valid) / len(valid)
             mean_alpha = sum(r["alpha_fg"] for r in valid) / len(valid)
+            mean_depth_l1 = sum(r["mean_depth_l1"] for r in valid) / len(valid)
             mean_dcov = sum(r["depth_coverage"] for r in valid) / len(valid)
             logger.info(
                 f"\n  SUMMARY [{ckpt_tag}] n={len(valid)} samples\n"
                 f"    mean PSNR  = {mean_psnr:.3f} dB\n"
                 f"    mean SSIM  = {mean_ssim:.4f}\n"
                 f"    alpha_fg   = {mean_alpha:.4f}\n"
+                f"    mean_depth_l1 = {mean_depth_l1:.4f}\n"
                 f"    depth_cov  = {mean_dcov:.4f}"
             )
 
@@ -377,6 +388,18 @@ def parse_args():
     p.add_argument("--elevation_deg", type=float, default=20.0)
     p.add_argument("--camera_azimuths", type=str, default="0,90,180,270")
     p.add_argument("--mesh_blacklist", type=str, default=None)
+    p.add_argument(
+        "--categories",
+        type=str,
+        default=None,
+        help="Comma-separated category names or synset IDs (same as train_gs_ae.py).",
+    )
+    p.add_argument(
+        "--max_items",
+        type=int,
+        default=None,
+        help="Cap dataset size after category filter (same as train_gs_ae.py).",
+    )
 
     # Sample selection
     p.add_argument("--num_samples", type=int, default=50,
@@ -414,6 +437,10 @@ def main():
                 f"camera_azimuths has {len(azimuths)} values but num_views={args.num_views}"
             )
 
+    categories: Optional[Set[str]] = resolve_category_ids(args.categories)
+    if categories is not None:
+        logger.info("Category filter: %s", sorted(categories))
+
     # Build dataset
     dataset = MeshDataset(
         data_dir=args.data_dir,
@@ -424,20 +451,31 @@ def main():
         num_views=args.num_views,
         camera_distance=args.camera_distance,
         elevation_deg=args.elevation_deg,
+        max_items=args.max_items,
         mesh_blacklist=args.mesh_blacklist,
         azimuths_deg=azimuths,
+        categories=categories,
     )
     logger.info(f"Dataset: {len(dataset)} meshes in {args.data_dir}")
 
     # Filter to meshes with pre-cached GT if requested
     mesh_paths = list(dataset.mesh_paths)
+    tag = dataset.gt_renderer._tag
+    az_list = dataset.gt_renderer.azimuths_deg
     if args.only_cached_gt:
-        tag = dataset.gt_renderer._tag
-        mesh_paths = [p for p in mesh_paths if os.path.exists(f"{p}.gt_rgbd_{tag}.pt")]
-        logger.info(f"Filtered to {len(mesh_paths)} meshes with cached GT (tag: {tag})")
-        dataset.mesh_paths = mesh_paths
-
-    # Select sample indices
+        mesh_paths = [
+            p
+            for p in mesh_paths
+            if mesh_path_has_usable_gt_cache(
+                p, tag, args.render_height, args.render_width, az_list
+            )
+        ]
+        logger.info(
+            "Filtered to %d meshes with usable GT on disk (tag '%s' or 4-view normv2 slice)",
+            len(mesh_paths),
+            tag,
+        )
+    dataset.mesh_paths = mesh_paths
     all_indices = list(range(len(dataset)))
     if args.shuffle:
         random.shuffle(all_indices)
@@ -481,6 +519,7 @@ def main():
             "mean_psnr_fg": round(sum(r["psnr_fg"] for r in valid) / len(valid), 4),
             "mean_ssim_fg": round(sum(r["ssim_fg"] for r in valid) / len(valid), 4),
             "mean_alpha_fg": round(sum(r["alpha_fg"] for r in valid) / len(valid), 4),
+            "mean_depth_l1": round(sum(r["mean_depth_l1"] for r in valid) / len(valid), 4),
             "mean_depth_cov": round(sum(r["depth_coverage"] for r in valid) / len(valid), 4),
         })
 
@@ -496,7 +535,7 @@ def main():
         print("\n" + "=" * 80)
         print("EVALUATION SUMMARY")
         print("=" * 80)
-        print(f"{'Checkpoint':<50} {'PSNR':>8} {'SSIM':>8} {'Alpha':>8} {'DepthCov':>10}")
+        print(f"{'Checkpoint':<50} {'PSNR':>8} {'SSIM':>8} {'Alpha':>8} {'L1depth':>10} {'DepthCov':>10}")
         print("-" * 80)
         for row in sorted(summary_rows, key=lambda x: -x["mean_psnr_fg"]):
             name = Path(row["checkpoint"]).parent.name + "/" + Path(row["checkpoint"]).stem
@@ -505,6 +544,7 @@ def main():
                 f"{row['mean_psnr_fg']:>8.3f} "
                 f"{row['mean_ssim_fg']:>8.4f} "
                 f"{row['mean_alpha_fg']:>8.4f} "
+                f"{row['mean_depth_l1']:>10.4f} "
                 f"{row['mean_depth_cov']:>10.4f}"
             )
         print("=" * 80 + "\n")

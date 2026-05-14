@@ -113,13 +113,18 @@ def orbit_c2w(
     z = radius * math.cos(el) * math.cos(az)
     pos = torch.tensor([x, y, z], dtype=torch.float32, device=device)
 
-    # Look-at construction (OpenGL convention, Y-up)
+    # Look-at construction (OpenGL convention, Y-up, right-handed).
+    # Standard gluLookAt-style basis: side = cross(forward, up).
+    # The previous formulation used cross(up, forward), which produced a
+    # left-handed (det = -1) c2w. pyrender silently rendered empty depth
+    # for half of all azimuths under that pose, which in turn caused
+    # opacity collapse during training.
     forward = -F.normalize(pos, dim=0)
     world_up = torch.tensor([0.0, 1.0, 0.0], device=device)
     if abs(forward[1].item()) > 0.99:
         world_up = torch.tensor([0.0, 0.0, 1.0], device=device)
-    right = F.normalize(torch.cross(world_up, forward, dim=0), dim=0)
-    up = torch.cross(forward, right, dim=0)
+    right = F.normalize(torch.cross(forward, world_up, dim=0), dim=0)
+    up = torch.cross(right, forward, dim=0)
 
     c2w = torch.eye(4, device=device)
     c2w[:3, 0] = right
