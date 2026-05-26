@@ -29,6 +29,7 @@ xatlas
 #facexlib
 
 # Training
+lpips
 accelerate
 #pytorch_lightning
 #scikit-learn

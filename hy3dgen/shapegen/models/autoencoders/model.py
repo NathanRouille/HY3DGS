@@ -367,6 +367,7 @@ class ShapeGSAE(nn.Module):
         drop_path_rate: float = 0.0,
         use_ln_post: bool = True,
         scale_factor: float = 1.0,
+        num_gs_per_anchor: int = 1,
         ckpt_path=None,
     ):
         super().__init__()
@@ -375,6 +376,7 @@ class ShapeGSAE(nn.Module):
         self.embed_dim = embed_dim
         self.scale_factor = scale_factor  # kept for config/checkpoint compat; not used in forward
         self.latent_shape = (num_latents, embed_dim)
+        self.num_gs_per_anchor = num_gs_per_anchor
 
         self.fourier_embedder = FourierEmbedder(num_freqs=num_freqs, include_pi=include_pi)
 
@@ -407,18 +409,22 @@ class ShapeGSAE(nn.Module):
             drop_path_rate=drop_path_rate,
         )
 
-        # 3DGS parameter head: 3 (pos delta) + 3 (log-scale) + 4 (quaternion) + 1 (opacity) + 3 (RGB) = 14
-        self.gs_head = nn.Linear(width, 14)
+        # 3DGS parameter head: K * 14 outputs per latent token.
+        # Per Gaussian: 3 (pos delta) + 3 (log-scale) + 4 (quaternion) + 1 (opacity) + 3 (RGB) = 14
+        K = self.num_gs_per_anchor
+        self.gs_head = nn.Linear(width, K * 14)
 
-        # Initialise GS head so opacities start near 0.5 and scales start small
+        # Initialise GS head so opacities start near 0.6 and scales start small.
         nn.init.zeros_(self.gs_head.weight)
         nn.init.zeros_(self.gs_head.bias)
-        # Slight positive bias on opacity logit → sigmoid ≈ 0.6 at init
-        self.gs_head.bias.data[10] = 0.4
-        # Negative bias on log-scale → small Gaussians at init
-        self.gs_head.bias.data[3:6] = -3.0
-        # Identity quaternion (w=1, x=y=z=0) to avoid zero-norm rotations at init.
-        self.gs_head.bias.data[6] = 1.0
+        for k in range(K):
+            off = k * 14
+            # Slight positive bias on opacity logit → sigmoid ≈ 0.6 at init
+            self.gs_head.bias.data[off + 10] = 0.4
+            # Negative bias on log-scale → small Gaussians at init
+            self.gs_head.bias.data[off + 3 : off + 6] = -3.0
+            # Identity quaternion (w=1, x=y=z=0) to avoid zero-norm rotations at init.
+            self.gs_head.bias.data[off + 6] = 1.0
 
         if ckpt_path is not None:
             self._init_from_ckpt(ckpt_path)
@@ -467,16 +473,30 @@ class ShapeGSAE(nn.Module):
             query_positions: [B, num_latents, 3]
 
         Returns:
-            means     : [B, num_latents, 3]
-            scales    : [B, num_latents, 3]  (always positive)
-            rotations : [B, num_latents, 4]  (unit quaternion, wxyz)
-            opacities : [B, num_latents, 1]  (in [0, 1])
-            colors    : [B, num_latents, 3]  (RGB in [0, 1])
+            means     : [B, num_latents * K, 3]
+            scales    : [B, num_latents * K, 3]  (always positive)
+            rotations : [B, num_latents * K, 4]  (unit quaternion, wxyz)
+            opacities : [B, num_latents * K, 1]  (in [0, 1])
+            colors    : [B, num_latents * K, 3]  (RGB in [0, 1])
+
+        where K = num_gs_per_anchor.  For K=1 this is identical to the original.
         """
+        K = self.num_gs_per_anchor
         latents = self.bottleneck_up(latents)
         latents = self.transformer(latents)
-        raw = self.gs_head(latents)
-        return self._parse_gaussians(raw, query_positions)
+        raw = self.gs_head(latents)          # (B, L, K*14)
+
+        B, L, _ = raw.shape
+        raw = raw.view(B, L * K, 14)        # (B, L*K, 14)
+
+        # Each anchor is repeated K times so every Gaussian is locally anchored.
+        anchors = (
+            query_positions                  # (B, L, 3)
+            .unsqueeze(2)                    # (B, L, 1, 3)
+            .expand(B, L, K, 3)             # (B, L, K, 3)
+            .reshape(B, L * K, 3)           # (B, L*K, 3)
+        )
+        return self._parse_gaussians(raw, anchors)
 
     def _parse_gaussians(self, raw: torch.FloatTensor, query_positions: torch.FloatTensor):
         """Apply per-parameter activations and anchor means to FPS positions."""
@@ -500,6 +520,7 @@ class ShapeGSAE(nn.Module):
 
         Returns:
             (means, scales, rotations, opacities, colors)
+            Each has shape [B, num_latents * num_gs_per_anchor, ...].
         """
         latents, query_positions = self.encode(surface)
         return self.decode(latents, query_positions)

@@ -129,12 +129,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--downsample_ratio", type=int, default=20)
 
     # Default 128 matches typical val precache: h128w128az0_90_normv1.pt
-    p.add_argument("--render_height", type=int, default=128)
-    p.add_argument("--render_width", type=int, default=128)
+    p.add_argument("--render_height", type=int, default=512)
+    p.add_argument("--render_width", type=int, default=512)
     p.add_argument("--num_views", type=int, default=2)
-    p.add_argument("--camera_distance", type=float, default=2.5)
+    p.add_argument("--camera_distance", type=float, default=3.5)
     p.add_argument("--elevation_deg", type=float, default=20.0)
     p.add_argument("--camera_azimuths", type=str, default="0,90")
+
+    p.add_argument(
+        "--gt_view_layout",
+        type=str,
+        default="legacy",
+        choices=("legacy", "v46"),
+        help="Must match the layout used to pre-cache GT.",
+    )
 
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--seed", type=int, default=0)
@@ -169,7 +177,9 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    azimuths = _parse_azimuths(args.camera_azimuths, args.num_views)
+    azimuths = None
+    if str(args.gt_view_layout).lower() != "v46":
+        azimuths = _parse_azimuths(args.camera_azimuths, args.num_views)
     categories: Optional[Set[str]] = resolve_category_ids(args.categories)
     if categories is not None:
         logger.info("Category filter: %s", sorted(categories))
@@ -187,9 +197,10 @@ def main() -> None:
         mesh_blacklist=args.mesh_blacklist,
         azimuths_deg=azimuths,
         categories=categories,
+        view_layout=args.gt_view_layout,
     )
     tag = dataset.gt_renderer._tag
-    az_list = dataset.gt_renderer.azimuths_deg
+    az_list = dataset.gt_renderer.azimuths_deg or [0.0]
     mesh_paths = list(dataset.mesh_paths)
     if args.only_cached_gt:
         mesh_paths = [
@@ -208,7 +219,7 @@ def main() -> None:
         if not mesh_paths:
             raise RuntimeError(
                 "No usable GT cache on disk for this view/H×W config. "
-                "Run train_gs_ae.py --precache_only with matching settings, "
+                "Run prepare_shapenet.py --precache with matching settings, "
                 "or pass --no_only_cached_gt to render on the fly."
             )
     if args.shuffle:
@@ -253,7 +264,7 @@ def main() -> None:
     for si, mesh_path in enumerate(selected):
         try:
             surface = dataset.loader(mesh_path).squeeze(0).to(device)
-            rgbs, depths, c2ws = dataset.gt_renderer.get_or_render(mesh_path)
+            rgbs, depths, c2ws, _vp = dataset.gt_renderer.get_or_render(mesh_path)
         except Exception as e:
             logger.warning("Skip %s: %s", mesh_path, e)
             continue

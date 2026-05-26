@@ -7,6 +7,10 @@ Evaluates one or more checkpoints on a validation set and produces:
   - Mean predicted alpha on foreground
   - Mean predicted depth coverage
   - Visual comparison grids (GT RGB | Pred RGB | GT depth | Pred depth)
+  - Input surface point clouds (``.ply``)
+  - FPS encoder anchors / ``query_positions`` (``.ply``)
+  - Normalized meshes aligned with the dataloader (``.obj``)
+  - Predicted 3D Gaussians (standard 3DGS ``.ply`` + ``.splat`` for web viewers)
   - A summary CSV for easy comparison across experiments
   - A summary JSON with all per-sample metrics
 
@@ -38,6 +42,8 @@ import json
 import logging
 import math
 import random
+import re
+import shutil
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -54,9 +60,18 @@ ROOT = Path(__file__).resolve().parents[0]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import trimesh
+
+from hy3dgen.shapegen.gs_export import (
+    export_gaussian_splat_file,
+    export_gaussian_splat_ply,
+    export_input_surface_ply,
+    export_xyz_pointcloud_ply,
+)
 from hy3dgen.shapegen.gs_renderer import GaussianRenderer, _ssim
 from hy3dgen.shapegen.models.autoencoders.model import ShapeGSAE
-from train_gs_ae import MeshDataset, mesh_path_has_usable_gt_cache, resolve_category_ids
+from hy3dgen.shapegen.surface_loaders import normalize_mesh
+from train_gs_ae import GTRGBDRenderer, MeshDataset, mesh_path_has_usable_gt_cache, resolve_category_ids
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -119,6 +134,29 @@ def _depth_to_rgb_u8(depth: torch.Tensor) -> np.ndarray:
     return (rgba[..., :3] * 255.0 * m[..., None]).astype(np.uint8)
 
 
+def _error_to_rgb_u8(
+    err: torch.Tensor,
+    vmax: Optional[float] = None,
+) -> np.ndarray:
+    """Render a non-negative scalar error map as a magma heatmap (uint8 RGB).
+
+    Low error → dark/black; high error → bright/yellow.
+    ``vmax`` can be set to a fixed value to keep colour scales comparable
+    across views; if None the per-image maximum is used.
+    """
+    e = err.squeeze(-1).float().numpy()
+    emax = float(e.max()) if vmax is None else float(vmax)
+    if emax <= 0:
+        return np.zeros((*e.shape, 3), dtype=np.uint8)
+    norm = np.clip(e / emax, 0.0, 1.0)
+    try:
+        cmap = matplotlib.colormaps["magma"]
+    except Exception:
+        cmap = cm.get_cmap("magma")
+    rgba = cmap(norm)
+    return (rgba[..., :3] * 255.0).astype(np.uint8)
+
+
 def _rgb01_to_u8(t: torch.Tensor) -> np.ndarray:
     return (t.detach().clamp(0, 1).float().cpu().numpy() * 255.0).round().astype(np.uint8)
 
@@ -164,6 +202,90 @@ def add_label_bar(
 
 
 # ---------------------------------------------------------------------------
+# Debug mesh export (same normalization as RGBSharpEdgeSurfaceLoader)
+# ---------------------------------------------------------------------------
+
+def export_normalized_mesh_obj(mesh_path: str, path: Path) -> None:
+    """Save normalized mesh as OBJ with per-sample MTL + texture for CloudCompare.
+
+    Uses the same geometry normalization as ``load_surface_sharpedge_rgb``.
+    Each export gets ``{stem}.obj``, ``{stem}.mtl``, and ``{stem}_texture.<ext>``
+    so multi-sample eval runs do not clobber shared ``material_0.png`` files.
+    """
+    stem = path.stem
+    out_dir = path.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    mesh = GTRGBDRenderer._load_mesh(mesh_path)
+    try:
+        mesh_full = trimesh.util.concatenate(mesh.dump())
+    except Exception:
+        mesh_full = trimesh.util.concatenate(mesh)
+    mesh_full = normalize_mesh(mesh_full)
+
+    # If no UV texture is present, bake vertex colors so CloudCompare still shows RGB.
+    has_uv_texture = (
+        isinstance(mesh_full.visual, trimesh.visual.texture.TextureVisuals)
+        and getattr(mesh_full.visual, "uv", None) is not None
+        and mesh_full.visual.material is not None
+        and getattr(mesh_full.visual.material, "image", None) is not None
+    )
+    if not has_uv_texture:
+        from hy3dgen.shapegen.surface_loaders import _get_vertex_colors
+
+        vc = (_get_vertex_colors(mesh_full) * 255.0).round().astype(np.uint8)
+        mesh_full.visual = trimesh.visual.ColorVisuals(
+            mesh=mesh_full,
+            vertex_colors=vc,
+        )
+
+    tmp_dir = out_dir / f".__mesh_export_{stem}"
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True)
+    try:
+        tmp_obj = tmp_dir / "mesh.obj"
+        mesh_full.export(tmp_obj)
+
+        mtl_src: Optional[Path] = None
+        tex_src: Optional[Path] = None
+        for f in tmp_dir.iterdir():
+            if f.suffix.lower() == ".mtl":
+                mtl_src = f
+            elif f.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".tga"):
+                tex_src = f
+
+        mtl_dst = out_dir / f"{stem}.mtl"
+        tex_dst: Optional[Path] = None
+        if tex_src is not None:
+            tex_dst = out_dir / f"{stem}_texture{tex_src.suffix.lower()}"
+            shutil.copy2(tex_src, tex_dst)
+
+        if mtl_src is not None:
+            mtl_text = mtl_src.read_text()
+            if tex_dst is not None:
+                tex_name = tex_dst.name
+                mtl_text = re.sub(
+                    r"(?m)^(map_Kd\s+)\S+",
+                    lambda m, n=tex_name: f"{m.group(1)}{n}",
+                    mtl_text,
+                )
+            mtl_dst.write_text(mtl_text)
+
+        obj_text = tmp_obj.read_text()
+        if mtl_dst.exists():
+            obj_text = re.sub(
+                r"(?m)^mtllib\s+\S+",
+                f"mtllib {mtl_dst.name}",
+                obj_text,
+                count=1,
+            )
+        path.write_text(obj_text)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
 # Model loading
 # ---------------------------------------------------------------------------
 
@@ -183,6 +305,7 @@ def load_model(
         pc_sharpedge_size=args.pc_sharpedge_size,
         point_feats=6,
         downsample_ratio=args.downsample_ratio,
+        num_gs_per_anchor=args.num_gs_per_anchor,
     ).to(device)
     ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
     state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
@@ -201,21 +324,27 @@ def evaluate_sample(
     renderer: GaussianRenderer,
     sample: Dict,
     device: torch.device,
-) -> Tuple[Dict[str, float], List[Image.Image]]:
-    """Evaluate one mesh sample. Returns (metrics_dict, list_of_row_images)."""
+    lpips_net=None,
+) -> Tuple[Dict[str, float], List[Image.Image], Dict[str, torch.Tensor]]:
+    """Evaluate one mesh sample.
+
+    Returns (metrics_dict, list_of_row_images, export_tensors).
+    """
     surface = sample["surface"].unsqueeze(0).to(device)
     gt_rgbs = sample["rgbs"]
     gt_depths = sample["depths"]
     c2ws = sample["c2ws"]
 
-    means, scales, rotations, opacities, colors = model(surface)
+    latents, query_positions = model.encode(surface)
+    means, scales, rotations, opacities, colors = model.decode(latents, query_positions)
+    query_positions = query_positions[0]
     means = means[0]
     scales = scales[0]
     rotations = rotations[0]
     opacities = opacities[0]
     colors = colors[0]
 
-    psnr_list, ssim_list, alpha_fg_list, depth_cov_list, depth_l1_list = [], [], [], [], []
+    psnr_list, ssim_list, lpips_list, depth_l1_list = [], [], [], []
     row_images: List[Image.Image] = []
 
     for gt_rgb, gt_depth, c2w in zip(gt_rgbs, gt_depths, c2ws):
@@ -227,25 +356,37 @@ def evaluate_sample(
         out = renderer(means, scales, rotations, opacities, colors, c2w.to(device))
         pred_rgb = out["rgb"].cpu()
         pred_depth = out["depth"].cpu()
-        pred_alpha = out["alpha"].cpu()
 
         psnr_list.append(compute_psnr(pred_rgb, gt_rgb, valid_mask))
         ssim_list.append(compute_ssim_fg(pred_rgb, gt_rgb, valid_mask))
-        alpha_fg_list.append(float(pred_alpha[valid_mask].mean().item()))
-        depth_cov_list.append(float((pred_depth > 0).float().mean().item()))
-        # Same as training RGBDLoss: L1(pred_depth, gt_depth) on GT-valid pixels.
+
+        # LPIPS — full-image, unmasked (matches training loss)
+        if lpips_net is not None:
+            pred_nchw = pred_rgb.unsqueeze(0).permute(0, 3, 1, 2).to(device)
+            gt_nchw = gt_rgb.unsqueeze(0).permute(0, 3, 1, 2).to(device)
+            lpips_val = float(lpips_net(pred_nchw, gt_nchw).mean().item())
+            lpips_list.append(lpips_val)
+
+        # Depth L1 over foreground only (diagnostic metric; full-image L1 is dominated by bg zeros)
         depth_l1 = F.l1_loss(
             pred_depth[valid_mask].float().reshape(-1),
             gt_depth[valid_mask].float().reshape(-1),
         )
         depth_l1_list.append(float(depth_l1.item()))
 
-        # Build visual row: GT RGB | Pred RGB | GT depth | Pred depth
+        # ---- Error maps ----
+        rgb_err = (pred_rgb - gt_rgb).abs()          # (H, W, 3) → mean over channels
+        rgb_err_scalar = rgb_err.mean(dim=-1, keepdim=True)  # (H, W, 1)
+        depth_err = (pred_depth - gt_depth).abs()             # (H, W, 1)
+
+        # Build visual row: GT RGB | Pred RGB | RGB Error | GT Depth | Pred Depth | Depth Error
         row = _hconcat([
             Image.fromarray(_rgb01_to_u8(gt_rgb)),
             Image.fromarray(_rgb01_to_u8(pred_rgb)),
+            Image.fromarray(_error_to_rgb_u8(rgb_err_scalar)),
             Image.fromarray(_depth_to_rgb_u8(gt_depth)),
             Image.fromarray(_depth_to_rgb_u8(pred_depth)),
+            Image.fromarray(_error_to_rgb_u8(depth_err)),
         ])
         row_images.append(row)
 
@@ -255,12 +396,20 @@ def evaluate_sample(
     metrics = {
         "psnr_fg": _mean(psnr_list),
         "ssim_fg": _mean(ssim_list),
-        "alpha_fg": _mean(alpha_fg_list),
-        "depth_coverage": _mean(depth_cov_list),
+        "lpips_fg": _mean(lpips_list),
         "mean_depth_l1": _mean(depth_l1_list),
         "n_views": len(psnr_list),
     }
-    return metrics, row_images
+    export_tensors = {
+        "surface": sample["surface"].detach().cpu(),
+        "query_positions": query_positions.detach().cpu(),
+        "means": means.detach().cpu(),
+        "scales": scales.detach().cpu(),
+        "rotations": rotations.detach().cpu(),
+        "opacities": opacities.detach().cpu(),
+        "colors": colors.detach().cpu(),
+    }
+    return metrics, row_images, export_tensors
 
 
 # ---------------------------------------------------------------------------
@@ -290,8 +439,32 @@ def evaluate_checkpoint(
         render_depth=True,
     ).to(device)
 
+    # Lazy-load LPIPS once per checkpoint (reused across all samples).
+    lpips_net = None
+    try:
+        import lpips as _lpips_mod
+        lpips_net = _lpips_mod.LPIPS(net='vgg', verbose=False)
+        lpips_net.eval()
+        for p in lpips_net.parameters():
+            p.requires_grad = False
+        lpips_net = lpips_net.to(device)
+    except ImportError:
+        logger.warning("lpips not installed — lpips_fg will be NaN. Install with: pip install lpips")
+
     viz_dir = output_dir / ckpt_tag / "visuals"
     viz_dir.mkdir(parents=True, exist_ok=True)
+    export_dir = output_dir / ckpt_tag / "exports"
+    input_ply_dir = export_dir / "input_clouds"
+    fps_anchors_dir = export_dir / "fps_anchors"
+    normalized_mesh_dir = export_dir / "normalized_meshes"
+    gs_ply_dir = export_dir / "gaussians_ply"
+    gs_splat_dir = export_dir / "gaussians_splat"
+    if not getattr(args, "no_export_3d", False):
+        input_ply_dir.mkdir(parents=True, exist_ok=True)
+        fps_anchors_dir.mkdir(parents=True, exist_ok=True)
+        normalized_mesh_dir.mkdir(parents=True, exist_ok=True)
+        gs_ply_dir.mkdir(parents=True, exist_ok=True)
+        gs_splat_dir.mkdir(parents=True, exist_ok=True)
 
     results = []
     for rank, idx in enumerate(sample_indices):
@@ -304,7 +477,47 @@ def evaluate_checkpoint(
         mesh_stem = Path(sample.get("mesh_path", str(idx))).stem
         logger.info(f"  [{rank+1}/{len(sample_indices)}] {mesh_stem}")
 
-        metrics, row_images = evaluate_sample(model, renderer, sample, device)
+        metrics, row_images, export_tensors = evaluate_sample(
+            model, renderer, sample, device, lpips_net=lpips_net,
+        )
+
+        if not getattr(args, "no_export_3d", False):
+            # File naming: {type_prefix}_{rank:03d}_{mesh_stem}.{ext}
+            # Makes multi-sample exports easy to sort and identify in CloudCompare.
+            stem = f"{rank:03d}_{mesh_stem}"
+            export_input_surface_ply(
+                export_tensors["surface"],
+                input_ply_dir / f"points_{stem}.ply",
+            )
+            export_xyz_pointcloud_ply(
+                export_tensors["query_positions"],
+                fps_anchors_dir / f"anchor_{stem}.ply",
+            )
+            mesh_path = sample.get("mesh_path")
+            if mesh_path:
+                try:
+                    export_normalized_mesh_obj(
+                        mesh_path,
+                        normalized_mesh_dir / f"mesh_{stem}.obj",
+                    )
+                except Exception as e:
+                    logger.warning("Normalized mesh export failed for %s: %s", mesh_stem, e)
+            export_gaussian_splat_ply(
+                export_tensors["means"],
+                export_tensors["scales"],
+                export_tensors["rotations"],
+                export_tensors["opacities"],
+                export_tensors["colors"],
+                gs_ply_dir / f"gaussian_{stem}.ply",
+            )
+            export_gaussian_splat_file(
+                export_tensors["means"],
+                export_tensors["scales"],
+                export_tensors["rotations"],
+                export_tensors["opacities"],
+                export_tensors["colors"],
+                gs_splat_dir / f"gaussian_{stem}.splat",
+            )
 
         # Save visual grid
         if row_images:
@@ -312,8 +525,9 @@ def evaluate_checkpoint(
             grid_labeled = add_label_bar(
                 grid,
                 f"{ckpt_tag} | {mesh_stem} | "
-                f"PSNR={metrics['psnr_fg']:.2f}dB | "
-                f"SSIM={metrics['ssim_fg']:.4f}",
+                f"PSNR={metrics['psnr_fg']:.2f}dB  "
+                f"SSIM={metrics['ssim_fg']:.4f}  "
+                f"LPIPS={metrics['lpips_fg']:.4f}",
             )
             grid_labeled.save(viz_dir / f"{rank:03d}_{mesh_stem}.png")
 
@@ -328,9 +542,8 @@ def evaluate_checkpoint(
         logger.info(
             f"PSNR={metrics['psnr_fg']:.2f}dB  "
             f"SSIM={metrics['ssim_fg']:.4f}  "
-            f"alpha_fg={metrics['alpha_fg']:.3f}  "
-            f"L1depth={metrics['mean_depth_l1']:.4f}  "
-            f"depth_cov={metrics['depth_coverage']:.3f}"
+            f"LPIPS={metrics['lpips_fg']:.4f}  "
+            f"L1depth={metrics['mean_depth_l1']:.4f}"
         )
 
     # Summary for this checkpoint
@@ -339,16 +552,16 @@ def evaluate_checkpoint(
         if valid:
             mean_psnr = sum(r["psnr_fg"] for r in valid) / len(valid)
             mean_ssim = sum(r["ssim_fg"] for r in valid) / len(valid)
-            mean_alpha = sum(r["alpha_fg"] for r in valid) / len(valid)
+            mean_lpips = sum(r["lpips_fg"] for r in valid if not math.isnan(r["lpips_fg"])) / max(
+                sum(1 for r in valid if not math.isnan(r["lpips_fg"])), 1
+            )
             mean_depth_l1 = sum(r["mean_depth_l1"] for r in valid) / len(valid)
-            mean_dcov = sum(r["depth_coverage"] for r in valid) / len(valid)
             logger.info(
                 f"\n  SUMMARY [{ckpt_tag}] n={len(valid)} samples\n"
-                f"    mean PSNR  = {mean_psnr:.3f} dB\n"
-                f"    mean SSIM  = {mean_ssim:.4f}\n"
-                f"    alpha_fg   = {mean_alpha:.4f}\n"
-                f"    mean_depth_l1 = {mean_depth_l1:.4f}\n"
-                f"    depth_cov  = {mean_dcov:.4f}"
+                f"    mean PSNR    = {mean_psnr:.3f} dB\n"
+                f"    mean SSIM    = {mean_ssim:.4f}\n"
+                f"    mean LPIPS   = {mean_lpips:.4f}\n"
+                f"    mean L1depth = {mean_depth_l1:.4f}"
             )
 
     return results
@@ -379,14 +592,23 @@ def parse_args():
     p.add_argument("--pc_size", type=int, default=5120)
     p.add_argument("--pc_sharpedge_size", type=int, default=5120)
     p.add_argument("--downsample_ratio", type=int, default=20)
+    p.add_argument("--num_gs_per_anchor", type=int, default=1,
+                   help="Must match the value used during training.")
 
     # Rendering
-    p.add_argument("--render_height", type=int, default=256)
-    p.add_argument("--render_width", type=int, default=256)
-    p.add_argument("--num_views", type=int, default=4)
-    p.add_argument("--camera_distance", type=float, default=2.5)
+    p.add_argument("--render_height", type=int, default=512)
+    p.add_argument("--render_width", type=int, default=512)
+    p.add_argument("--num_views", type=int, default=6)
+    p.add_argument("--camera_distance", type=float, default=3.5)
     p.add_argument("--elevation_deg", type=float, default=20.0)
     p.add_argument("--camera_azimuths", type=str, default="0,90,180,270")
+    p.add_argument(
+        "--gt_view_layout",
+        type=str,
+        default="v46",
+        choices=("legacy", "v46"),
+        help="Must match the layout used to pre-cache GT.",
+    )
     p.add_argument("--mesh_blacklist", type=str, default=None)
     p.add_argument(
         "--categories",
@@ -411,9 +633,16 @@ def parse_args():
     p.add_argument("--only_cached_gt", action="store_true", default=True)
     p.add_argument("--no_only_cached_gt", action="store_false", dest="only_cached_gt")
 
+    # 3D asset export (eval only; training script unchanged)
+    p.add_argument(
+        "--no_export_3d",
+        action="store_true",
+        help="Skip writing input surface, FPS anchors, normalized mesh, and 3DGS exports.",
+    )
+
     # Misc
     p.add_argument("--device", type=str, default="cuda")
-    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--seed", type=int, default=42)
 
     return p.parse_args()
 
@@ -430,7 +659,9 @@ def main():
 
     # Parse camera azimuths
     azimuths = None
-    if args.camera_azimuths:
+    if str(args.gt_view_layout).lower() == "v46":
+        azimuths = None
+    elif args.camera_azimuths:
         azimuths = [float(a.strip()) for a in args.camera_azimuths.split(",")]
         if len(azimuths) != args.num_views:
             raise ValueError(
@@ -455,13 +686,14 @@ def main():
         mesh_blacklist=args.mesh_blacklist,
         azimuths_deg=azimuths,
         categories=categories,
+        view_layout=args.gt_view_layout,
     )
     logger.info(f"Dataset: {len(dataset)} meshes in {args.data_dir}")
 
     # Filter to meshes with pre-cached GT if requested
     mesh_paths = list(dataset.mesh_paths)
     tag = dataset.gt_renderer._tag
-    az_list = dataset.gt_renderer.azimuths_deg
+    az_list = dataset.gt_renderer.azimuths_deg or [0.0]
     if args.only_cached_gt:
         mesh_paths = [
             p
@@ -512,15 +744,15 @@ def main():
         valid = [r for r in ckpt_results if not math.isnan(r["psnr_fg"])]
         if not valid:
             continue
+        lpips_valid = [r["lpips_fg"] for r in valid if not math.isnan(r.get("lpips_fg", float("nan")))]
         summary_rows.append({
             "checkpoint": ckpt_path,
             "tag": ckpt_tag,
             "n_samples": len(valid),
             "mean_psnr_fg": round(sum(r["psnr_fg"] for r in valid) / len(valid), 4),
             "mean_ssim_fg": round(sum(r["ssim_fg"] for r in valid) / len(valid), 4),
-            "mean_alpha_fg": round(sum(r["alpha_fg"] for r in valid) / len(valid), 4),
+            "mean_lpips_fg": round(sum(lpips_valid) / len(lpips_valid), 4) if lpips_valid else float("nan"),
             "mean_depth_l1": round(sum(r["mean_depth_l1"] for r in valid) / len(valid), 4),
-            "mean_depth_cov": round(sum(r["depth_coverage"] for r in valid) / len(valid), 4),
         })
 
     csv_path = output_dir / "summary.csv"
@@ -535,17 +767,17 @@ def main():
         print("\n" + "=" * 80)
         print("EVALUATION SUMMARY")
         print("=" * 80)
-        print(f"{'Checkpoint':<50} {'PSNR':>8} {'SSIM':>8} {'Alpha':>8} {'L1depth':>10} {'DepthCov':>10}")
+        print(f"{'Checkpoint':<50} {'PSNR':>8} {'SSIM':>8} {'LPIPS':>8} {'L1depth':>10}")
         print("-" * 80)
         for row in sorted(summary_rows, key=lambda x: -x["mean_psnr_fg"]):
             name = Path(row["checkpoint"]).parent.name + "/" + Path(row["checkpoint"]).stem
+            lpips_str = f"{row['mean_lpips_fg']:>8.4f}" if not math.isnan(row["mean_lpips_fg"]) else "     n/a"
             print(
                 f"  {name:<48} "
                 f"{row['mean_psnr_fg']:>8.3f} "
                 f"{row['mean_ssim_fg']:>8.4f} "
-                f"{row['mean_alpha_fg']:>8.4f} "
-                f"{row['mean_depth_l1']:>10.4f} "
-                f"{row['mean_depth_cov']:>10.4f}"
+                f"{lpips_str} "
+                f"{row['mean_depth_l1']:>10.4f}"
             )
         print("=" * 80 + "\n")
 

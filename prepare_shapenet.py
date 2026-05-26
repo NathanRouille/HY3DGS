@@ -1,63 +1,14 @@
 #!/usr/bin/env python3
 """ShapeNet Core v2 dataset preparation for ShapeGSAE training.
 
-This script:
-  1. Scans ShapeNetCore.v2 for all valid OBJ models in selected categories.
-  2. Validates each mesh (loadable, has geometry, has texture/color).
-  3. Creates a reproducible 90/10 train/val split.
-  4. Writes train_list.json and val_list.json index files.
-  5. Optionally pre-caches GT RGBD renders (identical to --precache_only mode).
+Creates **experiment** folders under ``--output_dir`` (one per ``--experiment_name``).
+Each experiment contains:
 
-Usage
------
-Step 1 — install ShapeNet Core v2
-    Register at https://shapenet.org/ and download ShapeNetCore.v2.zip (~25 GB).
-    Extract to /path/to/ShapeNetCore.v2/
+  * ``train/``, ``val/`` — symlinks to ShapeNet ``models/`` dirs (subset only)
+  * ``manifest.json`` — mesh paths, GT tag, and which canonical OBJs have GT caches
+  * GT ``.pt`` files live under **ShapeNetCore** (canonical path), shared across experiments
 
-Step 2 — prepare index files
-    python prepare_shapenet.py \\
-        --shapenet_dir /path/to/ShapeNetCore.v2 \\
-        --output_dir   /path/to/data/shapenet \\
-        --categories   03001627,04379243,02958343 \\
-        --val_fraction 0.1
-
-Step 3 — pre-cache GT RGBD (CPU-only, run before training to avoid EGL issues)
-    CUDA_VISIBLE_DEVICES="" python prepare_shapenet.py \\
-        --shapenet_dir /path/to/ShapeNetCore.v2 \\
-        --output_dir   /path/to/data/shapenet \\
-        --categories   03001627,04379243,02958343 \\
-        --precache \\
-        --render_height 256 --render_width 256 \\
-        --num_views 4 --camera_azimuths "0,90,180,270"
-
-Step 4 — train
-    python train_gs_ae.py \\
-        --data_dir  /path/to/data/shapenet/train \\
-        --val_dir   /path/to/data/shapenet/val \\
-        --output_dir runs/shapenet_baseline \\
-        --num_views 4 --camera_azimuths "0,90,180,270"
-
-Category IDs (common subsets)
------------------------------
-    02691156  airplane    (~4045 models,  ~2.5 GB)
-    02828884  bench       (~1813 models,  ~1.0 GB)
-    02933112  cabinet     (~1571 models,  ~1.5 GB)
-    02958343  car         (~3533 models,  ~4.5 GB) ← good textures
-    03001627  chair       (~6778 models,  ~3.5 GB) ← start here
-    03636649  lamp        (~2318 models,  ~2.0 GB)
-    04256520  sofa        (~3173 models,  ~2.5 GB)
-    04379243  table       (~8509 models,  ~5.0 GB)
-    04530566  watercraft  (~1939 models,  ~1.5 GB)
-
-Total for all 9 categories: ~37k models, ~24 GB (well within 50 GB budget).
-For a quick start use only chairs (03001627, ~3.5 GB).
-
-Notes on textures
------------------
-ShapeNet v2 models use UV-mapped textures (OBJ + MTL + PNG/JPG).
-trimesh.load() handles these correctly and to_color() bakes textures to
-per-vertex colors. pyrender renders UV textures directly, producing
-higher-quality GT images. Both paths are supported.
+Pre-cache GT only via this script (not ``train_gs_ae.py``).
 """
 
 from __future__ import annotations
@@ -65,17 +16,24 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import math
 import os
 import random
+import shutil
 import sys
+from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
+
+from hy3dgen.shapegen.gt_cache_util import (
+    canonical_obj_path,
+    experiment_manifest_path,
+    is_usable_gt_cache_file,
+    model_folder_name,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# Default categories: chairs + tables + cars — good diversity, textures available
 DEFAULT_CATEGORIES = "03001627,04379243,02958343"
 
 CATEGORY_NAMES = {
@@ -90,19 +48,86 @@ CATEGORY_NAMES = {
     "04530566": "watercraft",
 }
 
+CATEGORY_NAME_TO_ID: Dict[str, str] = {name: sid for sid, name in CATEGORY_NAMES.items()}
 
-# ---------------------------------------------------------------------------
-# Mesh discovery
-# ---------------------------------------------------------------------------
+PrecachePerCategoryLimits = Union[int, Dict[str, int]]
 
-def discover_shapenet_models(
-    shapenet_dir: str,
-    categories: List[str],
+
+def resolve_category_token(tok: str) -> str:
+    tok = tok.strip()
+    if not tok:
+        raise ValueError("Empty category token")
+    if tok in CATEGORY_NAME_TO_ID:
+        return CATEGORY_NAME_TO_ID[tok]
+    if tok.isdigit() and len(tok) == 8:
+        return tok
+    known = ", ".join(sorted(CATEGORY_NAME_TO_ID))
+    raise ValueError(
+        f"Unknown category '{tok}'. Use a known name ({known}) or an 8-digit synset ID."
+    )
+
+
+def parse_precache_per_category(limits_str: str) -> PrecachePerCategoryLimits:
+    s = limits_str.strip()
+    if not s:
+        raise ValueError("Per-category limit string must not be empty")
+    if ":" not in s:
+        n = int(s)
+        if n <= 0:
+            raise ValueError(f"Per-category limit must be positive; got {n}")
+        return n
+    per_cat: Dict[str, int] = {}
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            raise ValueError(f"Invalid segment {part!r}; expected 'category:limit'")
+        key, val = part.split(":", 1)
+        cat_id = resolve_category_token(key)
+        limit = int(val.strip())
+        if limit <= 0:
+            raise ValueError(f"Per-category limit must be positive; got {key}={limit}")
+        if cat_id in per_cat:
+            raise ValueError(f"Duplicate category limit for {cat_id}")
+        per_cat[cat_id] = limit
+    if not per_cat:
+        raise ValueError(f"No valid category limits parsed from {limits_str!r}")
+    return per_cat
+
+
+def limit_models_per_category(
+    model_list: List[Dict],
+    limits: PrecachePerCategoryLimits,
 ) -> List[Dict]:
-    """Find all model_normalized.obj files in the given categories.
+    buckets: Dict[str, List[Dict]] = defaultdict(list)
+    for m in model_list:
+        buckets[m["category"]].append(m)
+    for cat in buckets:
+        buckets[cat].sort(key=lambda m: (m.get("model_id", ""), m["obj_path"]))
 
-    Returns a list of dicts: {'category': str, 'model_id': str, 'obj_path': str}
-    """
+    out: List[Dict] = []
+    parts = []
+    for cat in sorted(buckets):
+        items = buckets[cat]
+        if isinstance(limits, int):
+            cap = limits
+        else:
+            cap = limits.get(cat)
+        kept = items if cap is None else items[:cap]
+        name = CATEGORY_NAMES.get(cat, "?")
+        parts.append(f"{cat}({name})={len(kept)}/{len(items)}")
+        out.extend(kept)
+    logger.info(
+        "Per-category cap: %s models (from %s). %s",
+        len(out),
+        len(model_list),
+        "; ".join(parts),
+    )
+    return out
+
+
+def discover_shapenet_models(shapenet_dir: str, categories: List[str]) -> List[Dict]:
     root = Path(shapenet_dir)
     models = []
     for cat in categories:
@@ -116,42 +141,29 @@ def discover_shapenet_models(
                 models.append({
                     "category": cat,
                     "model_id": model_dir.name,
-                    "obj_path": str(obj_path),
+                    "obj_path": str(obj_path.resolve()),
                 })
     logger.info(f"Discovered {len(models)} models across {len(categories)} categories")
     return models
 
 
-# ---------------------------------------------------------------------------
-# Mesh validation
-# ---------------------------------------------------------------------------
-
 def validate_mesh(obj_path: str) -> Tuple[bool, str]:
-    """Return (is_valid, reason). Loads mesh and checks basic sanity."""
     try:
         import trimesh
         mesh = trimesh.load(obj_path, process=False)
         if isinstance(mesh, trimesh.scene.Scene):
             geoms = [g for g in mesh.geometry.values() if isinstance(g, trimesh.Trimesh)]
             if not geoms:
-                return False, "scene with no trimesh geometry"
+                return False, "empty scene"
             mesh = trimesh.util.concatenate(geoms)
-        if not isinstance(mesh, trimesh.Trimesh):
-            return False, f"unexpected type {type(mesh)}"
-        if len(mesh.faces) < 10:
-            return False, f"too few faces ({len(mesh.faces)})"
-        if len(mesh.vertices) < 10:
-            return False, f"too few vertices ({len(mesh.vertices)})"
-        bbox = mesh.bounds
-        if bbox is None or (bbox[1] - bbox[0]).max() < 1e-6:
-            return False, "degenerate bounding box"
+        if len(mesh.vertices) < 3 or len(mesh.faces) < 1:
+            return False, "degenerate geometry"
         return True, "ok"
     except Exception as e:
         return False, str(e)
 
 
 def check_has_color(obj_path: str) -> bool:
-    """Return True if the mesh appears to have non-grey color information."""
     try:
         import trimesh
         import numpy as np
@@ -161,24 +173,16 @@ def check_has_color(obj_path: str) -> bool:
             if not geoms:
                 return False
             mesh = trimesh.util.concatenate(geoms)
-        # Check for UV texture (most ShapeNet models use this)
-        if hasattr(mesh.visual, 'uv') and mesh.visual.uv is not None:
-            return True  # UV-mapped → has texture
-        # Check vertex colors
+        if hasattr(mesh.visual, "uv") and mesh.visual.uv is not None:
+            return True
         try:
             vc = mesh.visual.to_color().vertex_colors[:, :3].astype(np.float32)
-            # Compute per-channel std to see if it's a uniform grey
-            std = vc.std(axis=0).mean()
-            return float(std) > 0.05  # meaningful color variation
+            return float(vc.std(axis=0).mean()) > 0.05
         except Exception:
             return False
     except Exception:
         return False
 
-
-# ---------------------------------------------------------------------------
-# Split creation
-# ---------------------------------------------------------------------------
 
 def create_train_val_split(
     models: List[Dict],
@@ -186,28 +190,21 @@ def create_train_val_split(
     seed: int = 42,
     color_only: bool = False,
 ) -> Tuple[List[Dict], List[Dict]]:
-    """Create reproducible 90/10 (or custom) train/val split.
-
-    Stratifies by category so each category has the same train/val ratio.
-    If color_only is True, keeps only models with non-grey color data.
-    """
     rng = random.Random(seed)
-
     if color_only:
         logger.info("Filtering to colored meshes (this may take a few minutes)...")
         colored = []
         for i, m in enumerate(models):
-            if check_has_color(m['obj_path']):
+            if check_has_color(m["obj_path"]):
                 colored.append(m)
             if (i + 1) % 500 == 0:
                 logger.info(f"  Color check: {i+1}/{len(models)} done, {len(colored)} colored so far")
         logger.info(f"Color filter: {len(colored)}/{len(models)} models have color data")
         models = colored
 
-    # Group by category
     by_cat: Dict[str, List[Dict]] = {}
     for m in models:
-        by_cat.setdefault(m['category'], []).append(m)
+        by_cat.setdefault(m["category"], []).append(m)
 
     train_list, val_list = [], []
     for cat, cat_models in sorted(by_cat.items()):
@@ -216,131 +213,208 @@ def create_train_val_split(
         val_list.extend(cat_models[:n_val])
         train_list.extend(cat_models[n_val:])
         logger.info(
-            f"  {cat} ({CATEGORY_NAMES.get(cat,'?')}): "
+            f"  {cat} ({CATEGORY_NAMES.get(cat, '?')}): "
             f"{len(cat_models) - n_val} train + {n_val} val"
         )
-
     return train_list, val_list
 
 
-# ---------------------------------------------------------------------------
-# Symlink / directory structure
-# ---------------------------------------------------------------------------
+def _reset_split_dir(split_dir: Path) -> None:
+    if split_dir.exists():
+        shutil.rmtree(split_dir)
+    split_dir.mkdir(parents=True, exist_ok=True)
 
-def create_dataset_dirs(
-    output_dir: str,
-    train_list: List[Dict],
-    val_list: List[Dict],
+
+def create_experiment_symlinks(
+    experiment_dir: Path,
+    train_models: List[Dict],
+    val_models: List[Dict],
     use_symlinks: bool = True,
-) -> Tuple[str, str]:
-    """Create train/ and val/ subdirectories with symlinks to OBJ files.
+) -> Tuple[List[str], List[str]]:
+    """Symlink only ``train_models`` / ``val_models`` into the experiment tree.
 
-    Returns (train_dir, val_dir) absolute paths.
+    Returns lists of absolute paths to ``model_normalized.obj`` inside the experiment.
     """
-    root = Path(output_dir)
-    train_dir = root / "train"
-    val_dir = root / "val"
-    train_dir.mkdir(parents=True, exist_ok=True)
-    val_dir.mkdir(parents=True, exist_ok=True)
+    train_dir = experiment_dir / "train"
+    val_dir = experiment_dir / "val"
+    _reset_split_dir(train_dir)
+    _reset_split_dir(val_dir)
 
-    def link_models(models: List[Dict], target_dir: Path):
+    def link_models(models: List[Dict], target_dir: Path) -> List[str]:
+        paths: List[str] = []
         for m in models:
-            src = Path(m['obj_path']).parent     # .../models/
-            # Use category_modelid as unique name to avoid collisions
-            link_name = f"{m['category']}_{m['model_id']}"
-            dst = target_dir / link_name
-            if dst.exists() or dst.is_symlink():
-                continue
+            src = Path(m["obj_path"]).parent
+            dst = target_dir / model_folder_name(m)
             if use_symlinks:
-                try:
-                    dst.symlink_to(src.resolve())
-                except Exception as e:
-                    logger.warning(f"Symlink failed for {link_name}: {e}. Skipping.")
+                dst.symlink_to(src.resolve(), target_is_directory=True)
             else:
-                # Hard-copy the models/ directory
-                import shutil
-                shutil.copytree(src, dst, ignore_errors=True)
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+            obj = (dst / "model_normalized.obj").resolve()
+            paths.append(str(obj))
+        return paths
 
-    logger.info(f"Creating train symlinks in {train_dir} ...")
-    link_models(train_list, train_dir)
-    logger.info(f"Creating val symlinks in {val_dir} ...")
-    link_models(val_list, val_dir)
+    logger.info("Creating train symlinks (%d models) ...", len(train_models))
+    train_paths = link_models(train_models, train_dir)
+    logger.info("Creating val symlinks (%d models) ...", len(val_models))
+    val_paths = link_models(val_models, val_dir)
+    return train_paths, val_paths
 
-    return str(train_dir), str(val_dir)
 
-
-# ---------------------------------------------------------------------------
-# Pre-caching helper
-# ---------------------------------------------------------------------------
-
-def precache_gt(
+def precache_gt_for_models(
     model_list: List[Dict],
+    renderer,
+    split_name: str,
+) -> Tuple[List[Dict], List[str]]:
+    """Pre-render GT on canonical ShapeNet paths; skip if a valid cache already exists."""
+    n = len(model_list)
+    ok_models: List[Dict] = []
+    failed: List[str] = []
+    skipped = 0
+    rendered = 0
+    logger.info("Pre-caching GT for %d %s models (tag: %s) ...", n, split_name, renderer._tag)
+
+    for i, m in enumerate(model_list):
+        obj_path = m["obj_path"]
+        cache_path = renderer.cache_path(obj_path)
+        try:
+            if is_usable_gt_cache_file(cache_path):
+                skipped += 1
+                ok_models.append(m)
+            else:
+                if os.path.isfile(cache_path):
+                    try:
+                        os.remove(cache_path)
+                    except OSError:
+                        pass
+                renderer.get_or_render(obj_path, allow_render=True)
+                rendered += 1
+                ok_models.append(m)
+        except Exception as e:
+            failed.append(obj_path)
+            logger.warning("  [%d/%d] FAILED %s: %s", i + 1, n, obj_path, e)
+        if (i + 1) % 50 == 0 or (i + 1) == n:
+            logger.info(
+                "  [%d/%d] ok=%d skipped_existing=%d rendered=%d failed=%d",
+                i + 1, n, len(ok_models), skipped, rendered, len(failed),
+            )
+
+    logger.info(
+        "Pre-cache %s: %d/%d with usable GT (%d skipped existing, %d newly rendered, %d failed).",
+        split_name,
+        len(ok_models),
+        n,
+        skipped,
+        rendered,
+        len(failed),
+    )
+    return ok_models, failed
+
+
+def build_renderer(
     render_height: int,
     render_width: int,
     num_views: int,
     camera_azimuths: Optional[str],
     elevation_deg: float,
     camera_distance: float,
-    split_name: str,
+    gt_view_layout: str,
 ):
-    """Pre-render and cache GT RGBD for all models in the list."""
-    # Import training helpers
-    repo = Path(__file__).resolve().parent
-    if str(repo) not in sys.path:
-        sys.path.insert(0, str(repo))
-
     from train_gs_ae import GTRGBDRenderer
 
+    layout = (gt_view_layout or "legacy").lower()
+    if layout == "v46":
+        return GTRGBDRenderer(
+            height=render_height,
+            width=render_width,
+            num_views=num_views,
+            camera_distance=camera_distance,
+            elevation_deg=elevation_deg,
+            azimuths_deg=None,
+            view_layout="v46",
+            train_view_indices=None,
+        )
     azimuths_deg = None
     if camera_azimuths:
         azimuths_deg = [float(a.strip()) for a in camera_azimuths.split(",")]
         if len(azimuths_deg) != num_views:
-            raise ValueError(f"camera_azimuths has {len(azimuths_deg)} values but num_views={num_views}")
-
-    renderer = GTRGBDRenderer(
+            raise ValueError(
+                f"camera_azimuths has {len(azimuths_deg)} values but num_views={num_views}"
+            )
+    return GTRGBDRenderer(
         height=render_height,
         width=render_width,
         num_views=num_views,
         camera_distance=camera_distance,
         elevation_deg=elevation_deg,
         azimuths_deg=azimuths_deg,
+        view_layout="legacy",
     )
 
-    n = len(model_list)
-    ok, failed = 0, []
-    logger.info(f"Pre-caching GT RGBD for {n} {split_name} models (tag: {renderer._tag}) ...")
-    for i, m in enumerate(model_list):
-        # The OBJ path is inside a models/ directory; we pass the full OBJ path
-        obj_path = m["obj_path"]
-        try:
-            renderer.get_or_render(obj_path)
-            ok += 1
-        except Exception as e:
-            failed.append(obj_path)
-            logger.warning(f"  [{i+1}/{n}] FAILED {obj_path}: {e}")
-        if (i + 1) % 50 == 0 or (i + 1) == n:
-            logger.info(f"  [{i+1}/{n}] {ok} ok, {len(failed)} failed")
 
-    logger.info(f"Pre-cache {split_name}: {ok}/{n} succeeded, {len(failed)} failed.")
-    if failed:
-        logger.warning("Failed models:\n" + "\n".join(f"  {p}" for p in failed[:20]))
+def models_with_usable_gt(
+    model_list: List[Dict],
+    renderer,
+) -> List[Dict]:
+    """Keep models whose canonical GT cache already exists on disk."""
+    ok = []
+    for m in model_list:
+        if is_usable_gt_cache_file(renderer.cache_path(m["obj_path"])):
+            ok.append(m)
+    return ok
 
 
-# ---------------------------------------------------------------------------
-# Statistics reporting
-# ---------------------------------------------------------------------------
+def write_experiment_manifest(
+    experiment_dir: Path,
+    renderer,
+    train_models: List[Dict],
+    val_models: List[Dict],
+    train_mesh_paths: List[str],
+    val_mesh_paths: List[str],
+    render_height: int,
+    render_width: int,
+    gt_view_layout: str,
+    camera_distance: float,
+    categories: List[str],
+    val_fraction: float,
+    seed: int,
+) -> None:
+    cached_canonical = sorted({
+        canonical_obj_path(m["obj_path"])
+        for m in train_models + val_models
+        if is_usable_gt_cache_file(renderer.cache_path(m["obj_path"]))
+    })
+    manifest = {
+        "version": 1,
+        "gt_tag": renderer._tag,
+        "gt_view_layout": gt_view_layout,
+        "render_height": render_height,
+        "render_width": render_width,
+        "camera_distance": camera_distance,
+        "categories": categories,
+        "val_fraction": val_fraction,
+        "seed": seed,
+        "train_mesh_paths": train_mesh_paths,
+        "val_mesh_paths": val_mesh_paths,
+        "cached_canonical_objs": cached_canonical,
+        "train_models": train_models,
+        "val_models": val_models,
+    }
+    path = experiment_manifest_path(experiment_dir)
+    with open(path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    logger.info("Wrote %s (%d train, %d val paths with GT)", path, len(train_mesh_paths), len(val_mesh_paths))
+
 
 def report_stats(train_list: List[Dict], val_list: List[Dict]):
-    """Print dataset statistics."""
-    all_cats = sorted(set(m['category'] for m in train_list + val_list))
+    all_cats = sorted(set(m["category"] for m in train_list + val_list))
     print("\n" + "=" * 60)
     print("Dataset Statistics")
     print("=" * 60)
     print(f"{'Category':<40} {'Train':>8} {'Val':>6} {'Total':>8}")
     print("-" * 60)
     for cat in all_cats:
-        n_train = sum(1 for m in train_list if m['category'] == cat)
-        n_val = sum(1 for m in val_list if m['category'] == cat)
+        n_train = sum(1 for m in train_list if m["category"] == cat)
+        n_val = sum(1 for m in val_list if m["category"] == cat)
         name = CATEGORY_NAMES.get(cat, "unknown")
         print(f"  {cat} ({name:<20}) {n_train:>8} {n_val:>6} {n_train+n_val:>8}")
     print("-" * 60)
@@ -348,53 +422,50 @@ def report_stats(train_list: List[Dict], val_list: List[Dict]):
     print("=" * 60 + "\n")
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
 def parse_args():
     p = argparse.ArgumentParser(description="Prepare ShapeNet Core v2 for ShapeGSAE")
 
-    # Paths
     p.add_argument("--shapenet_dir", required=True,
-                   help="Root of extracted ShapeNetCore.v2 (contains category ID subdirs).")
+                   help="Root of ShapeNetCore (category ID subdirs).")
     p.add_argument("--output_dir", required=True,
-                   help="Where to write train/, val/ symlinks and index JSON files.")
+                   help="Parent directory for experiments (each run uses --experiment_name).")
+    p.add_argument("--experiment_name", type=str, default="default",
+                   help="Subfolder name under output_dir for this split + precache run.")
 
-    # Category selection
     p.add_argument("--categories", type=str, default=DEFAULT_CATEGORIES,
-                   help=f"Comma-separated ShapeNet category IDs. Default: {DEFAULT_CATEGORIES} "
-                        f"(chair, table, car). Use 'all' for all 55 categories.")
+                   help="Comma-separated synset IDs or 'all'.")
 
-    # Split
-    p.add_argument("--val_fraction", type=float, default=0.1,
-                   help="Fraction of each category to use for validation (default 0.1 = 10%%).")
-    p.add_argument("--seed", type=int, default=42,
-                   help="Random seed for reproducible splits.")
-    p.add_argument("--color_only", action="store_true",
-                   help="Only keep models that have non-grey color data. "
-                        "Slower (loads every mesh) but produces a cleaner training set.")
+    p.add_argument("--val_fraction", type=float, default=0.1)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--color_only", action="store_true")
+    p.add_argument("--validate_meshes", action="store_true")
 
-    # Validation
-    p.add_argument("--validate_meshes", action="store_true",
-                   help="Load every mesh with trimesh to validate geometry (slower but catches bad models).")
-
-    # Pre-caching
     p.add_argument("--precache", action="store_true",
-                   help="After creating splits, pre-render and cache GT RGBD for all models.")
-    p.add_argument("--render_height", type=int, default=256)
-    p.add_argument("--render_width", type=int, default=256)
+                   help="Pre-render GT under ShapeNetCore (skips existing valid caches).")
+    p.add_argument("--render_height", type=int, default=512)
+    p.add_argument("--render_width", type=int, default=512)
     p.add_argument("--num_views", type=int, default=4)
-    p.add_argument("--camera_azimuths", type=str, default="0,90,180,270",
-                   help="Comma-separated azimuth angles. Must match num_views.")
+    p.add_argument("--camera_azimuths", type=str, default="0,90,180,270")
     p.add_argument("--elevation_deg", type=float, default=20.0)
-    p.add_argument("--camera_distance", type=float, default=2.5)
-    p.add_argument("--precache_train_only", action="store_true",
-                   help="Only pre-cache training split (skip val).")
+    p.add_argument("--camera_distance", type=float, default=3.5)
+    p.add_argument("--precache_train_only", action="store_true")
+    p.add_argument("--gt_view_layout", type=str, default="v46", choices=("legacy", "v46"))
 
-    # Output format
+    p.add_argument(
+        "--precache_per_category_train",
+        type=str,
+        default=None,
+        help="Cap train models per synset before precache (int or 'chair:500,...').",
+    )
+    p.add_argument(
+        "--precache_per_category_val",
+        type=str,
+        default=None,
+        help="Cap val models per synset before precache (int or mapping). Default: same as train cap.",
+    )
+
     p.add_argument("--no_symlinks", action="store_true",
-                   help="Copy model directories instead of symlinking (for remote filesystems).")
+                   help="Copy model dirs instead of symlinking.")
 
     return p.parse_args()
 
@@ -402,126 +473,129 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # Parse categories
     if args.categories.lower() == "all":
         shapenet_root = Path(args.shapenet_dir)
         categories = sorted([d.name for d in shapenet_root.iterdir() if d.is_dir()])
-        logger.info(f"Using all {len(categories)} categories found in {args.shapenet_dir}")
     else:
-        categories = [c.strip() for c in args.categories.split(",") if c.strip()]
+        raw_cats = [c.strip() for c in args.categories.split(",") if c.strip()]
+        categories = [resolve_category_token(c) for c in raw_cats]
 
-    logger.info(f"Selected categories: {categories}")
-    for cat in categories:
-        logger.info(f"  {cat} → {CATEGORY_NAMES.get(cat, 'unknown')}")
+    experiment_dir = Path(args.output_dir).resolve() / args.experiment_name
+    experiment_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("Experiment directory: %s", experiment_dir)
 
-    # Discover models
     models = discover_shapenet_models(args.shapenet_dir, categories)
     if not models:
-        logger.error("No models found. Check --shapenet_dir and --categories.")
+        logger.error("No models found.")
         sys.exit(1)
 
-    # Optional mesh validation
     if args.validate_meshes:
-        logger.info("Validating meshes (this may take several minutes)...")
         valid_models = []
-        failed_models = []
         for i, m in enumerate(models):
-            is_valid, reason = validate_mesh(m["obj_path"])
-            if is_valid:
+            ok, _ = validate_mesh(m["obj_path"])
+            if ok:
                 valid_models.append(m)
-            else:
-                failed_models.append((m["obj_path"], reason))
             if (i + 1) % 500 == 0:
-                logger.info(f"  Validated {i+1}/{len(models)}: {len(valid_models)} ok, {len(failed_models)} failed")
-        logger.info(f"Validation complete: {len(valid_models)}/{len(models)} valid")
-        if failed_models:
-            bad_path = Path(args.output_dir) / "bad_meshes.txt"
-            bad_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(bad_path, "w") as f:
-                for path, reason in failed_models:
-                    f.write(f"{path}\t{reason}\n")
-            logger.info(f"Bad mesh list written to {bad_path}")
+                logger.info(f"  Validated {i+1}/{len(models)}")
         models = valid_models
 
-    # Create train/val split
-    logger.info("Creating train/val split...")
     train_list, val_list = create_train_val_split(
-        models,
-        val_fraction=args.val_fraction,
-        seed=args.seed,
-        color_only=args.color_only,
+        models, val_fraction=args.val_fraction, seed=args.seed, color_only=args.color_only,
     )
 
-    # Report statistics
-    report_stats(train_list, val_list)
+    train_limits: Optional[PrecachePerCategoryLimits] = None
+    val_limits: Optional[PrecachePerCategoryLimits] = None
+    if args.precache_per_category_train:
+        train_limits = parse_precache_per_category(args.precache_per_category_train)
+    if args.precache_per_category_val:
+        val_limits = parse_precache_per_category(args.precache_per_category_val)
+    elif train_limits is not None:
+        val_limits = train_limits
 
-    # Save index files
-    output_root = Path(args.output_dir)
-    output_root.mkdir(parents=True, exist_ok=True)
-    train_json = output_root / "train_list.json"
-    val_json = output_root / "val_list.json"
-    with open(train_json, "w") as f:
-        json.dump(train_list, f, indent=2)
-    with open(val_json, "w") as f:
-        json.dump(val_list, f, indent=2)
-    logger.info(f"Saved {train_json} ({len(train_list)} models)")
-    logger.info(f"Saved {val_json} ({len(val_list)} models)")
+    train_subset = limit_models_per_category(train_list, train_limits) if train_limits else train_list
+    val_subset = limit_models_per_category(val_list, val_limits) if val_limits else val_list
 
-    # Create symlinked directory structure
-    logger.info("Creating train/ and val/ directory structure...")
-    train_dir, val_dir = create_dataset_dirs(
-        args.output_dir, train_list, val_list,
+    report_stats(train_subset, val_subset)
+
+    renderer = build_renderer(
+        args.render_height,
+        args.render_width,
+        args.num_views,
+        args.camera_azimuths,
+        args.elevation_deg,
+        args.camera_distance,
+        args.gt_view_layout,
+    )
+
+    train_ok, val_ok = train_subset, val_subset
+    if args.precache:
+        logger.info("\n--- Pre-caching GT RGBD (canonical ShapeNetCore paths) ---")
+        precache_models = list(train_subset)
+        if not args.precache_train_only:
+            precache_models.extend(val_subset)
+        by_canon: Dict[str, Dict] = {}
+        for m in precache_models:
+            by_canon[canonical_obj_path(m["obj_path"])] = m
+        union_list = list(by_canon.values())
+        logger.info("Union precache list: %d unique canonical meshes", len(union_list))
+
+        ok_union, _ = precache_gt_for_models(union_list, renderer, "train+val")
+        ok_canon = {canonical_obj_path(m["obj_path"]) for m in ok_union}
+        train_ok = [m for m in train_subset if canonical_obj_path(m["obj_path"]) in ok_canon]
+        val_ok = (
+            []
+            if args.precache_train_only
+            else [m for m in val_subset if canonical_obj_path(m["obj_path"]) in ok_canon]
+        )
+    else:
+        train_ok = models_with_usable_gt(train_subset, renderer)
+        val_ok = (
+            []
+            if args.precache_train_only
+            else models_with_usable_gt(val_subset, renderer)
+        )
+        logger.info(
+            "No --precache: symlinking models with existing GT only (%d train, %d val)",
+            len(train_ok),
+            len(val_ok),
+        )
+
+    train_paths, val_paths = create_experiment_symlinks(
+        experiment_dir,
+        train_ok,
+        val_ok,
         use_symlinks=not args.no_symlinks,
     )
-    logger.info(f"Train dir: {train_dir}")
-    logger.info(f"Val dir:   {val_dir}")
 
-    # Optional pre-caching
-    if args.precache:
-        logger.info("\n--- Pre-caching GT RGBD ---")
-        precache_gt(
-            train_list,
-            render_height=args.render_height,
-            render_width=args.render_width,
-            num_views=args.num_views,
-            camera_azimuths=args.camera_azimuths,
-            elevation_deg=args.elevation_deg,
-            camera_distance=args.camera_distance,
-            split_name="train",
-        )
-        if not args.precache_train_only:
-            precache_gt(
-                val_list,
-                render_height=args.render_height,
-                render_width=args.render_width,
-                num_views=args.num_views,
-                camera_azimuths=args.camera_azimuths,
-                elevation_deg=args.elevation_deg,
-                camera_distance=args.camera_distance,
-                split_name="val",
-            )
+    write_experiment_manifest(
+        experiment_dir,
+        renderer,
+        train_ok,
+        val_ok,
+        train_paths,
+        val_paths,
+        args.render_height,
+        args.render_width,
+        args.gt_view_layout,
+        args.camera_distance,
+        categories,
+        args.val_fraction,
+        args.seed,
+    )
 
-    print("\n✓ Preparation complete.")
-    print(f"  Train: {train_dir}  ({len(train_list)} models)")
-    print(f"  Val:   {val_dir}  ({len(val_list)} models)")
-    print("\nNext steps:")
-    print("  1. If not pre-caching now, run pre-cache separately:")
-    print(f"     CUDA_VISIBLE_DEVICES=\"\" python prepare_shapenet.py \\")
-    print(f"         --shapenet_dir {args.shapenet_dir} \\")
-    print(f"         --output_dir {args.output_dir} \\")
-    print(f"         --categories {args.categories} \\")
-    print(f"         --precache \\")
-    print(f"         --render_height {args.render_height} --render_width {args.render_width} \\")
-    print(f"         --num_views {args.num_views} --camera_azimuths \"{args.camera_azimuths}\"")
-    print()
-    print("  2. Start training:")
-    print(f"     python train_gs_ae.py \\")
-    print(f"         --data_dir {train_dir} \\")
-    print(f"         --val_dir  {val_dir} \\")
-    print(f"         --output_dir runs/shapenet_baseline \\")
-    print(f"         --num_views {args.num_views} \\")
-    print(f"         --camera_azimuths \"{args.camera_azimuths}\" \\")
-    print(f"         --use_wandb")
+    print("\n✓ Experiment ready.")
+    print(f"  Directory: {experiment_dir}")
+    print(f"  Train:     {experiment_dir / 'train'}  ({len(train_paths)} symlinks, GT required)")
+    if not args.precache_train_only:
+        print(f"  Val:       {experiment_dir / 'val'}  ({len(val_paths)} symlinks)")
+    print("\nTraining:")
+    print(f"  python train_gs_ae.py \\")
+    print(f"    --data_dir {experiment_dir / 'train'} \\")
+    if not args.precache_train_only and val_paths:
+        print(f"    --val_dir {experiment_dir / 'val'} \\")
+    print(f"    --gt_view_layout {args.gt_view_layout} \\")
+    print(f"    --render_height {args.render_height} --render_width {args.render_width} \\")
+    print(f"    --num_views <N> --output_dir runs/<run_name> ...")
 
 
 if __name__ == "__main__":
