@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import struct
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
 
 import numpy as np
 import torch
@@ -74,11 +74,29 @@ def export_xyz_pointcloud_ply(
     xyz: Union[torch.Tensor, np.ndarray],
     path: Union[str, Path],
     rgb: tuple[int, int, int] = (255, 64, 64),
+    colors: Optional[Union[torch.Tensor, np.ndarray]] = None,
 ) -> None:
-    """Save ``[N, 3]`` positions as a colored point cloud PLY (e.g. FPS anchors)."""
+    """Save ``[N, 3]`` positions as a colored point cloud PLY (e.g. FPS anchors).
+
+    Args:
+        xyz    : ``(N, 3)`` positions.
+        path   : output ``.ply`` file path.
+        rgb    : uniform colour used when ``colors`` is ``None``.
+        colors : optional ``(N, 3)`` per-point colour in ``[0, 1]`` (e.g. PCA→RGB).
+    """
     pts = _to_numpy_f32(xyz).reshape(-1, 3)
     n = pts.shape[0]
-    r, g, b = (int(np.clip(c, 0, 255)) for c in rgb)
+
+    if colors is not None:
+        rgb_arr = _to_numpy_f32(colors).reshape(-1, 3)
+        if rgb_arr.shape[0] != n:
+            raise ValueError(
+                f"colors has {rgb_arr.shape[0]} entries but xyz has {n}"
+            )
+        rgb_u8 = np.clip(rgb_arr * 255.0, 0, 255).astype(np.uint8)
+    else:
+        r, g, b = (int(np.clip(c, 0, 255)) for c in rgb)
+        rgb_u8 = np.broadcast_to(np.array([r, g, b], dtype=np.uint8), (n, 3))
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -100,7 +118,7 @@ def export_xyz_pointcloud_ply(
             f.write(struct.pack(
                 "<3f3B",
                 float(pts[i, 0]), float(pts[i, 1]), float(pts[i, 2]),
-                r, g, b,
+                int(rgb_u8[i, 0]), int(rgb_u8[i, 1]), int(rgb_u8[i, 2]),
             ))
 
 

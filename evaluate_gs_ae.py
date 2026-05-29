@@ -21,7 +21,6 @@ Usage — compare two checkpoints
         --data_dir  data/shapenet/val \\
         --output_dir eval/step10k \\
         --num_samples 50 \\
-        --num_views 4 --camera_azimuths "0,90,180,270" \\
         --categories chair
 
 Usage — evaluate a single checkpoint on training data (overfit test)
@@ -32,6 +31,10 @@ Usage — evaluate a single checkpoint on training data (overfit test)
         --output_dir eval/overfit_check \\
         --num_samples 10 --shuffle \\
         --categories chair
+
+Evaluation always uses the 6 canonical v46 views (indices 0..5: top, bottom,
+front, back, left, right) so metrics are directly comparable across runs that
+were trained on any number of views.
 """
 
 from __future__ import annotations
@@ -68,42 +71,19 @@ from hy3dgen.shapegen.gs_export import (
     export_input_surface_ply,
     export_xyz_pointcloud_ply,
 )
-from hy3dgen.shapegen.gs_renderer import GaussianRenderer, _ssim
+from hy3dgen.shapegen.gs_renderer import GaussianRenderer
+from hy3dgen.shapegen.eval_metrics import compute_psnr, compute_ssim_fg
 from hy3dgen.shapegen.models.autoencoders.model import ShapeGSAE
 from hy3dgen.shapegen.surface_loaders import normalize_mesh
-from train_gs_ae import GTRGBDRenderer, MeshDataset, mesh_path_has_usable_gt_cache, resolve_category_ids
+from train_gs_ae import (
+    GTRGBDRenderer,
+    MeshDataset,
+    mesh_path_has_usable_gt_cache,
+    resolve_category_ids,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Metrics
-# ---------------------------------------------------------------------------
-
-def compute_psnr(pred: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor) -> float:
-    """PSNR (dB) on foreground pixels. All tensors float in [0,1]."""
-    pred_fg = pred[mask.expand_as(pred)]
-    gt_fg = gt[mask.expand_as(gt)]
-    if len(pred_fg) == 0:
-        return float("nan")
-    mse = F.mse_loss(pred_fg, gt_fg)
-    if mse.item() < 1e-10:
-        return 100.0
-    return float(-10.0 * torch.log10(mse).item())
-
-
-def compute_ssim_fg(pred: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor) -> float:
-    """SSIM [0,1] on foreground-masked image (higher is better).
-
-    Background pixels in pred are replaced with GT background before computing
-    SSIM to isolate foreground quality.
-    """
-    mask_f = mask.float()
-    pred_m = pred * mask_f + gt * (1.0 - mask_f)
-    pred_nchw = pred_m.unsqueeze(0).permute(0, 3, 1, 2)
-    gt_nchw = gt.unsqueeze(0).permute(0, 3, 1, 2)
-    return float(_ssim(pred_nchw, gt_nchw).item())
 
 
 # ---------------------------------------------------------------------------
@@ -117,18 +97,30 @@ def _get_turbo():
         return cm.get_cmap("turbo")
 
 
-def _depth_to_rgb_u8(depth: torch.Tensor) -> np.ndarray:
+def _depth_to_rgb_u8(
+    depth: torch.Tensor,
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+) -> np.ndarray:
+    """Map a (H, W, 1) depth tensor to a turbo-colormapped RGB image.
+
+    When ``vmin``/``vmax`` are provided, the colormap range is fixed; otherwise
+    it is derived per-image from the foreground pixels. Using a shared range
+    (from the GT depths of the same sample) prevents the small residual depth
+    halo from dominating per-image normalisation in the visualisation.
+    """
     d = depth.squeeze(-1).float().numpy()
     m = d > 0
     out = np.zeros((*d.shape, 3), dtype=np.uint8)
     if not np.any(m):
         return out
-    vmin, vmax = float(d[m].min()), float(d[m].max())
-    norm = (
-        np.zeros_like(d)
-        if vmax <= vmin
-        else np.clip((d - vmin) / (vmax - vmin), 0.0, 1.0)
-    )
+    if vmin is None or vmax is None:
+        vmin = float(d[m].min())
+        vmax = float(d[m].max())
+    if vmax <= vmin:
+        norm = np.zeros_like(d)
+    else:
+        norm = np.clip((d - vmin) / (vmax - vmin), 0.0, 1.0)
     cmap = _get_turbo()
     rgba = cmap(norm)
     return (rgba[..., :3] * 255.0 * m[..., None]).astype(np.uint8)
@@ -286,6 +278,39 @@ def export_normalized_mesh_obj(mesh_path: str, path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Diagnostic helpers
+# ---------------------------------------------------------------------------
+
+def pca_features_to_rgb(features: torch.Tensor) -> torch.Tensor:
+    """Reduce per-anchor encoder features to RGB via PCA → top 3 components.
+
+    Args:
+        features : (N, D) float tensor of post-transformer features.
+
+    Returns:
+        (N, 3) float tensor in [0, 1] suitable as per-point colour.
+    """
+    feats = features.detach().cpu().float()
+    n, d = feats.shape
+    if n == 0:
+        return feats.new_zeros((0, 3))
+    centered = feats - feats.mean(dim=0, keepdim=True)
+    try:
+        _, _, vh = torch.linalg.svd(centered, full_matrices=False)
+    except RuntimeError:
+        # Cuda SVD can fail on degenerate batches; fall back to CPU
+        _, _, vh = torch.linalg.svd(centered.cpu(), full_matrices=False)
+    top3 = vh[:3]                                # (3, D)
+    proj = centered @ top3.T                     # (N, 3)
+    # Min-max normalise each component to [0, 1].
+    p_min = proj.amin(dim=0, keepdim=True)
+    p_max = proj.amax(dim=0, keepdim=True)
+    rng = (p_max - p_min).clamp_min(1e-6)
+    rgb = (proj - p_min) / rng
+    return rgb.clamp(0.0, 1.0)
+
+
+# ---------------------------------------------------------------------------
 # Model loading
 # ---------------------------------------------------------------------------
 
@@ -306,6 +331,7 @@ def load_model(
         point_feats=6,
         downsample_ratio=args.downsample_ratio,
         num_gs_per_anchor=args.num_gs_per_anchor,
+        deterministic_encoder=True,
     ).to(device)
     ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
     state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
@@ -326,23 +352,48 @@ def evaluate_sample(
     device: torch.device,
     lpips_net=None,
 ) -> Tuple[Dict[str, float], List[Image.Image], Dict[str, torch.Tensor]]:
-    """Evaluate one mesh sample.
+    """Evaluate one mesh sample on the 6 canonical views.
 
-    Returns (metrics_dict, list_of_row_images, export_tensors).
+    Returns (metrics_dict, list_of_row_images, export_tensors). The export
+    dict additionally contains the post-transformer encoder features so the
+    caller can PCA-colour the anchors.
     """
     surface = sample["surface"].unsqueeze(0).to(device)
-    gt_rgbs = sample["rgbs"]
-    gt_depths = sample["depths"]
-    c2ws = sample["c2ws"]
+    # Canonical 6 views (top, bottom, front, back, left, right) — first six in v46.
+    gt_rgbs = sample["rgbs"][:6]
+    gt_depths = sample["depths"][:6]
+    c2ws = sample["c2ws"][:6]
 
     latents, query_positions = model.encode(surface)
-    means, scales, rotations, opacities, colors = model.decode(latents, query_positions)
+    means, scales, rotations, opacities, colors, features = model.decode(
+        latents, query_positions, return_features=True,
+    )
     query_positions = query_positions[0]
     means = means[0]
     scales = scales[0]
     rotations = rotations[0]
     opacities = opacities[0]
     colors = colors[0]
+    features = features[0]                                # (L, width)
+
+    # Shared depth colormap range from the GT (per sample): keeps the residual
+    # depth halo from dominating per-image normalisation in visualisations.
+    gt_depth_vals: List[float] = []
+    for gd in gt_depths:
+        m = gd > 0
+        if m.any():
+            gt_depth_vals.append(float(gd[m].min().item()))
+            gt_depth_vals.append(float(gd[m].max().item()))
+    if gt_depth_vals:
+        depth_vmin = min(gt_depth_vals)
+        depth_vmax = max(gt_depth_vals)
+    else:
+        depth_vmin = depth_vmax = None
+    depth_err_vmax: Optional[float] = None
+    if depth_vmin is not None and depth_vmax is not None:
+        # Cap the depth-error colormap so even small per-view halo errors stay
+        # readable without saturating the colour wheel.
+        depth_err_vmax = max((depth_vmax - depth_vmin) / 5.0, 1e-3)
 
     psnr_list, ssim_list, lpips_list, depth_l1_list = [], [], [], []
     row_images: List[Image.Image] = []
@@ -367,7 +418,7 @@ def evaluate_sample(
             lpips_val = float(lpips_net(pred_nchw, gt_nchw).mean().item())
             lpips_list.append(lpips_val)
 
-        # Depth L1 over foreground only (diagnostic metric; full-image L1 is dominated by bg zeros)
+        # Depth L1 over foreground only (diagnostic; full-image L1 is dominated by bg zeros).
         depth_l1 = F.l1_loss(
             pred_depth[valid_mask].float().reshape(-1),
             gt_depth[valid_mask].float().reshape(-1),
@@ -375,18 +426,18 @@ def evaluate_sample(
         depth_l1_list.append(float(depth_l1.item()))
 
         # ---- Error maps ----
-        rgb_err = (pred_rgb - gt_rgb).abs()          # (H, W, 3) → mean over channels
-        rgb_err_scalar = rgb_err.mean(dim=-1, keepdim=True)  # (H, W, 1)
-        depth_err = (pred_depth - gt_depth).abs()             # (H, W, 1)
+        rgb_err = (pred_rgb - gt_rgb).abs()
+        rgb_err_scalar = rgb_err.mean(dim=-1, keepdim=True)
+        depth_err = (pred_depth - gt_depth).abs()
 
         # Build visual row: GT RGB | Pred RGB | RGB Error | GT Depth | Pred Depth | Depth Error
         row = _hconcat([
             Image.fromarray(_rgb01_to_u8(gt_rgb)),
             Image.fromarray(_rgb01_to_u8(pred_rgb)),
             Image.fromarray(_error_to_rgb_u8(rgb_err_scalar)),
-            Image.fromarray(_depth_to_rgb_u8(gt_depth)),
-            Image.fromarray(_depth_to_rgb_u8(pred_depth)),
-            Image.fromarray(_error_to_rgb_u8(depth_err)),
+            Image.fromarray(_depth_to_rgb_u8(gt_depth, depth_vmin, depth_vmax)),
+            Image.fromarray(_depth_to_rgb_u8(pred_depth, depth_vmin, depth_vmax)),
+            Image.fromarray(_error_to_rgb_u8(depth_err, vmax=depth_err_vmax)),
         ])
         row_images.append(row)
 
@@ -408,6 +459,7 @@ def evaluate_sample(
         "rotations": rotations.detach().cpu(),
         "opacities": opacities.detach().cpu(),
         "colors": colors.detach().cpu(),
+        "features": features.detach().cpu(),
     }
     return metrics, row_images, export_tensors
 
@@ -456,12 +508,14 @@ def evaluate_checkpoint(
     export_dir = output_dir / ckpt_tag / "exports"
     input_ply_dir = export_dir / "input_clouds"
     fps_anchors_dir = export_dir / "fps_anchors"
+    pca_anchors_dir = export_dir / "fps_anchors_pca"
     normalized_mesh_dir = export_dir / "normalized_meshes"
     gs_ply_dir = export_dir / "gaussians_ply"
     gs_splat_dir = export_dir / "gaussians_splat"
     if not getattr(args, "no_export_3d", False):
         input_ply_dir.mkdir(parents=True, exist_ok=True)
         fps_anchors_dir.mkdir(parents=True, exist_ok=True)
+        pca_anchors_dir.mkdir(parents=True, exist_ok=True)
         normalized_mesh_dir.mkdir(parents=True, exist_ok=True)
         gs_ply_dir.mkdir(parents=True, exist_ok=True)
         gs_splat_dir.mkdir(parents=True, exist_ok=True)
@@ -493,6 +547,17 @@ def evaluate_checkpoint(
                 export_tensors["query_positions"],
                 fps_anchors_dir / f"anchor_{stem}.ply",
             )
+            # PCA-coloured anchors: open in CloudCompare to inspect whether the
+            # encoder produces semantically clustered features (good) or noise.
+            try:
+                pca_rgb = pca_features_to_rgb(export_tensors["features"])
+                export_xyz_pointcloud_ply(
+                    export_tensors["query_positions"],
+                    pca_anchors_dir / f"anchor_pca_{stem}.ply",
+                    colors=pca_rgb,
+                )
+            except Exception as e:
+                logger.warning("PCA anchor export failed for %s: %s", mesh_stem, e)
             mesh_path = sample.get("mesh_path")
             if mesh_path:
                 try:
@@ -598,17 +663,8 @@ def parse_args():
     # Rendering
     p.add_argument("--render_height", type=int, default=512)
     p.add_argument("--render_width", type=int, default=512)
-    p.add_argument("--num_views", type=int, default=6)
     p.add_argument("--camera_distance", type=float, default=3.5)
     p.add_argument("--elevation_deg", type=float, default=20.0)
-    p.add_argument("--camera_azimuths", type=str, default="0,90,180,270")
-    p.add_argument(
-        "--gt_view_layout",
-        type=str,
-        default="v46",
-        choices=("legacy", "v46"),
-        help="Must match the layout used to pre-cache GT.",
-    )
     p.add_argument("--mesh_blacklist", type=str, default=None)
     p.add_argument(
         "--categories",
@@ -657,53 +713,37 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Parse camera azimuths
-    azimuths = None
-    if str(args.gt_view_layout).lower() == "v46":
-        azimuths = None
-    elif args.camera_azimuths:
-        azimuths = [float(a.strip()) for a in args.camera_azimuths.split(",")]
-        if len(azimuths) != args.num_views:
-            raise ValueError(
-                f"camera_azimuths has {len(azimuths)} values but num_views={args.num_views}"
-            )
-
     categories: Optional[Set[str]] = resolve_category_ids(args.categories)
     if categories is not None:
         logger.info("Category filter: %s", sorted(categories))
 
-    # Build dataset
+    # Build dataset. We force the 6 canonical views (indices 0..5 of v46) so all
+    # checkpoints are evaluated on the same camera set regardless of training views.
     dataset = MeshDataset(
         data_dir=args.data_dir,
         pc_size=args.pc_size,
         pc_sharpedge_size=args.pc_sharpedge_size,
         render_height=args.render_height,
         render_width=args.render_width,
-        num_views=args.num_views,
+        num_views=6,
         camera_distance=args.camera_distance,
         elevation_deg=args.elevation_deg,
         max_items=args.max_items,
         mesh_blacklist=args.mesh_blacklist,
-        azimuths_deg=azimuths,
         categories=categories,
-        view_layout=args.gt_view_layout,
+        train_view_indices=list(range(6)),
     )
     logger.info(f"Dataset: {len(dataset)} meshes in {args.data_dir}")
 
-    # Filter to meshes with pre-cached GT if requested
     mesh_paths = list(dataset.mesh_paths)
     tag = dataset.gt_renderer._tag
-    az_list = dataset.gt_renderer.azimuths_deg or [0.0]
     if args.only_cached_gt:
         mesh_paths = [
-            p
-            for p in mesh_paths
-            if mesh_path_has_usable_gt_cache(
-                p, tag, args.render_height, args.render_width, az_list
-            )
+            p for p in mesh_paths
+            if mesh_path_has_usable_gt_cache(p, tag)
         ]
         logger.info(
-            "Filtered to %d meshes with usable GT on disk (tag '%s' or 4-view normv2 slice)",
+            "Filtered to %d meshes with usable v46 GT on disk (tag '%s')",
             len(mesh_paths),
             tag,
         )

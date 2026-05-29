@@ -368,6 +368,7 @@ class ShapeGSAE(nn.Module):
         use_ln_post: bool = True,
         scale_factor: float = 1.0,
         num_gs_per_anchor: int = 1,
+        deterministic_encoder: bool = True,
         ckpt_path=None,
     ):
         super().__init__()
@@ -393,6 +394,7 @@ class ShapeGSAE(nn.Module):
             qkv_bias=qkv_bias,
             use_ln_post=use_ln_post,
             qk_norm=qk_norm,
+            deterministic=deterministic_encoder,
         )
 
         # Deterministic bottleneck (no KL, no sampling)
@@ -465,12 +467,15 @@ class ShapeGSAE(nn.Module):
         self,
         latents: torch.FloatTensor,
         query_positions: torch.FloatTensor,
+        return_features: bool = False,
     ):
         """Decode compact latents + FPS anchors into 3DGS parameters.
 
         Args:
-            latents        : [B, num_latents, embed_dim]
-            query_positions: [B, num_latents, 3]
+            latents         : [B, num_latents, embed_dim]
+            query_positions : [B, num_latents, 3]
+            return_features : if True, also return the post-transformer features
+                              (B, num_latents, width) for diagnostics (PCA → RGB).
 
         Returns:
             means     : [B, num_latents * K, 3]
@@ -478,16 +483,17 @@ class ShapeGSAE(nn.Module):
             rotations : [B, num_latents * K, 4]  (unit quaternion, wxyz)
             opacities : [B, num_latents * K, 1]  (in [0, 1])
             colors    : [B, num_latents * K, 3]  (RGB in [0, 1])
+            (optionally) features : [B, num_latents, width] before the GS head
 
         where K = num_gs_per_anchor.  For K=1 this is identical to the original.
         """
         K = self.num_gs_per_anchor
         latents = self.bottleneck_up(latents)
-        latents = self.transformer(latents)
-        raw = self.gs_head(latents)          # (B, L, K*14)
+        features = self.transformer(latents)         # (B, L, width)
+        raw = self.gs_head(features)                 # (B, L, K*14)
 
         B, L, _ = raw.shape
-        raw = raw.view(B, L * K, 14)        # (B, L*K, 14)
+        raw = raw.view(B, L * K, 14)                 # (B, L*K, 14)
 
         # Each anchor is repeated K times so every Gaussian is locally anchored.
         anchors = (
@@ -496,7 +502,10 @@ class ShapeGSAE(nn.Module):
             .expand(B, L, K, 3)             # (B, L, K, 3)
             .reshape(B, L * K, 3)           # (B, L*K, 3)
         )
-        return self._parse_gaussians(raw, anchors)
+        gaussians = self._parse_gaussians(raw, anchors)
+        if return_features:
+            return (*gaussians, features)
+        return gaussians
 
     def _parse_gaussians(self, raw: torch.FloatTensor, query_positions: torch.FloatTensor):
         """Apply per-parameter activations and anchor means to FPS positions."""

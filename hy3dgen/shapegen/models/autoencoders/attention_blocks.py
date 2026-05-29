@@ -526,7 +526,8 @@ class PointCrossAttentionEncoder(nn.Module):
         qkv_bias: bool = True,
         use_ln_post: bool = False,
         use_checkpoint: bool = False,
-        qk_norm: bool = False
+        qk_norm: bool = False,
+        deterministic: bool = True,
     ):
 
         super().__init__()
@@ -536,6 +537,11 @@ class PointCrossAttentionEncoder(nn.Module):
         self.downsample_ratio = downsample_ratio
         self.point_feats = point_feats
         self.normal_pe = normal_pe
+        # When True: input subset selection and FPS starting seed are deterministic
+        # (sequential indexing + FPS random_start=False). Required for overfit so the
+        # loss is a deterministic function of the parameters. Flip to False for the
+        # original stochastic-augmentation behaviour during generalisation training.
+        self.deterministic = deterministic
 
         if pc_sharpedge_size == 0:
             logger.info('PointCrossAttentionEncoder: pc_sharpedge_size=0, using pc_size for both splits')
@@ -588,19 +594,29 @@ class PointCrossAttentionEncoder(nn.Module):
         assert sharpedge_pc.shape[
                    1] <= self.pc_sharpedge_size, "Sharpedge surface points size must be less than or equal to pc_sharpedge_size"
 
-        # Randomly select random surface points and random query points
+        # Select random surface points and random query points.
+        # In deterministic mode use sequential indexing + FPS random_start=False so
+        # the encoder output is a pure function of the parameters; this matters for
+        # overfit, where stochastic per-step anchors otherwise inject noise into the
+        # loss that cannot be explained away by depth-sorting (see plan §1).
         input_random_pc_size = min(int(num_random_query * self.downsample_ratio), random_pc.shape[1])
         random_query_ratio = num_random_query / input_random_pc_size
-        idx_random_pc = torch.randperm(random_pc.shape[1], device=random_pc.device)[:input_random_pc_size]
+        if self.deterministic:
+            idx_random_pc = torch.arange(input_random_pc_size, device=random_pc.device)
+        else:
+            idx_random_pc = torch.randperm(random_pc.shape[1], device=random_pc.device)[:input_random_pc_size]
         input_random_pc = random_pc[:, idx_random_pc, :]
         flatten_input_random_pc = input_random_pc.view(B * input_random_pc_size, D)
         N_down = int(flatten_input_random_pc.shape[0] / B)
         batch_down = torch.arange(B).to(pc.device)
         batch_down = torch.repeat_interleave(batch_down, N_down)
-        idx_query_random = fps(flatten_input_random_pc, batch_down, ratio=random_query_ratio)
+        idx_query_random = fps(
+            flatten_input_random_pc, batch_down, ratio=random_query_ratio,
+            random_start=not self.deterministic,
+        )
         query_random_pc = flatten_input_random_pc[idx_query_random].view(B, -1, D)
 
-        # Randomly select sharpedge surface points and sharpedge query points
+        # Select sharpedge surface points and sharpedge query points (same determinism rule)
         input_sharpedge_pc_size = int(num_sharpedge_query * self.downsample_ratio)
         if input_sharpedge_pc_size == 0:
             input_sharpedge_pc = torch.zeros(B, 0, D, dtype=input_random_pc.dtype).to(pc.device)
@@ -608,14 +624,20 @@ class PointCrossAttentionEncoder(nn.Module):
         else:
             input_sharpedge_pc_size = min(input_sharpedge_pc_size, sharpedge_pc.shape[1])
             sharpedge_query_ratio = num_sharpedge_query / input_sharpedge_pc_size
-            idx_sharpedge_pc = torch.randperm(sharpedge_pc.shape[1], device=sharpedge_pc.device)[
-                               :input_sharpedge_pc_size]
+            if self.deterministic:
+                idx_sharpedge_pc = torch.arange(input_sharpedge_pc_size, device=sharpedge_pc.device)
+            else:
+                idx_sharpedge_pc = torch.randperm(sharpedge_pc.shape[1], device=sharpedge_pc.device)[
+                                   :input_sharpedge_pc_size]
             input_sharpedge_pc = sharpedge_pc[:, idx_sharpedge_pc, :]
             flatten_input_sharpedge_surface_points = input_sharpedge_pc.view(B * input_sharpedge_pc_size, D)
             N_down = int(flatten_input_sharpedge_surface_points.shape[0] / B)
             batch_down = torch.arange(B).to(pc.device)
             batch_down = torch.repeat_interleave(batch_down, N_down)
-            idx_query_sharpedge = fps(flatten_input_sharpedge_surface_points, batch_down, ratio=sharpedge_query_ratio)
+            idx_query_sharpedge = fps(
+                flatten_input_sharpedge_surface_points, batch_down, ratio=sharpedge_query_ratio,
+                random_start=not self.deterministic,
+            )
             query_sharpedge_pc = flatten_input_sharpedge_surface_points[idx_query_sharpedge].view(B, -1, D)
 
         # Concatenate random and sharpedge surface points and query points

@@ -6,14 +6,14 @@ with ``model_normalized.obj``). Optional ``--categories chair`` filters by
 ShapeNet synset prefix; ``--only_cached_gt`` accepts either the exact GT cache
 for your view config or the 4-view ``normv2`` superset cache (same as training).
 
-Example (chairs, 1 view, 256² — reuses 4-view precache):
+Example (chairs, 14 views from v46 layout):
 
     python visualize_gs_ae.py \\
-        --checkpoint runs/p1_baseline_1v/ckpt_020000.pt \\
+        --checkpoint runs/p1_baseline/ckpt_020000.pt \\
         --data_dir ~/datasets/shapenet_prepared/val \\
         --categories chair \\
         --render_height 256 --render_width 256 \\
-        --num_views 1 --camera_azimuths "0" \\
+        --num_views 14 \\
         --num_samples 8
 """
 
@@ -47,7 +47,6 @@ from train_gs_ae import (  # noqa: E402
     mesh_path_has_usable_gt_cache,
     resolve_category_ids,
 )
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -100,17 +99,6 @@ def _vconcat(images: List[Image.Image]) -> Image.Image:
     return canvas
 
 
-def _parse_azimuths(s: Optional[str], num_views: int) -> Optional[List[float]]:
-    if not s:
-        return None
-    vals = [float(a.strip()) for a in s.split(",")]
-    if len(vals) != num_views:
-        raise ValueError(
-            f"--camera_azimuths has {len(vals)} values but num_views={num_views}"
-        )
-    return vals
-
-
 def parse_args() -> argparse.Namespace:
     repo = Path(__file__).resolve().parents[0]
     p = argparse.ArgumentParser(description="Visualize ShapeGSAE vs GT RGBD")
@@ -127,22 +115,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pc_size", type=int, default=5120)
     p.add_argument("--pc_sharpedge_size", type=int, default=5120)
     p.add_argument("--downsample_ratio", type=int, default=20)
+    p.add_argument("--num_gs_per_anchor", type=int, default=1)
 
-    # Default 128 matches typical val precache: h128w128az0_90_normv1.pt
     p.add_argument("--render_height", type=int, default=512)
     p.add_argument("--render_width", type=int, default=512)
-    p.add_argument("--num_views", type=int, default=2)
+    p.add_argument("--num_views", type=int, default=14)
     p.add_argument("--camera_distance", type=float, default=3.5)
     p.add_argument("--elevation_deg", type=float, default=20.0)
-    p.add_argument("--camera_azimuths", type=str, default="0,90")
-
-    p.add_argument(
-        "--gt_view_layout",
-        type=str,
-        default="legacy",
-        choices=("legacy", "v46"),
-        help="Must match the layout used to pre-cache GT.",
-    )
 
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--seed", type=int, default=0)
@@ -177,9 +156,6 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    azimuths = None
-    if str(args.gt_view_layout).lower() != "v46":
-        azimuths = _parse_azimuths(args.camera_azimuths, args.num_views)
     categories: Optional[Set[str]] = resolve_category_ids(args.categories)
     if categories is not None:
         logger.info("Category filter: %s", sorted(categories))
@@ -195,32 +171,22 @@ def main() -> None:
         elevation_deg=args.elevation_deg,
         max_items=args.max_items,
         mesh_blacklist=args.mesh_blacklist,
-        azimuths_deg=azimuths,
         categories=categories,
-        view_layout=args.gt_view_layout,
     )
     tag = dataset.gt_renderer._tag
-    az_list = dataset.gt_renderer.azimuths_deg or [0.0]
     mesh_paths = list(dataset.mesh_paths)
     if args.only_cached_gt:
         mesh_paths = [
-            p
-            for p in mesh_paths
-            if mesh_path_has_usable_gt_cache(
-                p, tag, args.render_height, args.render_width, az_list
-            )
+            p for p in mesh_paths
+            if mesh_path_has_usable_gt_cache(p, tag)
         ]
         logger.info(
-            "GT usable from disk (exact tag '%s' or 4-view normv2 slice): "
-            "%d mesh(es)",
-            tag,
-            len(mesh_paths),
+            "GT usable from disk (v46 tag '%s'): %d mesh(es)", tag, len(mesh_paths),
         )
         if not mesh_paths:
             raise RuntimeError(
-                "No usable GT cache on disk for this view/H×W config. "
-                "Run prepare_shapenet.py --precache with matching settings, "
-                "or pass --no_only_cached_gt to render on the fly."
+                "No usable v46 GT cache on disk for this H×W config. "
+                "Run prepare_shapenet.py --precache with matching settings."
             )
     if args.shuffle:
         random.shuffle(mesh_paths)
@@ -245,6 +211,7 @@ def main() -> None:
         pc_sharpedge_size=args.pc_sharpedge_size,
         point_feats=6,
         downsample_ratio=args.downsample_ratio,
+        num_gs_per_anchor=args.num_gs_per_anchor,
     ).to(device)
 
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)

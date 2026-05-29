@@ -51,11 +51,8 @@ if str(ROOT) not in sys.path:
 
 from hy3dgen.shapegen.gs_renderer import GaussianRenderer, RGBDLoss
 from hy3dgen.shapegen.surface_loaders import RGBSharpEdgeSurfaceLoader
-from train_gs_ae import (
-    GTRGBDRenderer,
-    compute_psnr,
-    compute_ssim_fg,
-)
+from hy3dgen.shapegen.eval_metrics import compute_psnr, compute_ssim_fg
+from train_gs_ae import GTRGBDRenderer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -203,17 +200,14 @@ def train(args: argparse.Namespace) -> None:
     logger.info("Output directory: %s", out_dir)
 
     # ---- Ground-truth RGBD ----
-    # Reuse the same GT renderer infrastructure from train_gs_ae.py
+    # Reuse the same GT renderer infrastructure (v46 layout, 46 cached views).
+    # We slice down to the first --num_views (canonical 6 + first staggered).
     gt_renderer = GTRGBDRenderer(
         height=args.render_height,
         width=args.render_width,
         camera_distance=args.camera_distance,
         elevation_deg=args.elevation_deg,
-        num_views=args.num_views,
-        view_layout="legacy",
-        azimuths_deg=[
-            i * 360.0 / args.num_views for i in range(args.num_views)
-        ] if args.num_views > 0 else None,
+        train_view_indices=list(range(args.num_views)),
     )
     logger.info("Loading GT RGBD for %s …", args.mesh_path)
     gt_rgbs, gt_depths, c2ws, _ = gt_renderer.get_or_render(args.mesh_path)
@@ -256,11 +250,10 @@ def train(args: argparse.Namespace) -> None:
         lambda_lpips=0.0,          # skip LPIPS for speed; enable if you want
         lambda_d=args.lambda_d,
         lambda_alpha=args.lambda_alpha,
-        alpha_bg_weight=args.alpha_bg_weight,
         lambda_scale=args.lambda_scale,
         lambda_opa=args.lambda_opa,
-        fg_weight=args.fg_weight,
-        min_valid_ratio=0.02,
+        rgb_loss_type=args.rgb_loss_type,
+        lpips_warmup_steps=0,
     )
 
     # ---- Optimiser ----
@@ -448,15 +441,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--elevation_deg", type=float, default=20.0)
 
     # ---- Loss weights ----
+    p.add_argument("--rgb_loss_type", choices=("mse", "l1"), default="mse")
     p.add_argument("--lambda_ssim", type=float, default=0.2)
     p.add_argument("--lambda_d", type=float, default=1.0)
     p.add_argument("--lambda_alpha", type=float, default=0.05)
-    p.add_argument("--alpha_bg_weight", type=float, default=5.0)
     p.add_argument("--lambda_scale", type=float, default=0.01,
                    help="AnchorSplat volume penalty weight.")
-    p.add_argument("--lambda_opa", type=float, default=0.01,
-                   help="AnchorSplat opacity penalty weight.")
-    p.add_argument("--fg_weight", type=float, default=0.75)
+    p.add_argument("--lambda_opa", type=float, default=0.05,
+                   help="Binary opacity entropy weight.")
 
     # ---- Optimiser ----
     p.add_argument("--lr", type=float, default=3e-4)

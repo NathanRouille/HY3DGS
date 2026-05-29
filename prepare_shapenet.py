@@ -313,41 +313,18 @@ def precache_gt_for_models(
 def build_renderer(
     render_height: int,
     render_width: int,
-    num_views: int,
-    camera_azimuths: Optional[str],
     elevation_deg: float,
     camera_distance: float,
-    gt_view_layout: str,
 ):
+    """Build the v46 GT renderer used for pre-caching (always renders all 46 views)."""
     from train_gs_ae import GTRGBDRenderer
 
-    layout = (gt_view_layout or "legacy").lower()
-    if layout == "v46":
-        return GTRGBDRenderer(
-            height=render_height,
-            width=render_width,
-            num_views=num_views,
-            camera_distance=camera_distance,
-            elevation_deg=elevation_deg,
-            azimuths_deg=None,
-            view_layout="v46",
-            train_view_indices=None,
-        )
-    azimuths_deg = None
-    if camera_azimuths:
-        azimuths_deg = [float(a.strip()) for a in camera_azimuths.split(",")]
-        if len(azimuths_deg) != num_views:
-            raise ValueError(
-                f"camera_azimuths has {len(azimuths_deg)} values but num_views={num_views}"
-            )
     return GTRGBDRenderer(
         height=render_height,
         width=render_width,
-        num_views=num_views,
         camera_distance=camera_distance,
         elevation_deg=elevation_deg,
-        azimuths_deg=azimuths_deg,
-        view_layout="legacy",
+        train_view_indices=None,
     )
 
 
@@ -372,7 +349,6 @@ def write_experiment_manifest(
     val_mesh_paths: List[str],
     render_height: int,
     render_width: int,
-    gt_view_layout: str,
     camera_distance: float,
     categories: List[str],
     val_fraction: float,
@@ -386,7 +362,7 @@ def write_experiment_manifest(
     manifest = {
         "version": 1,
         "gt_tag": renderer._tag,
-        "gt_view_layout": gt_view_layout,
+        "gt_view_layout": "v46",
         "render_height": render_height,
         "render_width": render_width,
         "camera_distance": camera_distance,
@@ -444,12 +420,9 @@ def parse_args():
                    help="Pre-render GT under ShapeNetCore (skips existing valid caches).")
     p.add_argument("--render_height", type=int, default=512)
     p.add_argument("--render_width", type=int, default=512)
-    p.add_argument("--num_views", type=int, default=4)
-    p.add_argument("--camera_azimuths", type=str, default="0,90,180,270")
     p.add_argument("--elevation_deg", type=float, default=20.0)
     p.add_argument("--camera_distance", type=float, default=3.5)
     p.add_argument("--precache_train_only", action="store_true")
-    p.add_argument("--gt_view_layout", type=str, default="v46", choices=("legacy", "v46"))
 
     p.add_argument(
         "--precache_per_category_train",
@@ -520,11 +493,8 @@ def main():
     renderer = build_renderer(
         args.render_height,
         args.render_width,
-        args.num_views,
-        args.camera_azimuths,
         args.elevation_deg,
         args.camera_distance,
-        args.gt_view_layout,
     )
 
     train_ok, val_ok = train_subset, val_subset
@@ -576,7 +546,6 @@ def main():
         val_paths,
         args.render_height,
         args.render_width,
-        args.gt_view_layout,
         args.camera_distance,
         categories,
         args.val_fraction,
@@ -593,7 +562,6 @@ def main():
     print(f"    --data_dir {experiment_dir / 'train'} \\")
     if not args.precache_train_only and val_paths:
         print(f"    --val_dir {experiment_dir / 'val'} \\")
-    print(f"    --gt_view_layout {args.gt_view_layout} \\")
     print(f"    --render_height {args.render_height} --render_width {args.render_width} \\")
     print(f"    --num_views <N> --output_dir runs/<run_name> ...")
 

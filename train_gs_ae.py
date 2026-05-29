@@ -50,10 +50,9 @@ from hy3dgen.shapegen.gs_renderer import (
     RGBDLoss,
     TOTAL_V46_STAGGER,
     VIEW46_TRAIN_ALLOWED,
-    build_orbit_cameras,
     build_view46_c2ws,
-    _ssim,
 )
+from hy3dgen.shapegen.eval_metrics import compute_psnr, compute_ssim_fg
 
 
 class GtCacheNotFoundError(FileNotFoundError):
@@ -111,34 +110,9 @@ def resolve_category_ids(categories_str: Optional[str]) -> Optional[Set[str]]:
     return ids
 
 
-# The 4-azimuth set used by the prepared ShapeNet GT cache. When training with
-# a subset of these views (e.g. 1 or 2 views), GTRGBDRenderer reuses the
-# 4-view cache and slices it instead of re-rendering.
-SUPERSET_AZIMUTHS_DEG: List[float] = [0.0, 90.0, 180.0, 270.0]
-
-
-def mesh_path_has_usable_gt_cache(
-    mesh_path: str,
-    gt_tag: str,
-    height: int,
-    width: int,
-    azimuths_deg: List[float],
-) -> bool:
-    """True if a valid GT cache exists on disk (canonical ShapeNet path).
-
-    Used by ``visualize_gs_ae`` / ``evaluate_gs_ae`` with ``--only_cached_gt``.
-    """
-    if GT_CACHE_TAG_V46 in gt_tag:
-        return is_usable_gt_cache_file(gt_cache_file_path(mesh_path, gt_tag))
-    if is_usable_gt_cache_file(gt_cache_file_path(mesh_path, gt_tag)):
-        return True
-    if not all(a in SUPERSET_AZIMUTHS_DEG for a in azimuths_deg):
-        return False
-    super_az_str = '_'.join(str(int(round(a))) for a in SUPERSET_AZIMUTHS_DEG)
-    super_tag = f"h{height}w{width}az{super_az_str}_normv2"
-    if super_tag == gt_tag:
-        return False
-    return is_usable_gt_cache_file(gt_cache_file_path(mesh_path, super_tag))
+def mesh_path_has_usable_gt_cache(mesh_path: str, gt_tag: str) -> bool:
+    """True if a valid GT cache (v46) exists on disk for this mesh."""
+    return is_usable_gt_cache_file(gt_cache_file_path(mesh_path, gt_tag))
 
 
 def load_experiment_manifest(data_dir: str) -> Optional[Dict]:
@@ -191,33 +165,8 @@ def debug_gt_cache_path(mesh_path: str, debug_root: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Evaluation metrics
+# Evaluation metrics: imported from hy3dgen.shapegen.eval_metrics
 # ---------------------------------------------------------------------------
-
-def compute_psnr(pred: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor) -> float:
-    """PSNR (dB) on foreground pixels only. All tensors float in [0, 1]."""
-    pred_fg = pred[mask.expand_as(pred)]
-    gt_fg = gt[mask.expand_as(gt)]
-    if len(pred_fg) == 0:
-        return 0.0
-    mse = F.mse_loss(pred_fg, gt_fg)
-    if mse.item() < 1e-10:
-        return 100.0
-    return float(-10.0 * torch.log10(mse).item())
-
-
-def compute_ssim_fg(pred: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor) -> float:
-    """SSIM on foreground-masked image (0–1 scale, higher is better).
-
-    pred / gt : (H, W, 3) float [0, 1]
-    mask      : (H, W, 1) bool
-    """
-    # Replace background in pred with GT so SSIM window only measures fg quality
-    mask_f = mask.float()
-    pred_m = pred * mask_f + gt * (1.0 - mask_f)
-    pred_nchw = pred_m.unsqueeze(0).permute(0, 3, 1, 2)
-    gt_nchw = gt.unsqueeze(0).permute(0, 3, 1, 2)
-    return float(_ssim(pred_nchw, gt_nchw).item())
 
 
 @torch.no_grad()
@@ -233,7 +182,7 @@ def run_validation(
     Returns mean PSNR (fg) and mean SSIM (fg) across all samples and views.
     """
     model.eval()
-    psnr_list, ssim_list, alpha_list = [], [], []
+    psnr_list, ssim_list = [], []
 
     indices = list(range(len(val_dataset)))[:num_samples]
     for idx in indices:
@@ -244,9 +193,12 @@ def run_validation(
             continue
 
         surface = sample['surface'].unsqueeze(0).to(device)
-        gt_rgbs = sample['rgbs']
-        gt_depths = sample['depths']
-        c2ws = sample['c2ws']
+        # Defensive slice: even if val_dataset was built with more views, we always
+        # evaluate on the 6 canonical views (indices 0..5 in v46) for fair
+        # cross-experiment comparison.
+        gt_rgbs = sample['rgbs'][:6]
+        gt_depths = sample['depths'][:6]
+        c2ws = sample['c2ws'][:6]
 
         means, scales, rotations, opacities, colors = model(surface)
         means = means[0]
@@ -261,11 +213,9 @@ def run_validation(
                 continue
             out = renderer(means, scales, rotations, opacities, colors, c2w.to(device))
             pred_rgb = out['rgb'].cpu()
-            pred_alpha = out['alpha'].cpu()
 
             psnr_list.append(compute_psnr(pred_rgb, gt_rgb, valid_mask))
             ssim_list.append(compute_ssim_fg(pred_rgb, gt_rgb, valid_mask))
-            alpha_list.append(float(pred_alpha[valid_mask].mean().item()))
 
     model.train()
     if not psnr_list:
@@ -296,14 +246,10 @@ class GTRGBDRenderer:
         fov_deg: float = 49.13,
         camera_distance: float = 2.5,
         elevation_deg: float = 20.0,
-        num_views: int = 8,
         device: str = 'cpu',
-        azimuths_deg: Optional[List[float]] = None,
-        view_layout: str = 'legacy',
         debug_renders_root: Optional[str] = None,
         train_view_indices: Optional[List[int]] = None,
     ):
-        self.view_layout = (view_layout or 'legacy').lower()
         self.debug_renders_root = debug_renders_root
         self._train_view_indices = (
             None if train_view_indices is None else [int(i) for i in train_view_indices]
@@ -316,30 +262,12 @@ class GTRGBDRenderer:
         self.elevation_deg = elevation_deg
         self.device = device
 
-        if self.view_layout == 'v46':
-            if azimuths_deg is not None:
-                raise ValueError("view_layout=v46 does not use azimuths_deg")
-            self.azimuths_deg = []
-            self._tag = f"h{height}w{width}_{GT_CACHE_TAG_V46}"
-            self._full_num_views = TOTAL_V46_STAGGER
-            if self._train_view_indices is None:
-                self.num_views = self._full_num_views
-            else:
-                self.num_views = len(self._train_view_indices)
-            return
-
-        if self._train_view_indices is not None:
-            raise ValueError("train_view_indices are only supported with view_layout=v46")
-
-        # Legacy: normalize azimuths to an explicit list so the cache tag is always
-        # in the deterministic "az<a0>_<a1>_..." form.
-        if azimuths_deg is None:
-            azimuths_deg = [360.0 * i / num_views for i in range(num_views)]
-
-        self.num_views = num_views
-        self.azimuths_deg = list(azimuths_deg)
-        az_str = '_'.join(str(int(round(a))) for a in self.azimuths_deg)
-        self._tag = f"h{height}w{width}az{az_str}_normv2"
+        self._tag = f"h{height}w{width}_{GT_CACHE_TAG_V46}"
+        self._full_num_views = TOTAL_V46_STAGGER
+        self.num_views = (
+            self._full_num_views if self._train_view_indices is None
+            else len(self._train_view_indices)
+        )
 
     def cache_path(self, mesh_path: str) -> str:
         if self.debug_renders_root:
@@ -400,57 +328,13 @@ class GTRGBDRenderer:
         mesh: Optional[trimesh.Trimesh] = None,
         allow_render: bool = True,
     ):
-        """Return cached GT RGBD (and optional per-view camera params) or render.
+        """Return cached GT RGBD (and per-view camera params) or render the v46 set.
 
         Caches are always stored next to the **canonical** OBJ under ShapeNetCore
         (``realpath``), so experiment symlinks and ``prepare_shapenet`` agree.
 
         Set ``allow_render=False`` to require a pre-existing cache (training).
         """
-        if self.view_layout == 'v46':
-            return self._get_or_render_v46(mesh_path, mesh, allow_render=allow_render)
-
-        cache_path = self.cache_path(mesh_path)
-        cached = self._try_load_cache_tuple(cache_path)
-        if cached is not None:
-            rgbs, depths, c2ws, vp = cached
-            return rgbs, depths, c2ws, vp
-
-        if not allow_render:
-            raise GtCacheNotFoundError(
-                f"No usable GT cache at {cache_path} (canonical storage under ShapeNetCore)."
-            )
-
-        sliced = self._try_load_superset_slice(mesh_path)
-        if sliced is not None:
-            rgbs, depths, c2ws, _vp = sliced
-            return rgbs, depths, c2ws, None
-
-        if mesh is None:
-            mesh = self._load_mesh(mesh_path)
-        mesh = normalize_mesh(mesh)
-
-        c2ws = build_orbit_cameras(
-            num_views=self.num_views,
-            elevation_deg=self.elevation_deg,
-            radius=self.camera_distance,
-            device='cpu',
-            azimuths_deg=self.azimuths_deg,
-        )
-
-        rgbs, depths = self._render_views(mesh, c2ws)
-        rgbs, depths, c2ws = self._pack_gt_tensors(rgbs, depths, c2ws, use_fp16=True)
-        data = {'rgbs': rgbs, 'depths': depths, 'c2ws': c2ws, 'storage_dtype': 'float16'}
-        torch.save(data, cache_path)
-        rgbs, depths, c2ws = self._unpack_gt_tensors(rgbs, depths, c2ws, storage_dtype='float16')
-        return rgbs, depths, c2ws, None
-
-    def _get_or_render_v46(
-        self,
-        mesh_path: str,
-        mesh: Optional[trimesh.Trimesh] = None,
-        allow_render: bool = True,
-    ):
         cache_path = self.cache_path(mesh_path)
         cached = self._try_load_cache_tuple(cache_path)
         if cached is not None:
@@ -513,30 +397,6 @@ class GTRGBDRenderer:
         if vp is not None:
             vp = list(vp)
         return rgbs, depths, c2ws, vp
-
-    def _try_load_superset_slice(self, mesh_path: str):
-        """If our azimuths are a subset of the 4-view cache, load and slice it."""
-        if not all(a in SUPERSET_AZIMUTHS_DEG for a in self.azimuths_deg):
-            return None
-
-        super_az_str = '_'.join(str(int(round(a))) for a in SUPERSET_AZIMUTHS_DEG)
-        super_tag = f"h{self.height}w{self.width}az{super_az_str}_normv2"
-        if super_tag == self._tag:
-            return None
-
-        super_cache_path = gt_cache_file_path(mesh_path, super_tag)
-        cached = self._try_load_cache_tuple(super_cache_path)
-        if cached is None:
-            return None
-
-        rgbs, depths, c2ws, _vp = cached
-        idx = [SUPERSET_AZIMUTHS_DEG.index(a) for a in self.azimuths_deg]
-        return (
-            [rgbs[i] for i in idx],
-            [depths[i] for i in idx],
-            [c2ws[i] for i in idx],
-            None,
-        )
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -740,56 +600,50 @@ class MeshDataset(Dataset):
         pc_sharpedge_size: int = 5120,
         render_height: int = 256,
         render_width: int = 256,
-        num_views: int = 8,
+        num_views: int = 14,
         camera_distance: float = 2.5,
         elevation_deg: float = 20.0,
         max_items: Optional[int] = None,
         mesh_blacklist: Optional[str] = None,
-        azimuths_deg: Optional[List[float]] = None,
         categories: Optional[Iterable[str]] = None,
-        view_layout: str = 'legacy',
         precache_full_views: bool = False,
         debug_renders_root: Optional[str] = None,
         require_cached_gt: bool = True,
         use_experiment_manifest: bool = True,
+        train_view_indices: Optional[List[int]] = None,
     ):
         self.require_cached_gt = require_cached_gt
         self.loader = RGBSharpEdgeSurfaceLoader(
             num_uniform_points=pc_size,
             num_sharp_points=pc_sharpedge_size,
         )
-        vl = (view_layout or 'legacy').lower()
-        if vl == 'v46':
-            train_idx: Optional[List[int]] = None
-            if not precache_full_views:
-                snapped = snap_train_views_v46(num_views)
-                train_idx = train_view_indices_v46(snapped)
-                logger.info(
-                    f"GT view layout v46: training/preview uses {len(train_idx)} views "
-                    f"(requested num_views={num_views} → snapped {snapped}); "
-                    f"full {TOTAL_V46_STAGGER} views are cached on disk."
-                )
-            self.gt_renderer = GTRGBDRenderer(
-                height=render_height,
-                width=render_width,
-                num_views=TOTAL_V46_STAGGER,
-                camera_distance=camera_distance,
-                elevation_deg=elevation_deg,
-                azimuths_deg=None,
-                view_layout='v46',
-                debug_renders_root=debug_renders_root,
-                train_view_indices=train_idx,
+
+        if train_view_indices is not None:
+            train_idx: Optional[List[int]] = list(train_view_indices)
+            logger.info(
+                "GT view layout v46: using %d explicit train view indices "
+                "(full %d views cached on disk).",
+                len(train_idx),
+                TOTAL_V46_STAGGER,
             )
+        elif precache_full_views:
+            train_idx = None
         else:
-            self.gt_renderer = GTRGBDRenderer(
-                height=render_height,
-                width=render_width,
-                num_views=num_views,
-                camera_distance=camera_distance,
-                elevation_deg=elevation_deg,
-                azimuths_deg=azimuths_deg,
-                view_layout='legacy',
+            snapped = snap_train_views_v46(num_views)
+            train_idx = train_view_indices_v46(snapped)
+            logger.info(
+                f"GT view layout v46: training/preview uses {len(train_idx)} views "
+                f"(requested num_views={num_views} → snapped {snapped}); "
+                f"full {TOTAL_V46_STAGGER} views are cached on disk."
             )
+        self.gt_renderer = GTRGBDRenderer(
+            height=render_height,
+            width=render_width,
+            camera_distance=camera_distance,
+            elevation_deg=elevation_deg,
+            debug_renders_root=debug_renders_root,
+            train_view_indices=train_idx,
+        )
 
         # Load blacklist of known-bad meshes (one path per line; tab-separated label ignored)
         blacklist: Set[str] = set()
@@ -993,23 +847,6 @@ def _train_log_to_floats(comp: Dict[str, torch.Tensor]) -> Dict[str, float]:
 
 
 def train(args):
-    if args.smoke_overfit and str(args.gt_view_layout).lower() == 'v46':
-        raise ValueError("--smoke_overfit is incompatible with --gt_view_layout v46")
-
-    # ---- Parse camera azimuths ----
-    azimuths_deg: Optional[List[float]] = None
-    if str(args.gt_view_layout).lower() == 'v46':
-        if args.camera_azimuths:
-            raise ValueError("--camera_azimuths is not used with --gt_view_layout v46")
-    elif args.camera_azimuths:
-        azimuths_deg = [float(a.strip()) for a in args.camera_azimuths.split(',')]
-        if len(azimuths_deg) != args.num_views:
-            raise ValueError(
-                f"--camera_azimuths has {len(azimuths_deg)} values "
-                f"but --num_views={args.num_views}. They must match."
-            )
-        logger.info(f"Camera azimuths: {azimuths_deg}")
-
     # ---- Resolve category filter ----
     categories = resolve_category_ids(args.categories)
     if categories is not None:
@@ -1018,25 +855,6 @@ def train(args):
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     logger.info(f"Training on device: {device}")
     max_grad_norm = 1.0
-    if args.smoke_overfit:
-        # Minimal learning sanity-check: one view + pure RGB L1 only.
-        args.num_views = 1
-        args.lambda_ssim = 0.0
-        args.lambda_lpips = 0.0
-        args.lambda_d = 0.0
-        args.lambda_alpha = 0.0
-        args.lambda_scale = 0.0
-        args.lambda_opa = 0.0
-        # Keep smoke test numerically stable to diagnose learnability.
-        args.lr = min(args.lr, 3e-5)
-        args.weight_decay = 0.0
-        max_grad_norm = 0.1
-        logger.info(
-            "Smoke overfit mode enabled: num_views=1, lambda_ssim=0, lambda_lpips=0, lambda_d=0, "
-            "lambda_alpha=0, lambda_scale=0, lambda_opa=0, "
-            f"lr={args.lr:.1e}, weight_decay={args.weight_decay:.1e}, "
-            f"max_grad_norm={max_grad_norm:.2f}"
-        )
 
     # ---- Model ----
     model = ShapeGSAE(
@@ -1051,6 +869,7 @@ def train(args):
         point_feats=6,              # normals(3) + rgb(3)
         downsample_ratio=args.downsample_ratio,
         num_gs_per_anchor=args.num_gs_per_anchor,
+        deterministic_encoder=args.deterministic_encoder,
     ).to(device)
 
     if args.shapevae_ckpt:
@@ -1074,9 +893,8 @@ def train(args):
         lambda_alpha=args.lambda_alpha,
         lambda_scale=args.lambda_scale,
         lambda_opa=args.lambda_opa,
-        fg_weight=args.fg_weight,
-        min_valid_ratio=args.min_valid_depth_ratio,
-        alpha_bg_weight=args.alpha_bg_weight,
+        rgb_loss_type=args.rgb_loss_type,
+        lpips_warmup_steps=args.lpips_warmup_steps,
     )
 
     # ---- Data ----
@@ -1091,9 +909,7 @@ def train(args):
         elevation_deg=args.elevation_deg,
         max_items=args.max_items,
         mesh_blacklist=args.mesh_blacklist,
-        azimuths_deg=azimuths_deg,
         categories=categories,
-        view_layout=args.gt_view_layout,
         precache_full_views=False,
         require_cached_gt=not args.allow_on_the_fly_gt,
         use_experiment_manifest=not args.no_experiment_manifest,
@@ -1109,6 +925,8 @@ def train(args):
     )
 
     # ---- Optional validation dataset ----
+    # Validation always uses the 6 canonical views (indices 0..5) for cross-experiment
+    # comparability, regardless of how many views training uses.
     val_dataset = None
     if args.val_dir:
         val_dataset = MeshDataset(
@@ -1117,15 +935,14 @@ def train(args):
             pc_sharpedge_size=args.pc_sharpedge_size,
             render_height=args.render_height,
             render_width=args.render_width,
-            num_views=args.num_views,
+            num_views=6,
             camera_distance=args.camera_distance,
             elevation_deg=args.elevation_deg,
-            azimuths_deg=azimuths_deg,
             categories=categories,
-            view_layout=args.gt_view_layout,
             precache_full_views=False,
             require_cached_gt=not args.allow_on_the_fly_gt,
             use_experiment_manifest=not args.no_experiment_manifest,
+            train_view_indices=list(range(6)),
         )
         logger.info(f"Val set: {len(val_dataset)} meshes in {args.val_dir}")
 
@@ -1137,7 +954,7 @@ def train(args):
         betas=(0.9, 0.999),
     )
     total_steps = args.max_steps
-    warmup_steps = args.warmup_steps if not args.smoke_overfit else 0
+    warmup_steps = args.warmup_steps
     if warmup_steps > 0:
         warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
             optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps
@@ -1211,32 +1028,14 @@ def train(args):
             total_loss = torch.zeros((), device=device)
             log_components: Dict[str, torch.Tensor] = {}
 
-            # Per-view diagnostics (GPU tensors; .item() only when will_log)
-            view_valid_ratios_t: List[torch.Tensor] = []
-            view_pred_alpha_means_t: List[torch.Tensor] = []
-            view_pred_alpha_maxes_t: List[torch.Tensor] = []
-            view_pred_depth_pos_ratios_t: List[torch.Tensor] = []
-
             B = surface.shape[0]
             num_views = len(c2ws)
-            num_valid_views = 0  # views with enough foreground GT to be useful
             for view_idx, (gt_rgb_b, gt_depth_b, c2w) in enumerate(
                 zip(gt_rgbs, gt_depths, c2ws)
             ):
                 gt_rgb_b = gt_rgb_b.to(device)       # (B, H, W, 3)
                 gt_depth_b = gt_depth_b.to(device)   # (B, H, W, 1)
                 c2w = c2w.to(device)
-
-                gt_valid_ratio_t = (gt_depth_b > 0).float().mean()
-                if will_log:
-                    view_valid_ratios_t.append(gt_valid_ratio_t.detach())
-
-                # Skip views with no foreground GT: including them in the loss
-                # creates a gradient toward alpha=0 (predicting white bg = 0 loss).
-                if gt_valid_ratio_t < args.min_valid_depth_ratio:
-                    continue
-
-                num_valid_views += 1
 
                 # Render each item in the batch separately (gsplat is per-scene)
                 pred_rgbs_list, pred_depths_list, pred_alphas_list = [], [], []
@@ -1253,13 +1052,6 @@ def train(args):
                 pred_depth = torch.stack(pred_depths_list, dim=0) # (B, H, W, 1)
                 pred_alpha = torch.stack(pred_alphas_list, dim=0) # (B, H, W, 1)
 
-                if will_log:
-                    view_pred_alpha_means_t.append(pred_alpha.detach().mean())
-                    view_pred_alpha_maxes_t.append(pred_alpha.detach().max())
-                    view_pred_depth_pos_ratios_t.append(
-                        (pred_depth.detach() > 0).float().mean()
-                    )
-
                 valid_mask = gt_depth_b > 0
 
                 view_loss, comps = criterion(
@@ -1267,20 +1059,19 @@ def train(args):
                     pred_depth, gt_depth_b,
                     pred_alpha=pred_alpha,
                     valid_mask=valid_mask,
-                    scales=scales.view(-1, 3).log(),  # log(scale) for regulariser
+                    scales=scales.view(-1, 3).log(),
                     opacities=opacities.view(-1, 1),
+                    step=global_step,
                 )
                 total_loss = total_loss + view_loss
 
                 for k, v in comps.items():
                     _accum_train_log(log_components, k, v)
 
-            # Normalize by number of valid views (avoids collapsed solution when
-            # many views are skipped — loss scale stays constant regardless)
-            valid_views_fraction = num_valid_views / max(num_views, 1)
-            if num_valid_views > 0:
-                inv_n = 1.0 / num_valid_views
-                total_loss = total_loss / num_valid_views
+            # Mean over views: keeps loss magnitude constant across 6/14/22/etc.
+            if num_views > 0:
+                inv_n = 1.0 / num_views
+                total_loss = total_loss * inv_n
                 log_components = {k: v * inv_n for k, v in log_components.items()}
 
             optimizer.zero_grad()
@@ -1296,7 +1087,6 @@ def train(args):
             if global_step % args.log_every == 0:
                 lr = scheduler.get_last_lr()[0]
                 log_floats = _train_log_to_floats(log_components)
-                log_floats['valid_views_fraction'] = valid_views_fraction
 
                 elapsed = time.time() - t0
                 parts = ' | '.join(f"{k}={v:.4f}" for k, v in log_floats.items())
@@ -1308,24 +1098,26 @@ def train(args):
                 )
 
                 if use_wandb:
-                    # Core training metrics only — sub-components and per-view
-                    # diagnostics are available in the console log if needed.
-                    _WANDB_LOSS_KEYS = {
-                        'total', 'l1', 'ssim', 'lpips',
-                        'depth', 'alpha_sup', 'scale_reg', 'opa_reg', 'valid_ratio',
-                    }
-                    wandb_log = {
-                        "train/total_loss": float(total_loss.detach().item()),
+                    # Panels follow dict insertion order in wandb. Order chosen so
+                    # the most important plots (lr, grad_norm, regularisers) come
+                    # first, then individual loss components, with total_loss last.
+                    grad_norm_val = float(
+                        grad_norm_preclip.detach().item()
+                        if torch.is_tensor(grad_norm_preclip) else grad_norm_preclip
+                    )
+                    wandb_log: Dict[str, float] = {
                         "train/lr": float(lr),
-                        "train/grad_norm": float(
-                            grad_norm_preclip.detach().item()
-                            if torch.is_tensor(grad_norm_preclip) else grad_norm_preclip
-                        ),
-                        "train/valid_views_fraction": valid_views_fraction,
+                        "train/grad_norm": grad_norm_val,
                     }
-                    for k, v in log_floats.items():
-                        if k in _WANDB_LOSS_KEYS:
-                            wandb_log[f"train/{k}"] = v
+                    # Regularisers first
+                    for k in ("scale_reg", "opa_reg"):
+                        if k in log_floats:
+                            wandb_log[f"train/{k}"] = log_floats[k]
+                    # Per-loss components
+                    for k in (args.rgb_loss_type, "ssim", "lpips", "depth", "alpha_sup"):
+                        if k in log_floats:
+                            wandb_log[f"train/{k}"] = log_floats[k]
+                    wandb_log["train/total_loss"] = float(total_loss.detach().item())
                     wandb.log(wandb_log, step=global_step)
 
             # Validation
@@ -1403,24 +1195,15 @@ def parse_args():
     # Rendering
     p.add_argument('--render_height', type=int, default=512)
     p.add_argument('--render_width', type=int, default=512)
-    p.add_argument('--num_views', type=int, default=6)
+    p.add_argument(
+        '--num_views', type=int, default=14,
+        help=(
+            f'Number of v46-staggered training views per step. Snapped to one of '
+            f'{list(VIEW46_TRAIN_ALLOWED)}. Validation always uses 6 canonical views.'
+        ),
+    )
     p.add_argument('--camera_distance', type=float, default=3.5)
     p.add_argument('--elevation_deg', type=float, default=20.0)
-    p.add_argument('--camera_azimuths', type=str, default=None,
-                   help='Comma-separated azimuth angles in degrees, one per view. '
-                        'Length must equal --num_views (legacy layout only). '
-                        'IMPORTANT: for 2-view training use "0,90" (front + right side) '
-                        'NOT the default "0,180" — the back view (180°) has no geometry '
-                        'for most Objaverse objects. Default: evenly spaced (0,180 for 2 views).')
-    p.add_argument(
-        '--gt_view_layout',
-        type=str,
-        default='v46',
-        choices=('legacy', 'v46'),
-        help='GT camera layout: legacy orbit (num_views + azimuths) or v46 staggered '
-             f'cache ({TOTAL_V46_STAGGER} views); training uses --num_views snapped to '
-             f'{list(VIEW46_TRAIN_ALLOWED)}.',
-    )
     p.add_argument(
         '--allow_on_the_fly_gt',
         action='store_true',
@@ -1433,26 +1216,41 @@ def parse_args():
         help='Scan data_dir for symlinks instead of reading experiment manifest.json.',
     )
 
+    # Encoder behaviour
+    p.add_argument(
+        '--deterministic_encoder',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            'Sequential point subset + FPS random_start=False so the encoder is a '
+            'pure function of the parameters (required for clean overfit loss '
+            'curves). Use --no-deterministic_encoder for the original stochastic '
+            'augmentation behaviour during generalisation training.'
+        ),
+    )
+
     # Loss weights
+    p.add_argument('--rgb_loss_type', choices=('mse', 'l1'), default='mse',
+                   help='RGB photometric loss: MSE (LGM/GRM/GS-LRM default; preserves high frequencies) '
+                        'or L1.')
     p.add_argument('--lambda_ssim', type=float, default=0.2,
-                   help='SSIM loss weight. Applied only on foreground pixels.')
+                   help='SSIM loss weight. Full-image (no masking).')
     p.add_argument('--lambda_lpips', type=float, default=0.1,
-                   help='LPIPS perceptual loss weight on foreground-masked RGB.')
+                   help='LPIPS perceptual loss weight. Full-image; ramped in via --lpips_warmup_steps.')
+    p.add_argument('--lpips_warmup_steps', type=int, default=5000,
+                   help='Linear LPIPS ramp 0→1 over this many steps (0 disables). Mitigates the '
+                        '"perceptual mean" texture-washout failure mode.')
     p.add_argument('--lambda_d', type=float, default=1.0,
-                   help='Depth L1 weight. Key lever for Gaussian placement quality.')
+                   help='FG-masked depth L1 weight (background depth pixels are ignored).')
     p.add_argument('--lambda_alpha', type=float, default=0.05,
-                   help='Alpha supervision: FG→1 (MSE), BG→0 (L1, see --alpha_bg_weight).')
-    p.add_argument('--alpha_bg_weight', type=float, default=5.0,
-                   help='Multiplier on background alpha L1 before lambda_alpha (default 5).')
+                   help='Alpha supervision L1: gt_alpha = valid_mask (full image).')
     p.add_argument('--lambda_scale', type=float, default=0.01,
                    help='AnchorSplat volume penalty: penalises mean(s0*s1*s2) per Gaussian.')
-    p.add_argument('--lambda_opa', type=float, default=0.01,
-                   help='AnchorSplat opacity penalty: penalises mean(1 - opacity) toward solid splats.')
-    p.add_argument('--fg_weight', type=float, default=0.75,
-                   help='Foreground pixel weight in RGB L1 (0.75 = fg gets 3× bg weight). '
-                        'Gradient scale is preserved regardless of fg ratio.')
-    p.add_argument('--min_valid_depth_ratio', type=float, default=0.02,
-                   help='Skip depth loss for views with fewer than this fraction of valid pixels.')
+    p.add_argument('--lambda_opa', type=float, default=0.05,
+                   help='Binary opacity entropy weight: pushes each Gaussian to fully opaque '
+                        '(carves thin features) or fully transparent (carves holes). Replaces '
+                        'AnchorSplat\'s linear (1-opacity) penalty which allowed semi-transparent '
+                        'Gaussians at 0.5 ("vanishing colors").')
 
     # Optimiser
     p.add_argument('--lr', type=float, default=1e-4)
@@ -1473,8 +1271,6 @@ def parse_args():
                    help='Max number of val meshes to evaluate per validation pass.')
     p.add_argument('--resume_ckpt', type=str, default=None)
     p.add_argument('--seed', type=int, default=42)
-    p.add_argument('--smoke_overfit', action='store_true',
-                   help='Minimal learning sanity-check: single view + RGB L1 only.')
     p.add_argument('--use_wandb', action='store_true',
                    help='Enable Weights & Biases logging.')
     p.add_argument('--wandb_project', type=str, default='hy3dgs',
