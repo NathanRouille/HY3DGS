@@ -1241,7 +1241,7 @@ def parse_args():
                    help='Linear LPIPS ramp 0→1 over this many steps (0 disables). Mitigates the '
                         '"perceptual mean" texture-washout failure mode.')
     p.add_argument('--lambda_d', type=float, default=1.0,
-                   help='FG-masked depth L1 weight (background depth pixels are ignored).')
+                   help='Full-image depth L1 weight (GT background depth is 0).')
     p.add_argument('--lambda_alpha', type=float, default=0.05,
                    help='Alpha supervision L1: gt_alpha = valid_mask (full image).')
     p.add_argument('--lambda_scale', type=float, default=0.01,

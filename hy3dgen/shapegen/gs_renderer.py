@@ -353,7 +353,7 @@ class RGBDLoss(nn.Module):
     Loss = rgb_loss(pred_rgb, gt_rgb)                  [full image; MSE or L1]
          + lambda_ssim  * (1 - SSIM(pred_rgb, gt_rgb)) [full image]
          + lambda_lpips * LPIPS(pred_rgb, gt_rgb) * lpips_ramp(step) [full image]
-         + lambda_d     * L1(pred_depth, gt_depth)[fg]  [FG-masked, see plan §2a]
+         + lambda_d     * L1(pred_depth, gt_depth)      [full image; GT BG depth is 0]
          + lambda_alpha * L1(pred_alpha, gt_alpha)      [full image, gt_alpha = valid_mask]
          + lambda_scale * mean(s0*s1*s2)                [AnchorSplat volume penalty]
          + lambda_opa   * mean(H(opacity))              [binary entropy → 0 or 1]
@@ -361,8 +361,9 @@ class RGBDLoss(nn.Module):
     Why this recipe:
         - Full-image RGB/SSIM/LPIPS on white background matches the unanimous
           object FF-3DGS recipe (LGM, GRM, AGG, TriplaneGaussian).
-        - FG-masked depth removes the BG-depth-to-zero pressure that otherwise
-          forces edge Gaussians to shrink/become transparent (vanishing edges).
+        - Full-image depth L1 (GT background depth = 0) gives background Gaussians
+          a positional gradient that pushes them away from the object silhouette,
+          complementing alpha supervision.
         - Binary entropy on opacity peaks at 0.5 and pushes each Gaussian toward
           either 0 (carves holes) or 1 (opaque thin features) — see GSurf 2024
           and NGS Oct 2025 false-transparency analysis.
@@ -370,7 +371,7 @@ class RGBDLoss(nn.Module):
     Args:
         lambda_ssim         : SSIM weight (default 0.2).
         lambda_lpips        : LPIPS weight (default 0.1; ramped in by lpips_warmup_steps).
-        lambda_d            : FG depth L1 weight (default 1.0).
+        lambda_d            : full-image depth L1 weight (default 1.0).
         lambda_alpha        : full-image alpha L1 weight (default 0.05).
         lambda_scale        : AnchorSplat volume penalty mean(s0*s1*s2) weight (default 0.01).
         lambda_opa          : binary opacity entropy weight (default 0.05).
@@ -471,11 +472,8 @@ class RGBDLoss(nn.Module):
             ramp = 1.0
         loss_lpips = loss_lpips_raw * ramp
 
-        # ---- FG-masked depth L1 (plan §2a: removes BG-depth-to-zero pressure on edge Gaussians) ----
-        if valid_mask.any():
-            loss_depth = F.l1_loss(pred_depth[valid_mask], gt_depth[valid_mask])
-        else:
-            loss_depth = pred_depth.new_zeros(())
+        # ---- Full-image depth L1 (GT background depth is 0) ----
+        loss_depth = F.l1_loss(pred_depth, gt_depth)
 
         # ---- Full-image alpha L1 (gt_alpha = valid_mask as float) ----
         loss_alpha = pred_depth.new_zeros(())
