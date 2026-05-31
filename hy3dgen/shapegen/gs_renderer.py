@@ -348,36 +348,31 @@ class GaussianRenderer(nn.Module):
 # ---------------------------------------------------------------------------
 
 class RGBDLoss(nn.Module):
-    """Multi-view RGBD reconstruction loss for object FF-3DGS.
+    """Multi-view RGBD reconstruction loss for 3DGS.
 
-    Loss = rgb_loss(pred_rgb, gt_rgb)                  [full image; MSE or L1]
-         + lambda_ssim  * (1 - SSIM(pred_rgb, gt_rgb)) [full image]
-         + lambda_lpips * LPIPS(pred_rgb, gt_rgb) * lpips_ramp(step) [full image]
-         + lambda_d     * L1(pred_depth, gt_depth)      [full image; GT BG depth is 0]
-         + lambda_alpha * L1(pred_alpha, gt_alpha)      [full image, gt_alpha = valid_mask]
-         + lambda_scale * mean(s0*s1*s2)                [AnchorSplat volume penalty]
-         + lambda_opa   * mean(H(opacity))              [binary entropy → 0 or 1]
+    Loss = L1(pred_rgb, gt_rgb)                       [full-image, unmasked]
+         + lambda_ssim*(1-SSIM(pred_rgb, gt_rgb))     [full-image, unmasked]
+         + lambda_lpips*LPIPS(pred_rgb, gt_rgb)        [full-image, unmasked]
+         + lambda_d * L1(pred_depth, gt_depth)         [full-image; bg gt_depth=0]
+         + lambda_alpha * L1(pred_alpha, gt_alpha)     [gt_alpha = valid_mask as float]
+         + lambda_scale * mean(s0*s1*s2)               [AnchorSplat volume penalty]
+         + lambda_opa   * mean(1 - opacity)            [AnchorSplat opacity penalty]
 
-    Why this recipe:
-        - Full-image RGB/SSIM/LPIPS on white background matches the unanimous
-          object FF-3DGS recipe (LGM, GRM, AGG, TriplaneGaussian).
-        - Full-image depth L1 (GT background depth = 0) gives background Gaussians
-          a positional gradient that pushes them away from the object silhouette,
-          complementing alpha supervision.
-        - Binary entropy on opacity peaks at 0.5 and pushes each Gaussian toward
-          either 0 (carves holes) or 1 (opaque thin features) — see GSurf 2024
-          and NGS Oct 2025 false-transparency analysis.
+    SSIM is computed with background pixels replaced by GT background in the
+    prediction, so the network receives no SSIM gradient from background regions.
 
     Args:
-        lambda_ssim         : SSIM weight (default 0.2).
-        lambda_lpips        : LPIPS weight (default 0.1; ramped in by lpips_warmup_steps).
-        lambda_d            : full-image depth L1 weight (default 1.0).
-        lambda_alpha        : full-image alpha L1 weight (default 0.05).
-        lambda_scale        : AnchorSplat volume penalty mean(s0*s1*s2) weight (default 0.01).
-        lambda_opa          : binary opacity entropy weight (default 0.05).
-        rgb_loss_type       : 'mse' (default; LGM/GRM/GS-LRM) or 'l1'.
-        lpips_warmup_steps  : linear LPIPS ramp from 0→1 over this many steps (default 5000;
-                              set 0 to disable). Mitigates "perceptual mean" texture washout.
+        lambda_ssim       : weight for SSIM term (default 0.2).
+        lambda_lpips      : weight for LPIPS on foreground-masked RGB (default 0.1).
+        lambda_d          : weight for depth L1 + BG depth-to-zero (default 1.0).
+        lambda_alpha      : weight for alpha supervision on fg (→1) and bg (→0).
+        alpha_bg_weight   : multiplier on BG alpha L1 before lambda_alpha (default 5.0).
+        lambda_scale      : weight for AnchorSplat volume penalty mean(s0*s1*s2) (default 0.01).
+        lambda_opa        : weight for AnchorSplat opacity penalty mean(1 - opacity) (default 0.01).
+        fg_weight         : unused, kept for API compatibility.
+        alpha_bg_weight   : unused, kept for API compatibility.
+        min_valid_ratio   : if foreground pixel fraction falls below this, depth terms
+                            are zeroed for that view (degenerate camera / bad mesh).
     """
 
     def __init__(
@@ -387,29 +382,29 @@ class RGBDLoss(nn.Module):
         lambda_d: float = 1.0,
         lambda_alpha: float = 0.05,
         lambda_scale: float = 0.01,
-        lambda_opa: float = 0.05,
-        rgb_loss_type: str = 'mse',
-        lpips_warmup_steps: int = 5000,
+        lambda_opa: float = 0.01,
+        fg_weight: float = 0.75,
+        min_valid_ratio: float = 0.02,
+        alpha_bg_weight: float = 5.0,
     ):
         super().__init__()
-        if rgb_loss_type not in ('mse', 'l1'):
-            raise ValueError(f"rgb_loss_type must be 'mse' or 'l1', got {rgb_loss_type!r}")
         self.lambda_ssim = lambda_ssim
         self.lambda_lpips = lambda_lpips
         self.lambda_d = lambda_d
+        self._lpips_net = None
         self.lambda_alpha = lambda_alpha
         self.lambda_scale = lambda_scale
         self.lambda_opa = lambda_opa
-        self.rgb_loss_type = rgb_loss_type
-        self.lpips_warmup_steps = int(lpips_warmup_steps)
-        self._lpips_net = None
+        self.fg_weight = fg_weight
+        self.min_valid_ratio = min_valid_ratio
+        self.alpha_bg_weight = alpha_bg_weight
 
     def _compute_lpips(
         self,
         pred_nchw: torch.Tensor,
         gt_nchw: torch.Tensor,
     ) -> torch.Tensor:
-        """LPIPS on full-image RGB (NCHW, values in [0, 1])."""
+        """LPIPS on foreground-masked RGB (NCHW, values in [0, 1])."""
         if self.lambda_lpips <= 0:
             return pred_nchw.new_zeros(())
         if self._lpips_net is None:
@@ -437,7 +432,6 @@ class RGBDLoss(nn.Module):
         valid_mask: Optional[torch.Tensor] = None,  # same shape as depth, bool
         scales: Optional[torch.Tensor] = None,      # (N, 3) or (B, N, 3) log-scales
         opacities: Optional[torch.Tensor] = None,   # (N, 1) or (B, N, 1)
-        step: Optional[int] = None,                 # global step, for LPIPS warmup ramp
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Compute combined loss and return (total, component_dict)."""
 
@@ -455,25 +449,22 @@ class RGBDLoss(nn.Module):
         if valid_mask is None:
             valid_mask = gt_depth > 0
 
-        # ---- Full-image RGB photometric loss (MSE by default, L1 optional) ----
-        if self.rgb_loss_type == 'mse':
-            loss_rgb = F.mse_loss(pred_rgb, gt_rgb)
-        else:
-            loss_rgb = F.l1_loss(pred_rgb, gt_rgb)
+        valid_ratio = valid_mask.float().mean()
+        depth_scale = (valid_ratio >= self.min_valid_ratio).to(pred_depth.dtype)
 
-        # ---- Full-image SSIM + LPIPS ----
+        # ---- Full-image RGB L1 ----
+        loss_l1 = F.l1_loss(pred_rgb, gt_rgb)
+
+        # ---- Full-image SSIM ----
         pred_rgb_nchw = pred_rgb.permute(0, 3, 1, 2).contiguous()
         gt_rgb_nchw = gt_rgb.permute(0, 3, 1, 2).contiguous()
         loss_ssim = 1.0 - _ssim(pred_rgb_nchw, gt_rgb_nchw)
-        loss_lpips_raw = self._compute_lpips(pred_rgb_nchw, gt_rgb_nchw)
-        if self.lpips_warmup_steps > 0 and step is not None:
-            ramp = min(1.0, max(0.0, float(step) / float(self.lpips_warmup_steps)))
-        else:
-            ramp = 1.0
-        loss_lpips = loss_lpips_raw * ramp
+        loss_lpips = self._compute_lpips(pred_rgb_nchw, gt_rgb_nchw)
 
-        # ---- Full-image depth L1 (GT background depth is 0) ----
-        loss_depth = F.l1_loss(pred_depth, gt_depth)
+        # ---- Full-image depth L1 ----
+        # gt_depth == 0 for background pixels, so this naturally pushes the
+        # renderer to produce zero depth in empty regions.
+        loss_depth = depth_scale * F.l1_loss(pred_depth, gt_depth)
 
         # ---- Full-image alpha L1 (gt_alpha = valid_mask as float) ----
         loss_alpha = pred_depth.new_zeros(())
@@ -481,7 +472,8 @@ class RGBDLoss(nn.Module):
             gt_alpha = valid_mask.float().expand_as(pred_alpha)
             loss_alpha = F.l1_loss(pred_alpha, gt_alpha)
 
-        # ---- AnchorSplat volume penalty ----
+        # ---- AnchorSplat 3D regularisers ----
+        # Volume penalty: penalise the mean physical volume of each Gaussian.
         # scales are log(physical_scale); sum over dims gives log-volume.
         # Clamp before exp for numerical safety (scale≫e^10 is already degenerate).
         if scales is not None:
@@ -490,20 +482,15 @@ class RGBDLoss(nn.Module):
         else:
             loss_scale = pred_rgb.new_zeros(())
 
-        # ---- Binary opacity entropy: pushes opacity to 0 or 1, not 0.5 ----
-        # H(p) = -p log p - (1-p) log(1-p); peaks at p=0.5, zero at p∈{0,1}.
-        # Replaces AnchorSplat's monotone (1-p) penalty which let Gaussians sit
-        # at 0.5 ("vanishing colors" / semi-transparent edges).
+        # Opacity penalty: pull each Gaussian toward fully opaque (opacity → 1).
+        # opacities are sigmoid outputs in [0, 1].
         if opacities is not None:
-            eps = 1e-6
-            p = opacities.view(-1).clamp(eps, 1.0 - eps)
-            entropy = -(p * p.log() + (1.0 - p) * (1.0 - p).log())
-            loss_opa = entropy.mean()
+            loss_opa = (1.0 - opacities.view(-1)).abs().mean()
         else:
             loss_opa = pred_rgb.new_zeros(())
 
         total = (
-            loss_rgb
+            loss_l1
             + self.lambda_ssim * loss_ssim
             + self.lambda_lpips * loss_lpips
             + self.lambda_d * loss_depth
@@ -513,7 +500,7 @@ class RGBDLoss(nn.Module):
         )
 
         components = {
-            self.rgb_loss_type: loss_rgb,
+            'l1': loss_l1,
             'ssim': loss_ssim,
             'lpips': loss_lpips,
             'depth': loss_depth,
@@ -521,6 +508,7 @@ class RGBDLoss(nn.Module):
             'scale_reg': loss_scale,
             'opa_reg': loss_opa,
             'total': total,
+            'valid_ratio': valid_ratio.detach(),
         }
         return total, components
 

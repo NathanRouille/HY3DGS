@@ -893,8 +893,6 @@ def train(args):
         lambda_alpha=args.lambda_alpha,
         lambda_scale=args.lambda_scale,
         lambda_opa=args.lambda_opa,
-        rgb_loss_type=args.rgb_loss_type,
-        lpips_warmup_steps=args.lpips_warmup_steps,
     )
 
     # ---- Data ----
@@ -1061,7 +1059,6 @@ def train(args):
                     valid_mask=valid_mask,
                     scales=scales.view(-1, 3).log(),
                     opacities=opacities.view(-1, 1),
-                    step=global_step,
                 )
                 total_loss = total_loss + view_loss
 
