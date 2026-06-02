@@ -116,6 +116,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pc_sharpedge_size", type=int, default=5120)
     p.add_argument("--downsample_ratio", type=int, default=20)
     p.add_argument("--num_gs_per_anchor", type=int, default=1)
+    p.add_argument("--sh_degree", type=int, default=1, choices=(0, 1))
 
     p.add_argument("--render_height", type=int, default=512)
     p.add_argument("--render_width", type=int, default=512)
@@ -200,6 +201,10 @@ def main() -> None:
         selected = mesh_paths[: min(args.num_samples, len(mesh_paths))]
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    train_args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
+    sh_degree = int(train_args.get("sh_degree", args.sh_degree))
+
     model = ShapeGSAE(
         num_latents=args.num_latents,
         embed_dim=args.embed_dim,
@@ -212,9 +217,9 @@ def main() -> None:
         point_feats=6,
         downsample_ratio=args.downsample_ratio,
         num_gs_per_anchor=args.num_gs_per_anchor,
+        sh_degree=sh_degree,
     ).to(device)
 
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     model.load_state_dict(state, strict=True)
     model.eval()
@@ -223,6 +228,7 @@ def main() -> None:
         height=args.render_height,
         width=args.render_width,
         render_depth=True,
+        sh_degree=sh_degree,
     ).to(device)
 
     out_dir = Path(args.output_dir)
@@ -236,16 +242,16 @@ def main() -> None:
             logger.warning("Skip %s: %s", mesh_path, e)
             continue
 
-        means, scales, rotations, opacities, colors = model(surface.unsqueeze(0))
+        means, scales, rotations, opacities, sh_coeffs = model(surface.unsqueeze(0))
         means = means[0]
         scales = scales[0]
         rotations = rotations[0]
         opacities = opacities[0]
-        colors = colors[0]
+        sh_coeffs = sh_coeffs[0]
 
         rows: List[Image.Image] = []
         for vi, c2w in enumerate(c2ws):
-            out = renderer(means, scales, rotations, opacities, colors, c2w.to(device))
+            out = renderer(means, scales, rotations, opacities, sh_coeffs, c2w.to(device))
             gt_rgb, gt_dep = rgbs[vi], depths[vi]
             rows.append(
                 _hconcat(

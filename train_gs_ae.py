@@ -200,18 +200,18 @@ def run_validation(
         gt_depths = sample['depths'][:6]
         c2ws = sample['c2ws'][:6]
 
-        means, scales, rotations, opacities, colors = model(surface)
+        means, scales, rotations, opacities, sh_coeffs = model(surface)
         means = means[0]
         scales = scales[0]
         rotations = rotations[0]
         opacities = opacities[0]
-        colors = colors[0]
+        sh_coeffs = sh_coeffs[0]
 
         for gt_rgb, gt_depth, c2w in zip(gt_rgbs, gt_depths, c2ws):
             valid_mask = (gt_depth > 0)                       # (H, W, 1)
             if float(valid_mask.float().mean().item()) < 0.02:
                 continue
-            out = renderer(means, scales, rotations, opacities, colors, c2w.to(device))
+            out = renderer(means, scales, rotations, opacities, sh_coeffs, c2w.to(device))
             pred_rgb = out['rgb'].cpu()
 
             psnr_list.append(compute_psnr(pred_rgb, gt_rgb, valid_mask))
@@ -870,6 +870,7 @@ def train(args):
         downsample_ratio=args.downsample_ratio,
         num_gs_per_anchor=args.num_gs_per_anchor,
         deterministic_encoder=args.deterministic_encoder,
+        sh_degree=args.sh_degree,
     ).to(device)
 
     if args.shapevae_ckpt:
@@ -884,6 +885,7 @@ def train(args):
         height=args.render_height,
         width=args.render_width,
         render_depth=True,
+        sh_degree=args.sh_degree,
     ).to(device)
 
     criterion = RGBDLoss(
@@ -1020,7 +1022,7 @@ def train(args):
             c2ws = batch['c2ws']        # list of (4,4)
 
             # Forward pass
-            means, scales, rotations, opacities, colors = model(surface)
+            means, scales, rotations, opacities, sh_coeffs = model(surface)
 
             # Accumulate rendering loss over all views
             total_loss = torch.zeros((), device=device)
@@ -1040,7 +1042,7 @@ def train(args):
                 for b in range(B):
                     out = renderer(
                         means[b], scales[b], rotations[b],
-                        opacities[b], colors[b], c2w,
+                        opacities[b], sh_coeffs[b], c2w,
                     )
                     pred_rgbs_list.append(out['rgb'])
                     pred_depths_list.append(out['depth'])
@@ -1186,6 +1188,13 @@ def parse_args():
     p.add_argument('--num_gs_per_anchor', type=int, default=1,
                    help='Number of Gaussians predicted per FPS anchor (default 1). '
                         'Total Gaussians = num_latents * num_gs_per_anchor.')
+    p.add_argument(
+        '--sh_degree',
+        type=int,
+        default=1,
+        choices=(0, 1),
+        help='SH degree for view-dependent color (0=flat RGB, 1=SH1).',
+    )
     p.add_argument('--shapevae_ckpt', type=str, default=None,
                    help='Optional ShapeVAE .ckpt for warm-starting the encoder')
 

@@ -22,6 +22,50 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# INRIA 3DGS SH basis constant (DC coefficient scaling).
+SH_C0 = 0.28209479177387814
+
+
+def num_sh_bases(sh_degree: int) -> int:
+    """Number of real SH bases for the given active degree (inclusive)."""
+    return (sh_degree + 1) ** 2
+
+
+def rgb_to_sh_dc(rgb: torch.Tensor) -> torch.Tensor:
+    """Map linear RGB in [0, 1] to degree-0 SH coefficients (per channel)."""
+    return (rgb - 0.5) / SH_C0
+
+
+def sh_dc_to_rgb(f_dc: torch.Tensor) -> torch.Tensor:
+    """Map SH DC coefficients back to linear RGB in [0, 1]."""
+    return (f_dc * SH_C0 + 0.5).clamp(0.0, 1.0)
+
+
+def pack_sh_coeffs(
+    dc_rgb: torch.Tensor,
+    sh_rest: Optional[torch.Tensor],
+    sh_degree: int,
+) -> torch.Tensor:
+    """Build gsplat SH coefficient tensor from DC RGB and higher-order coeffs.
+
+    Args:
+        dc_rgb  : (..., 3) sigmoid RGB in [0, 1] for the DC band.
+        sh_rest : (..., (K-1)*3) raw higher-order coeffs, or None when ``sh_degree==0``.
+        sh_degree: active SH degree (0 = view-independent DC only).
+
+    Returns:
+        (..., K, 3) with K = (sh_degree + 1)^2.
+    """
+    K = num_sh_bases(sh_degree)
+    f_dc = rgb_to_sh_dc(dc_rgb).unsqueeze(-2)  # (..., 1, 3)
+    if sh_degree == 0:
+        return f_dc
+    if sh_rest is None:
+        raise ValueError("sh_rest is required when sh_degree > 0")
+    rest = sh_rest.reshape(*sh_rest.shape[:-1], K - 1, 3)
+    return torch.cat([f_dc, rest], dim=-2)
+
+
 # ---------------------------------------------------------------------------
 # SSIM (lightweight, no external dependency)
 # ---------------------------------------------------------------------------
@@ -247,10 +291,14 @@ class GaussianRenderer(nn.Module):
         far: float = 100.0,
         background_color: Tuple[float, float, float] = (1.0, 1.0, 1.0),
         render_depth: bool = True,
+        sh_degree: int = 1,
     ):
         super().__init__()
         self.height = height
         self.width = width
+        self.sh_degree = int(sh_degree)
+        if self.sh_degree < 0:
+            raise ValueError(f"sh_degree must be >= 0, got {sh_degree}")
         self.near = near
         self.far = far
         self.register_buffer(
@@ -270,10 +318,14 @@ class GaussianRenderer(nn.Module):
         scales: torch.Tensor,       # (N, 3)
         rotations: torch.Tensor,    # (N, 4) wxyz quaternion
         opacities: torch.Tensor,    # (N, 1)
-        colors: torch.Tensor,       # (N, 3) RGB
+        colors: torch.Tensor,       # (N, 3) RGB if sh_degree==0, else (N, K, 3) SH coeffs
         c2w: torch.Tensor,          # (4, 4) camera-to-world
     ) -> Dict[str, torch.Tensor]:
         """Render a single scene.
+
+        When ``sh_degree > 0``, ``colors`` must be SH coefficients with shape
+        ``(N, (sh_degree+1)^2, 3)``.  When ``sh_degree == 0``, pass linear RGB
+        ``(N, 3)`` or a single-band SH tensor ``(N, 1, 3)``.
 
         Returns a dict with keys:
             'rgb'   : (H, W, 3) float in [0, 1]
@@ -308,7 +360,26 @@ class GaussianRenderer(nn.Module):
         scales_ = scales                    # (N, 3)
         quats_ = rotations                  # (N, 4)
         opacs_ = opacities.squeeze(-1)      # (N,)
-        colors_ = colors                    # (N, 3)
+        if self.sh_degree == 0:
+            if colors.dim() == 3 and colors.shape[-2] == 1:
+                colors_ = sh_dc_to_rgb(colors[..., 0, :])
+            else:
+                colors_ = colors
+            sh_degree_arg = None
+        else:
+            K = num_sh_bases(self.sh_degree)
+            if colors.dim() == 2:
+                raise ValueError(
+                    f"sh_degree={self.sh_degree} requires colors shape (N, {K}, 3), "
+                    f"got (N, {colors.shape[-1]})"
+                )
+            if colors.shape[-2] < K:
+                raise ValueError(
+                    f"colors has {colors.shape[-2]} SH bases but sh_degree={self.sh_degree} "
+                    f"needs at least {K}"
+                )
+            colors_ = colors[..., :K, :]
+            sh_degree_arg = self.sh_degree
         renders, alphas, meta = rasterization(
             means=means_,
             quats=quats_,
@@ -326,6 +397,7 @@ class GaussianRenderer(nn.Module):
             far_plane=self.far,
             backgrounds=self.bg.unsqueeze(0).to(dtype),
             packed=False,
+            sh_degree=sh_degree_arg,
             render_mode='RGB+D' if self.render_depth else 'RGB',
         )
 

@@ -11,8 +11,8 @@ Evaluates one or more checkpoints on a validation set and produces:
   - FPS encoder anchors / ``query_positions`` (``.ply``)
   - Normalized meshes aligned with the dataloader (``.obj``)
   - Predicted 3D Gaussians (standard 3DGS ``.ply`` + ``.splat`` for web viewers)
-  - A summary CSV for easy comparison across experiments
-  - A summary JSON with all per-sample metrics
+  - Per-checkpoint ``results.json`` and ``summary.csv`` under ``<output_dir>/<ckpt_tag>/``
+  - Optional combined ``summary_all_checkpoints.csv`` when evaluating multiple checkpoints
 
 Usage — compare two checkpoints
 --------------------------------
@@ -67,7 +67,7 @@ import trimesh
 
 from hy3dgen.shapegen.gs_export import (
     export_gaussian_splat_file,
-    export_gaussian_splat_ply,
+    export_gaussian_splats_gsplat,
     export_input_surface_ply,
     export_xyz_pointcloud_ply,
 )
@@ -319,6 +319,15 @@ def load_model(
     args: argparse.Namespace,
     device: torch.device,
 ) -> ShapeGSAE:
+    ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
+    train_args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
+    sh_degree = int(train_args.get("sh_degree", getattr(args, "sh_degree", 1)))
+    deterministic_encoder = bool(
+        train_args.get(
+            "deterministic_encoder",
+            getattr(args, "deterministic_encoder", True),
+        )
+    )
     model = ShapeGSAE(
         num_latents=args.num_latents,
         embed_dim=args.embed_dim,
@@ -331,9 +340,9 @@ def load_model(
         point_feats=6,
         downsample_ratio=args.downsample_ratio,
         num_gs_per_anchor=args.num_gs_per_anchor,
-        deterministic_encoder=True,
+        deterministic_encoder=deterministic_encoder,
+        sh_degree=sh_degree,
     ).to(device)
-    ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
     state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     model.load_state_dict(state, strict=True)
     model.eval()
@@ -365,7 +374,7 @@ def evaluate_sample(
     c2ws = sample["c2ws"][:6]
 
     latents, query_positions = model.encode(surface)
-    means, scales, rotations, opacities, colors, features = model.decode(
+    means, scales, rotations, opacities, sh_coeffs, features = model.decode(
         latents, query_positions, return_features=True,
     )
     query_positions = query_positions[0]
@@ -373,7 +382,7 @@ def evaluate_sample(
     scales = scales[0]
     rotations = rotations[0]
     opacities = opacities[0]
-    colors = colors[0]
+    sh_coeffs = sh_coeffs[0]
     features = features[0]                                # (L, width)
 
     # Shared depth colormap range from the GT (per sample): keeps the residual
@@ -404,7 +413,7 @@ def evaluate_sample(
         if valid_ratio < 0.02:
             continue
 
-        out = renderer(means, scales, rotations, opacities, colors, c2w.to(device))
+        out = renderer(means, scales, rotations, opacities, sh_coeffs, c2w.to(device))
         pred_rgb = out["rgb"].cpu()
         pred_depth = out["depth"].cpu()
 
@@ -458,7 +467,7 @@ def evaluate_sample(
         "scales": scales.detach().cpu(),
         "rotations": rotations.detach().cpu(),
         "opacities": opacities.detach().cpu(),
-        "colors": colors.detach().cpu(),
+        "sh_coeffs": sh_coeffs.detach().cpu(),
         "features": features.detach().cpu(),
     }
     return metrics, row_images, export_tensors
@@ -489,6 +498,7 @@ def evaluate_checkpoint(
         height=args.render_height,
         width=args.render_width,
         render_depth=True,
+        sh_degree=model.sh_degree,
     ).to(device)
 
     # Lazy-load LPIPS once per checkpoint (reused across all samples).
@@ -567,21 +577,24 @@ def evaluate_checkpoint(
                     )
                 except Exception as e:
                     logger.warning("Normalized mesh export failed for %s: %s", mesh_stem, e)
-            export_gaussian_splat_ply(
+            export_gaussian_splats_gsplat(
                 export_tensors["means"],
                 export_tensors["scales"],
                 export_tensors["rotations"],
                 export_tensors["opacities"],
-                export_tensors["colors"],
+                export_tensors["sh_coeffs"],
                 gs_ply_dir / f"gaussian_{stem}.ply",
+                format=getattr(args, "gs_export_format", "ply_compressed"),
+                sh_degree=model.sh_degree,
             )
             export_gaussian_splat_file(
                 export_tensors["means"],
                 export_tensors["scales"],
                 export_tensors["rotations"],
                 export_tensors["opacities"],
-                export_tensors["colors"],
+                export_tensors["sh_coeffs"],
                 gs_splat_dir / f"gaussian_{stem}.splat",
+                sh_degree=model.sh_degree,
             )
 
         # Save visual grid
@@ -611,25 +624,54 @@ def evaluate_checkpoint(
             f"L1depth={metrics['mean_depth_l1']:.4f}"
         )
 
-    # Summary for this checkpoint
-    if results:
-        valid = [r for r in results if not math.isnan(r["psnr_fg"])]
-        if valid:
-            mean_psnr = sum(r["psnr_fg"] for r in valid) / len(valid)
-            mean_ssim = sum(r["ssim_fg"] for r in valid) / len(valid)
-            mean_lpips = sum(r["lpips_fg"] for r in valid if not math.isnan(r["lpips_fg"])) / max(
-                sum(1 for r in valid if not math.isnan(r["lpips_fg"])), 1
-            )
-            mean_depth_l1 = sum(r["mean_depth_l1"] for r in valid) / len(valid)
-            logger.info(
-                f"\n  SUMMARY [{ckpt_tag}] n={len(valid)} samples\n"
-                f"    mean PSNR    = {mean_psnr:.3f} dB\n"
-                f"    mean SSIM    = {mean_ssim:.4f}\n"
-                f"    mean LPIPS   = {mean_lpips:.4f}\n"
-                f"    mean L1depth = {mean_depth_l1:.4f}"
-            )
+    # Per-checkpoint metrics (under output_dir / ckpt_tag /)
+    ckpt_out_dir = output_dir / ckpt_tag
+    results_json = ckpt_out_dir / "results.json"
+    with open(results_json, "w") as f:
+        json.dump(results, f, indent=2)
+    logger.info(f"Per-sample results saved to {results_json}")
+
+    summary_row = _summarize_checkpoint_results(checkpoint, ckpt_tag, results)
+    if summary_row:
+        csv_path = ckpt_out_dir / "summary.csv"
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(summary_row.keys()))
+            writer.writeheader()
+            writer.writerow(summary_row)
+        logger.info(f"Summary CSV saved to {csv_path}")
+        logger.info(
+            f"\n  SUMMARY [{ckpt_tag}] n={summary_row['n_samples']} samples\n"
+            f"    mean PSNR    = {summary_row['mean_psnr_fg']:.3f} dB\n"
+            f"    mean SSIM    = {summary_row['mean_ssim_fg']:.4f}\n"
+            f"    mean LPIPS   = {summary_row['mean_lpips_fg']:.4f}\n"
+            f"    mean L1depth = {summary_row['mean_depth_l1']:.4f}"
+        )
 
     return results
+
+
+def _summarize_checkpoint_results(
+    checkpoint: str,
+    ckpt_tag: str,
+    results: List[Dict],
+) -> Optional[Dict]:
+    """Aggregate per-sample rows into one summary dict, or None if no valid samples."""
+    valid = [r for r in results if not math.isnan(r.get("psnr_fg", float("nan")))]
+    if not valid:
+        return None
+    lpips_valid = [
+        r["lpips_fg"] for r in valid
+        if not math.isnan(r.get("lpips_fg", float("nan")))
+    ]
+    return {
+        "checkpoint": checkpoint,
+        "tag": ckpt_tag,
+        "n_samples": len(valid),
+        "mean_psnr_fg": round(sum(r["psnr_fg"] for r in valid) / len(valid), 4),
+        "mean_ssim_fg": round(sum(r["ssim_fg"] for r in valid) / len(valid), 4),
+        "mean_lpips_fg": round(sum(lpips_valid) / len(lpips_valid), 4) if lpips_valid else float("nan"),
+        "mean_depth_l1": round(sum(r["mean_depth_l1"] for r in valid) / len(valid), 4),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -659,6 +701,19 @@ def parse_args():
     p.add_argument("--downsample_ratio", type=int, default=20)
     p.add_argument("--num_gs_per_anchor", type=int, default=1,
                    help="Must match the value used during training.")
+    p.add_argument(
+        "--sh_degree",
+        type=int,
+        default=1,
+        choices=(0, 1),
+        help="SH degree (overridden by checkpoint args when present).",
+    )
+    p.add_argument(
+        "--deterministic_encoder",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Encoder FPS determinism (overridden by checkpoint args when present).",
+    )
 
     # Rendering
     p.add_argument("--render_height", type=int, default=512)
@@ -694,6 +749,14 @@ def parse_args():
         "--no_export_3d",
         action="store_true",
         help="Skip writing input surface, FPS anchors, normalized mesh, and 3DGS exports.",
+    )
+    p.add_argument(
+        "--gs_export_format",
+        type=str,
+        default="ply_compressed",
+        choices=("ply", "ply_compressed", "splat"),
+        help="gsplat export format for gaussians_ply/*.ply (ply_compressed for SH1+; "
+        "SH0 checkpoints auto-use standard ply for SuperSplat).",
     )
 
     # Misc
@@ -757,53 +820,29 @@ def main():
         sample_indices = all_indices[: min(args.num_samples, len(all_indices))]
     logger.info(f"Evaluating on {len(sample_indices)} samples")
 
-    # Evaluate each checkpoint
-    all_results = []
+    # Evaluate each checkpoint (metrics saved under output_dir/<ckpt_tag>/)
+    summary_rows = []
     for ckpt_path in args.checkpoints:
-        # Build a short tag from the checkpoint path for filenames
         ckpt_tag = Path(ckpt_path).parent.name + "__" + Path(ckpt_path).stem
         ckpt_tag = ckpt_tag.replace("/", "_").replace("\\", "_")
 
         results = evaluate_checkpoint(
             ckpt_path, dataset, sample_indices, args, device, output_dir, ckpt_tag
         )
-        all_results.extend(results)
+        row = _summarize_checkpoint_results(ckpt_path, ckpt_tag, results)
+        if row:
+            summary_rows.append(row)
 
-    # Save full results as JSON
-    results_json = output_dir / "results.json"
-    with open(results_json, "w") as f:
-        json.dump(all_results, f, indent=2)
-    logger.info(f"Full results saved to {results_json}")
-
-    # Save summary CSV (one row per checkpoint)
-    summary_rows = []
-    for ckpt_path in args.checkpoints:
-        ckpt_tag = Path(ckpt_path).parent.name + "__" + Path(ckpt_path).stem
-        ckpt_tag = ckpt_tag.replace("/", "_").replace("\\", "_")
-        ckpt_results = [r for r in all_results if r["ckpt_tag"] == ckpt_tag]
-        valid = [r for r in ckpt_results if not math.isnan(r["psnr_fg"])]
-        if not valid:
-            continue
-        lpips_valid = [r["lpips_fg"] for r in valid if not math.isnan(r.get("lpips_fg", float("nan")))]
-        summary_rows.append({
-            "checkpoint": ckpt_path,
-            "tag": ckpt_tag,
-            "n_samples": len(valid),
-            "mean_psnr_fg": round(sum(r["psnr_fg"] for r in valid) / len(valid), 4),
-            "mean_ssim_fg": round(sum(r["ssim_fg"] for r in valid) / len(valid), 4),
-            "mean_lpips_fg": round(sum(lpips_valid) / len(lpips_valid), 4) if lpips_valid else float("nan"),
-            "mean_depth_l1": round(sum(r["mean_depth_l1"] for r in valid) / len(valid), 4),
-        })
-
-    csv_path = output_dir / "summary.csv"
-    if summary_rows:
-        with open(csv_path, "w", newline="") as f:
+    # Optional combined summary when multiple checkpoints are evaluated together
+    if len(summary_rows) > 1:
+        combined_csv = output_dir / "summary_all_checkpoints.csv"
+        with open(combined_csv, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=list(summary_rows[0].keys()))
             writer.writeheader()
             writer.writerows(summary_rows)
-        logger.info(f"Summary CSV saved to {csv_path}")
+        logger.info(f"Combined summary CSV saved to {combined_csv}")
 
-        # Print final comparison table
+    if summary_rows:
         print("\n" + "=" * 80)
         print("EVALUATION SUMMARY")
         print("=" * 80)

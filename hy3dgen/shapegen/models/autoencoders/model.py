@@ -25,6 +25,7 @@ import yaml
 from .attention_blocks import FourierEmbedder, Transformer, CrossAttentionDecoder, PointCrossAttentionEncoder
 from .surface_extractors import MCSurfaceExtractor, SurfaceExtractors
 from .volume_decoders import VanillaVolumeDecoder, FlashVDMVolumeDecoding, HierarchicalVolumeDecoding
+from ...gs_renderer import pack_sh_coeffs
 from ...utils import logger, synchronize_timer, smart_load_model
 
 
@@ -310,8 +311,8 @@ class ShapeGSAE(nn.Module):
     The first pc_size rows are uniform samples; the next pc_sharpedge_size rows
     are sharp-edge samples (same convention as SharpEdgeSurfaceLoader).
 
-    Output: a tuple (means, scales, rotations, opacities, colors) where each
-    element is a per-Gaussian parameter tensor of shape [B, num_latents, C].
+    Output: (means, scales, rotations, opacities, sh_coeffs) where ``sh_coeffs``
+    has shape [B, num_latents * K, (sh_degree+1)^2, 3] for gsplat SH rendering.
     """
 
     @classmethod
@@ -369,6 +370,7 @@ class ShapeGSAE(nn.Module):
         scale_factor: float = 1.0,
         num_gs_per_anchor: int = 1,
         deterministic_encoder: bool = True,
+        sh_degree: int = 1,
         ckpt_path=None,
     ):
         super().__init__()
@@ -378,6 +380,10 @@ class ShapeGSAE(nn.Module):
         self.scale_factor = scale_factor  # kept for config/checkpoint compat; not used in forward
         self.latent_shape = (num_latents, embed_dim)
         self.num_gs_per_anchor = num_gs_per_anchor
+        self.sh_degree = int(sh_degree)
+        if self.sh_degree < 0:
+            raise ValueError(f"sh_degree must be >= 0, got {sh_degree}")
+        self.num_sh_bases = (self.sh_degree + 1) ** 2
 
         self.fourier_embedder = FourierEmbedder(num_freqs=num_freqs, include_pi=include_pi)
 
@@ -411,16 +417,21 @@ class ShapeGSAE(nn.Module):
             drop_path_rate=drop_path_rate,
         )
 
-        # 3DGS parameter head: K * 14 outputs per latent token.
-        # Per Gaussian: 3 (pos delta) + 3 (log-scale) + 4 (quaternion) + 1 (opacity) + 3 (RGB) = 14
+        # 3DGS parameter head: K_g * D outputs per latent token.
+        # Per Gaussian: 11 geometry + 3*num_sh_bases appearance (SH coeffs).
+        #   geometry: 3 (pos delta) + 3 (log-scale) + 4 (quat) + 1 (opacity)
+        #   appearance: 3 DC (sigmoid RGB) + (num_sh_bases-1)*3 higher-order SH (raw, init 0)
         K = self.num_gs_per_anchor
-        self.gs_head = nn.Linear(width, K * 14)
+        self._geom_dim = 11
+        self._appearance_dim = 3 * self.num_sh_bases
+        self._raw_dim = self._geom_dim + self._appearance_dim
+        self.gs_head = nn.Linear(width, K * self._raw_dim)
 
         # Initialise GS head so opacities start near 0.6 and scales start small.
         nn.init.zeros_(self.gs_head.weight)
         nn.init.zeros_(self.gs_head.bias)
         for k in range(K):
-            off = k * 14
+            off = k * self._raw_dim
             # Slight positive bias on opacity logit → sigmoid ≈ 0.6 at init
             self.gs_head.bias.data[off + 10] = 0.4
             # Negative bias on log-scale → small Gaussians at init
@@ -482,18 +493,18 @@ class ShapeGSAE(nn.Module):
             scales    : [B, num_latents * K, 3]  (always positive)
             rotations : [B, num_latents * K, 4]  (unit quaternion, wxyz)
             opacities : [B, num_latents * K, 1]  (in [0, 1])
-            colors    : [B, num_latents * K, 3]  (RGB in [0, 1])
+            sh_coeffs : [B, num_latents * K, num_sh_bases, 3]  (SH appearance)
             (optionally) features : [B, num_latents, width] before the GS head
 
-        where K = num_gs_per_anchor.  For K=1 this is identical to the original.
+        where K = num_gs_per_anchor.
         """
         K = self.num_gs_per_anchor
         latents = self.bottleneck_up(latents)
         features = self.transformer(latents)         # (B, L, width)
-        raw = self.gs_head(features)                 # (B, L, K*14)
+        raw = self.gs_head(features)                 # (B, L, K * raw_dim)
 
         B, L, _ = raw.shape
-        raw = raw.view(B, L * K, 14)                 # (B, L*K, 14)
+        raw = raw.view(B, L * K, self._raw_dim)    # (B, L*K, D)
 
         # Each anchor is repeated K times so every Gaussian is locally anchored.
         anchors = (
@@ -518,8 +529,13 @@ class ShapeGSAE(nn.Module):
         quat_identity[..., 0] = 1.0
         rotations = torch.where(quat_norm > 1e-8, quat_raw / quat_norm, quat_identity)
         opacities = torch.sigmoid(raw[..., 10:11])
-        colors = torch.sigmoid(raw[..., 11:14])
-        return means, scales, rotations, opacities, colors
+        dc_rgb = torch.sigmoid(raw[..., 11:14])
+        if self.sh_degree == 0:
+            sh_coeffs = pack_sh_coeffs(dc_rgb, None, sh_degree=0)
+        else:
+            sh_rest = raw[..., 14 : 14 + (self.num_sh_bases - 1) * 3]
+            sh_coeffs = pack_sh_coeffs(dc_rgb, sh_rest, sh_degree=self.sh_degree)
+        return means, scales, rotations, opacities, sh_coeffs
 
     def forward(self, surface: torch.FloatTensor):
         """Full encode → decode pass.
@@ -528,7 +544,7 @@ class ShapeGSAE(nn.Module):
             surface: [B, N, 9]
 
         Returns:
-            (means, scales, rotations, opacities, colors)
+            (means, scales, rotations, opacities, sh_coeffs)
             Each has shape [B, num_latents * num_gs_per_anchor, ...].
         """
         latents, query_positions = self.encode(surface)
