@@ -14,7 +14,7 @@
 
 
 import os
-from typing import Union, List
+from typing import Union, List, Optional
 
 import numpy as np
 import torch
@@ -371,6 +371,7 @@ class ShapeGSAE(nn.Module):
         num_gs_per_anchor: int = 1,
         deterministic_encoder: bool = True,
         sh_degree: int = 1,
+        max_anchor_delta: Optional[float] = None,
         ckpt_path=None,
     ):
         super().__init__()
@@ -380,6 +381,7 @@ class ShapeGSAE(nn.Module):
         self.scale_factor = scale_factor  # kept for config/checkpoint compat; not used in forward
         self.latent_shape = (num_latents, embed_dim)
         self.num_gs_per_anchor = num_gs_per_anchor
+        self.max_anchor_delta = max_anchor_delta
         self.sh_degree = int(sh_degree)
         if self.sh_degree < 0:
             raise ValueError(f"sh_degree must be >= 0, got {sh_degree}")
@@ -520,7 +522,13 @@ class ShapeGSAE(nn.Module):
 
     def _parse_gaussians(self, raw: torch.FloatTensor, query_positions: torch.FloatTensor):
         """Apply per-parameter activations and anchor means to FPS positions."""
-        means = query_positions + raw[..., :3]
+        raw_delta = raw[..., :3]
+        if self.max_anchor_delta is not None:
+            # AnchorSplat constrains offsets to a small local range (e.g. 10/128).
+            pos_delta = torch.tanh(raw_delta) * self.max_anchor_delta
+        else:
+            pos_delta = raw_delta
+        means = query_positions + pos_delta
         # exp(clamp) keeps scales in (e^-5, e^2) ≈ (0.007, 7.4)
         scales = torch.exp(raw[..., 3:6].clamp(-5.0, 2.0))
         quat_raw = raw[..., 6:10]

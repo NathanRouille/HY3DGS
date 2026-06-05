@@ -32,9 +32,14 @@ Usage — evaluate a single checkpoint on training data (overfit test)
         --num_samples 10 --shuffle \\
         --categories chair
 
-Evaluation always uses the 6 canonical v46 views (indices 0..5: top, bottom,
-front, back, left, right) so metrics are directly comparable across runs that
-were trained on any number of views.
+Per checkpoint, evaluates two view sets from the full v46 GT cache:
+
+  * **canonical** — always the 6 axis-aligned views (indices 0..5), so 6-view
+    and 14-view models are compared fairly on the same cameras
+  * **holdout** — 8 grid views not in 14-view training (rows 0 & 3, odd
+    azimuth columns 1/3/5/7)
+
+Saves separate visuals/metrics (``*_canonical`` / ``*_holdout``).
 """
 
 from __future__ import annotations
@@ -71,7 +76,11 @@ from hy3dgen.shapegen.gs_export import (
     export_input_surface_ply,
     export_xyz_pointcloud_ply,
 )
-from hy3dgen.shapegen.gs_renderer import GaussianRenderer
+from hy3dgen.shapegen.gs_renderer import (
+    GaussianRenderer,
+    compute_anchor_drift_metrics,
+    expand_anchor_positions,
+)
 from hy3dgen.shapegen.eval_metrics import compute_psnr, compute_ssim_fg
 from hy3dgen.shapegen.models.autoencoders.model import ShapeGSAE
 from hy3dgen.shapegen.surface_loaders import normalize_mesh
@@ -80,6 +89,8 @@ from train_gs_ae import (
     MeshDataset,
     mesh_path_has_usable_gt_cache,
     resolve_category_ids,
+    snap_train_views_v46,
+    train_view_indices_v46,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -311,6 +322,39 @@ def pca_features_to_rgb(features: torch.Tensor) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
+# v46 view index sets (canonical vs 14-view holdout)
+# ---------------------------------------------------------------------------
+
+CANONICAL_VIEW_INDICES_V46: List[int] = list(range(6))
+
+
+def eval_holdout_view_indices_v46_14grid() -> List[int]:
+    """8 grid views omitted from 14-view training (rows 0 & 3, odd az columns)."""
+    g = lambda r, c: 6 + r * 8 + c
+    return [g(r, c) for r in (0, 3) for c in (1, 3, 5, 7)]
+
+
+def train_view_indices_from_checkpoint(train_args: dict) -> List[int]:
+    """Training view indices implied by checkpoint ``args['num_views']``."""
+    num_views = int(train_args.get("num_views", 14))
+    snapped = snap_train_views_v46(num_views)
+    return train_view_indices_v46(snapped)
+
+
+def _slice_views_by_indices(
+    rgbs: List[torch.Tensor],
+    depths: List[torch.Tensor],
+    c2ws: List[torch.Tensor],
+    indices: List[int],
+) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+    return (
+        [rgbs[i] for i in indices],
+        [depths[i] for i in indices],
+        [c2ws[i] for i in indices],
+    )
+
+
+# ---------------------------------------------------------------------------
 # Model loading
 # ---------------------------------------------------------------------------
 
@@ -328,6 +372,10 @@ def load_model(
             getattr(args, "deterministic_encoder", True),
         )
     )
+    max_anchor_delta = train_args.get(
+        "max_anchor_delta",
+        getattr(args, "max_anchor_delta", None),
+    )
     model = ShapeGSAE(
         num_latents=args.num_latents,
         embed_dim=args.embed_dim,
@@ -342,6 +390,7 @@ def load_model(
         num_gs_per_anchor=args.num_gs_per_anchor,
         deterministic_encoder=deterministic_encoder,
         sh_degree=sh_degree,
+        max_anchor_delta=max_anchor_delta,
     ).to(device)
     state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     model.load_state_dict(state, strict=True)
@@ -353,40 +402,25 @@ def load_model(
 # Per-sample evaluation
 # ---------------------------------------------------------------------------
 
+def _mean_metric(lst: List[float]) -> float:
+    return float(sum(lst) / len(lst)) if lst else float("nan")
+
+
 @torch.no_grad()
-def evaluate_sample(
-    model: ShapeGSAE,
+def _evaluate_views_subset(
+    means: torch.Tensor,
+    scales: torch.Tensor,
+    rotations: torch.Tensor,
+    opacities: torch.Tensor,
+    sh_coeffs: torch.Tensor,
     renderer: GaussianRenderer,
-    sample: Dict,
     device: torch.device,
+    gt_rgbs: List[torch.Tensor],
+    gt_depths: List[torch.Tensor],
+    c2ws: List[torch.Tensor],
     lpips_net=None,
-) -> Tuple[Dict[str, float], List[Image.Image], Dict[str, torch.Tensor]]:
-    """Evaluate one mesh sample on the 6 canonical views.
-
-    Returns (metrics_dict, list_of_row_images, export_tensors). The export
-    dict additionally contains the post-transformer encoder features so the
-    caller can PCA-colour the anchors.
-    """
-    surface = sample["surface"].unsqueeze(0).to(device)
-    # Canonical 6 views (top, bottom, front, back, left, right) — first six in v46.
-    gt_rgbs = sample["rgbs"][:6]
-    gt_depths = sample["depths"][:6]
-    c2ws = sample["c2ws"][:6]
-
-    latents, query_positions = model.encode(surface)
-    means, scales, rotations, opacities, sh_coeffs, features = model.decode(
-        latents, query_positions, return_features=True,
-    )
-    query_positions = query_positions[0]
-    means = means[0]
-    scales = scales[0]
-    rotations = rotations[0]
-    opacities = opacities[0]
-    sh_coeffs = sh_coeffs[0]
-    features = features[0]                                # (L, width)
-
-    # Shared depth colormap range from the GT (per sample): keeps the residual
-    # depth halo from dominating per-image normalisation in visualisations.
+) -> Tuple[Dict[str, float], List[Image.Image]]:
+    """Render and score one list of GT views (shared Gaussian prediction)."""
     gt_depth_vals: List[float] = []
     for gd in gt_depths:
         m = gd > 0
@@ -400,15 +434,13 @@ def evaluate_sample(
         depth_vmin = depth_vmax = None
     depth_err_vmax: Optional[float] = None
     if depth_vmin is not None and depth_vmax is not None:
-        # Cap the depth-error colormap so even small per-view halo errors stay
-        # readable without saturating the colour wheel.
         depth_err_vmax = max((depth_vmax - depth_vmin) / 5.0, 1e-3)
 
     psnr_list, ssim_list, lpips_list, depth_l1_list = [], [], [], []
     row_images: List[Image.Image] = []
 
     for gt_rgb, gt_depth, c2w in zip(gt_rgbs, gt_depths, c2ws):
-        valid_mask = gt_depth > 0  # (H, W, 1)
+        valid_mask = gt_depth > 0
         valid_ratio = float(valid_mask.float().mean().item())
         if valid_ratio < 0.02:
             continue
@@ -420,26 +452,21 @@ def evaluate_sample(
         psnr_list.append(compute_psnr(pred_rgb, gt_rgb, valid_mask))
         ssim_list.append(compute_ssim_fg(pred_rgb, gt_rgb, valid_mask))
 
-        # LPIPS — full-image, unmasked (matches training loss)
         if lpips_net is not None:
             pred_nchw = pred_rgb.unsqueeze(0).permute(0, 3, 1, 2).to(device)
             gt_nchw = gt_rgb.unsqueeze(0).permute(0, 3, 1, 2).to(device)
-            lpips_val = float(lpips_net(pred_nchw, gt_nchw).mean().item())
-            lpips_list.append(lpips_val)
+            lpips_list.append(float(lpips_net(pred_nchw, gt_nchw).mean().item()))
 
-        # Depth L1 over foreground only (diagnostic; full-image L1 is dominated by bg zeros).
         depth_l1 = F.l1_loss(
             pred_depth[valid_mask].float().reshape(-1),
             gt_depth[valid_mask].float().reshape(-1),
         )
         depth_l1_list.append(float(depth_l1.item()))
 
-        # ---- Error maps ----
         rgb_err = (pred_rgb - gt_rgb).abs()
         rgb_err_scalar = rgb_err.mean(dim=-1, keepdim=True)
         depth_err = (pred_depth - gt_depth).abs()
 
-        # Build visual row: GT RGB | Pred RGB | RGB Error | GT Depth | Pred Depth | Depth Error
         row = _hconcat([
             Image.fromarray(_rgb01_to_u8(gt_rgb)),
             Image.fromarray(_rgb01_to_u8(pred_rgb)),
@@ -450,16 +477,85 @@ def evaluate_sample(
         ])
         row_images.append(row)
 
-    def _mean(lst):
-        return float(sum(lst) / len(lst)) if lst else float("nan")
-
     metrics = {
-        "psnr_fg": _mean(psnr_list),
-        "ssim_fg": _mean(ssim_list),
-        "lpips_fg": _mean(lpips_list),
-        "mean_depth_l1": _mean(depth_l1_list),
+        "psnr_fg": _mean_metric(psnr_list),
+        "ssim_fg": _mean_metric(ssim_list),
+        "lpips_fg": _mean_metric(lpips_list),
+        "mean_depth_l1": _mean_metric(depth_l1_list),
         "n_views": len(psnr_list),
     }
+    return metrics, row_images
+
+
+def _prefix_metrics(metrics: Dict[str, float], prefix: str) -> Dict[str, float]:
+    return {f"{k}_{prefix}": v for k, v in metrics.items()}
+
+
+@torch.no_grad()
+def evaluate_sample(
+    model: ShapeGSAE,
+    renderer: GaussianRenderer,
+    sample: Dict,
+    device: torch.device,
+    gt_renderer: GTRGBDRenderer,
+    canonical_view_indices: List[int],
+    holdout_view_indices: List[int],
+    ckpt_train_view_indices: Optional[List[int]] = None,
+    lpips_net=None,
+    drift_threshold: float = 0.1,
+) -> Tuple[Dict[str, float], Dict[str, List[Image.Image]], Dict[str, torch.Tensor]]:
+    """Evaluate canonical (6) + holdout (8) view sets using full v46 GT from disk.
+
+    Returns (flat_metrics_dict, {"canonical": rows, "holdout": rows}, export_tensors).
+    """
+    mesh_path = sample["mesh_path"]
+    rgbs_full, depths_full, c2ws_full, _ = gt_renderer.get_or_render(
+        mesh_path, allow_render=False,
+    )
+
+    canon_rgbs, canon_depths, canon_c2ws = _slice_views_by_indices(
+        rgbs_full, depths_full, c2ws_full, canonical_view_indices,
+    )
+    hold_rgbs, hold_depths, hold_c2ws = _slice_views_by_indices(
+        rgbs_full, depths_full, c2ws_full, holdout_view_indices,
+    )
+
+    surface = sample["surface"].unsqueeze(0).to(device)
+    latents, query_positions = model.encode(surface)
+    means, scales, rotations, opacities, sh_coeffs, features = model.decode(
+        latents, query_positions, return_features=True,
+    )
+    query_positions = query_positions[0]
+    means = means[0]
+    scales = scales[0]
+    rotations = rotations[0]
+    opacities = opacities[0]
+    sh_coeffs = sh_coeffs[0]
+    features = features[0]
+
+    metrics_canon, rows_canon = _evaluate_views_subset(
+        means, scales, rotations, opacities, sh_coeffs,
+        renderer, device, canon_rgbs, canon_depths, canon_c2ws, lpips_net,
+    )
+    metrics_holdout, rows_holdout = _evaluate_views_subset(
+        means, scales, rotations, opacities, sh_coeffs,
+        renderer, device, hold_rgbs, hold_depths, hold_c2ws, lpips_net,
+    )
+
+    anchors = expand_anchor_positions(query_positions, model.num_gs_per_anchor)
+    drift_metrics = compute_anchor_drift_metrics(
+        means, anchors, drift_threshold=drift_threshold,
+    )
+
+    flat_metrics = {
+        **_prefix_metrics(metrics_canon, "canonical"),
+        **_prefix_metrics(metrics_holdout, "holdout"),
+        **drift_metrics,
+        "canonical_view_indices": canonical_view_indices,
+        "holdout_view_indices": holdout_view_indices,
+    }
+    if ckpt_train_view_indices is not None:
+        flat_metrics["ckpt_train_view_indices"] = ckpt_train_view_indices
     export_tensors = {
         "surface": sample["surface"].detach().cpu(),
         "query_positions": query_positions.detach().cpu(),
@@ -470,7 +566,8 @@ def evaluate_sample(
         "sh_coeffs": sh_coeffs.detach().cpu(),
         "features": features.detach().cpu(),
     }
-    return metrics, row_images, export_tensors
+    row_images = {"canonical": rows_canon, "holdout": rows_holdout}
+    return flat_metrics, row_images, export_tensors
 
 
 # ---------------------------------------------------------------------------
@@ -492,6 +589,19 @@ def evaluate_checkpoint(
     logger.info(f"Evaluating: {checkpoint}")
     logger.info(f"Tag: {ckpt_tag}")
     logger.info(f"{'='*60}")
+
+    ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
+    train_args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
+    canonical_view_indices = list(CANONICAL_VIEW_INDICES_V46)
+    holdout_view_indices = eval_holdout_view_indices_v46_14grid()
+    ckpt_train_view_indices = train_view_indices_from_checkpoint(train_args)
+    logger.info(
+        "Eval canonical=%s | holdout=%s | checkpoint trained on %d views %s",
+        canonical_view_indices,
+        holdout_view_indices,
+        len(ckpt_train_view_indices),
+        ckpt_train_view_indices,
+    )
 
     model = load_model(checkpoint, args, device)
     renderer = GaussianRenderer(
@@ -541,8 +651,17 @@ def evaluate_checkpoint(
         mesh_stem = Path(sample.get("mesh_path", str(idx))).stem
         logger.info(f"  [{rank+1}/{len(sample_indices)}] {mesh_stem}")
 
-        metrics, row_images, export_tensors = evaluate_sample(
-            model, renderer, sample, device, lpips_net=lpips_net,
+        metrics, row_images_by_split, export_tensors = evaluate_sample(
+            model,
+            renderer,
+            sample,
+            device,
+            dataset.gt_renderer,
+            canonical_view_indices,
+            holdout_view_indices,
+            ckpt_train_view_indices=ckpt_train_view_indices,
+            lpips_net=lpips_net,
+            drift_threshold=args.drift_threshold,
         )
 
         if not getattr(args, "no_export_3d", False):
@@ -597,17 +716,20 @@ def evaluate_checkpoint(
                 sh_degree=model.sh_degree,
             )
 
-        # Save visual grid
-        if row_images:
-            grid = _vconcat(row_images)
+        for split_name in ("canonical", "holdout"):
+            rows = row_images_by_split.get(split_name) or []
+            if not rows:
+                continue
+            m_psnr = metrics.get(f"psnr_fg_{split_name}", float("nan"))
+            m_ssim = metrics.get(f"ssim_fg_{split_name}", float("nan"))
+            m_lpips = metrics.get(f"lpips_fg_{split_name}", float("nan"))
+            grid = _vconcat(rows)
             grid_labeled = add_label_bar(
                 grid,
-                f"{ckpt_tag} | {mesh_stem} | "
-                f"PSNR={metrics['psnr_fg']:.2f}dB  "
-                f"SSIM={metrics['ssim_fg']:.4f}  "
-                f"LPIPS={metrics['lpips_fg']:.4f}",
+                f"{ckpt_tag} | {mesh_stem} | {split_name} | "
+                f"PSNR={m_psnr:.2f}dB  SSIM={m_ssim:.4f}  LPIPS={m_lpips:.4f}",
             )
-            grid_labeled.save(viz_dir / f"{rank:03d}_{mesh_stem}.png")
+            grid_labeled.save(viz_dir / f"{rank:03d}_{mesh_stem}_{split_name}.png")
 
         result = {
             "checkpoint": checkpoint,
@@ -618,10 +740,28 @@ def evaluate_checkpoint(
         }
         results.append(result)
         logger.info(
-            f"PSNR={metrics['psnr_fg']:.2f}dB  "
-            f"SSIM={metrics['ssim_fg']:.4f}  "
-            f"LPIPS={metrics['lpips_fg']:.4f}  "
-            f"L1depth={metrics['mean_depth_l1']:.4f}"
+            "  canonical: PSNR=%.2fdB SSIM=%.4f LPIPS=%.4f L1depth=%.4f (n=%s)",
+            metrics.get("psnr_fg_canonical", float("nan")),
+            metrics.get("ssim_fg_canonical", float("nan")),
+            metrics.get("lpips_fg_canonical", float("nan")),
+            metrics.get("mean_depth_l1_canonical", float("nan")),
+            metrics.get("n_views_canonical", "?"),
+        )
+        logger.info(
+            "  holdout: PSNR=%.2fdB SSIM=%.4f LPIPS=%.4f L1depth=%.4f (n=%s)",
+            metrics.get("psnr_fg_holdout", float("nan")),
+            metrics.get("ssim_fg_holdout", float("nan")),
+            metrics.get("lpips_fg_holdout", float("nan")),
+            metrics.get("mean_depth_l1_holdout", float("nan")),
+            metrics.get("n_views_holdout", "?"),
+        )
+        logger.info(
+            "  drift: mean_l2=%.4f max_l2=%.4f p95_l2=%.4f frac_gt_%.2f=%.4f",
+            metrics.get("mean_drift_l2", float("nan")),
+            metrics.get("max_drift_l2", float("nan")),
+            metrics.get("p95_drift_l2", float("nan")),
+            metrics.get("drift_threshold", 0.1),
+            metrics.get("frac_drift_gt_thresh", float("nan")),
         )
 
     # Per-checkpoint metrics (under output_dir / ckpt_tag /)
@@ -641,10 +781,15 @@ def evaluate_checkpoint(
         logger.info(f"Summary CSV saved to {csv_path}")
         logger.info(
             f"\n  SUMMARY [{ckpt_tag}] n={summary_row['n_samples']} samples\n"
-            f"    mean PSNR    = {summary_row['mean_psnr_fg']:.3f} dB\n"
-            f"    mean SSIM    = {summary_row['mean_ssim_fg']:.4f}\n"
-            f"    mean LPIPS   = {summary_row['mean_lpips_fg']:.4f}\n"
-            f"    mean L1depth = {summary_row['mean_depth_l1']:.4f}"
+            f"    canonical PSNR={summary_row['mean_psnr_fg_canonical']:.3f}  "
+            f"SSIM={summary_row['mean_ssim_fg_canonical']:.4f}  "
+            f"LPIPS={summary_row['mean_lpips_fg_canonical']:.4f}\n"
+            f"    holdout  PSNR={summary_row['mean_psnr_fg_holdout']:.3f}  "
+            f"SSIM={summary_row['mean_ssim_fg_holdout']:.4f}  "
+            f"LPIPS={summary_row['mean_lpips_fg_holdout']:.4f}\n"
+            f"    drift mean_l2={summary_row['mean_drift_l2']:.4f}  "
+            f"max_l2={summary_row['mean_max_drift_l2']:.4f}  "
+            f"frac_gt_thresh={summary_row['mean_frac_drift_gt_thresh']:.4f}"
         )
 
     return results
@@ -656,22 +801,43 @@ def _summarize_checkpoint_results(
     results: List[Dict],
 ) -> Optional[Dict]:
     """Aggregate per-sample rows into one summary dict, or None if no valid samples."""
-    valid = [r for r in results if not math.isnan(r.get("psnr_fg", float("nan")))]
+    valid = [
+        r for r in results
+        if not math.isnan(r.get("psnr_fg_canonical", float("nan")))
+    ]
     if not valid:
         return None
-    lpips_valid = [
-        r["lpips_fg"] for r in valid
-        if not math.isnan(r.get("lpips_fg", float("nan")))
-    ]
-    return {
+
+    def _mean_key(key: str) -> float:
+        vals = [r[key] for r in valid if not math.isnan(r.get(key, float("nan")))]
+        return round(sum(vals) / len(vals), 4) if vals else float("nan")
+
+    row = {
         "checkpoint": checkpoint,
         "tag": ckpt_tag,
         "n_samples": len(valid),
-        "mean_psnr_fg": round(sum(r["psnr_fg"] for r in valid) / len(valid), 4),
-        "mean_ssim_fg": round(sum(r["ssim_fg"] for r in valid) / len(valid), 4),
-        "mean_lpips_fg": round(sum(lpips_valid) / len(lpips_valid), 4) if lpips_valid else float("nan"),
-        "mean_depth_l1": round(sum(r["mean_depth_l1"] for r in valid) / len(valid), 4),
+        "mean_psnr_fg_canonical": _mean_key("psnr_fg_canonical"),
+        "mean_ssim_fg_canonical": _mean_key("ssim_fg_canonical"),
+        "mean_lpips_fg_canonical": _mean_key("lpips_fg_canonical"),
+        "mean_depth_l1_canonical": _mean_key("mean_depth_l1_canonical"),
+        "mean_psnr_fg_holdout": _mean_key("psnr_fg_holdout"),
+        "mean_ssim_fg_holdout": _mean_key("ssim_fg_holdout"),
+        "mean_lpips_fg_holdout": _mean_key("lpips_fg_holdout"),
+        "mean_depth_l1_holdout": _mean_key("mean_depth_l1_holdout"),
+        "mean_drift_l2": _mean_key("mean_drift_l2"),
+        "mean_max_drift_l2": _mean_key("max_drift_l2"),
+        "mean_p95_drift_l2": _mean_key("p95_drift_l2"),
+        "mean_frac_drift_gt_thresh": _mean_key("frac_drift_gt_thresh"),
     }
+    if valid:
+        row["canonical_view_indices"] = json.dumps(
+            valid[0].get("canonical_view_indices", []),
+        )
+        row["holdout_view_indices"] = json.dumps(valid[0].get("holdout_view_indices", []))
+        row["ckpt_train_view_indices"] = json.dumps(
+            valid[0].get("ckpt_train_view_indices", []),
+        )
+    return row
 
 
 # ---------------------------------------------------------------------------
@@ -713,6 +879,18 @@ def parse_args():
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Encoder FPS determinism (overridden by checkpoint args when present).",
+    )
+    p.add_argument(
+        "--max_anchor_delta",
+        type=float,
+        default=None,
+        help="Override checkpoint max_anchor_delta (AnchorSplat uses 10/128 ≈ 0.078).",
+    )
+    p.add_argument(
+        "--drift_threshold",
+        type=float,
+        default=0.1,
+        help="L2 drift threshold for frac_drift_gt_thresh metric (normalised coords).",
     )
 
     # Rendering
@@ -780,21 +958,21 @@ def main():
     if categories is not None:
         logger.info("Category filter: %s", sorted(categories))
 
-    # Build dataset. We force the 6 canonical views (indices 0..5 of v46) so all
-    # checkpoints are evaluated on the same camera set regardless of training views.
+    # Surface loader only; GT RGBD is read from full v46 cache inside evaluate_sample.
     dataset = MeshDataset(
         data_dir=args.data_dir,
         pc_size=args.pc_size,
         pc_sharpedge_size=args.pc_sharpedge_size,
         render_height=args.render_height,
         render_width=args.render_width,
-        num_views=6,
+        num_views=14,
         camera_distance=args.camera_distance,
         elevation_deg=args.elevation_deg,
         max_items=args.max_items,
         mesh_blacklist=args.mesh_blacklist,
         categories=categories,
-        train_view_indices=list(range(6)),
+        precache_full_views=True,
+        require_cached_gt=args.only_cached_gt,
     )
     logger.info(f"Dataset: {len(dataset)} meshes in {args.data_dir}")
 
@@ -846,17 +1024,22 @@ def main():
         print("\n" + "=" * 80)
         print("EVALUATION SUMMARY")
         print("=" * 80)
-        print(f"{'Checkpoint':<50} {'PSNR':>8} {'SSIM':>8} {'LPIPS':>8} {'L1depth':>10}")
-        print("-" * 80)
-        for row in sorted(summary_rows, key=lambda x: -x["mean_psnr_fg"]):
+        hdr = (
+            f"{'Checkpoint':<40} "
+            f"{'CA_PSNR':>8} {'CA_SSIM':>8} {'HO_PSNR':>8} {'HO_SSIM':>8}"
+        )
+        print(hdr)
+        print("-" * len(hdr))
+        for row in sorted(summary_rows, key=lambda x: -x["mean_psnr_fg_canonical"]):
             name = Path(row["checkpoint"]).parent.name + "/" + Path(row["checkpoint"]).stem
-            lpips_str = f"{row['mean_lpips_fg']:>8.4f}" if not math.isnan(row["mean_lpips_fg"]) else "     n/a"
+            if len(name) > 38:
+                name = ".." + name[-36:]
             print(
-                f"  {name:<48} "
-                f"{row['mean_psnr_fg']:>8.3f} "
-                f"{row['mean_ssim_fg']:>8.4f} "
-                f"{lpips_str} "
-                f"{row['mean_depth_l1']:>10.4f}"
+                f"  {name:<40} "
+                f"{row['mean_psnr_fg_canonical']:>8.3f} "
+                f"{row['mean_ssim_fg_canonical']:>8.4f} "
+                f"{row['mean_psnr_fg_holdout']:>8.3f} "
+                f"{row['mean_ssim_fg_holdout']:>8.4f}"
             )
         print("=" * 80 + "\n")
 

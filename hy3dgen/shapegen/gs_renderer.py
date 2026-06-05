@@ -416,19 +416,89 @@ class GaussianRenderer(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Anchor position utilities
+# ---------------------------------------------------------------------------
+
+def expand_anchor_positions(
+    query_positions: torch.Tensor,
+    num_gs_per_anchor: int,
+) -> torch.Tensor:
+    """Repeat each FPS anchor ``K`` times to align with per-anchor Gaussians.
+
+    Args:
+        query_positions: (B, L, 3) or (L, 3)
+        num_gs_per_anchor: K Gaussians predicted per anchor.
+
+    Returns:
+        (B, L*K, 3) or (L*K, 3) with the same batching as the input.
+    """
+    K = num_gs_per_anchor
+    if query_positions.dim() == 2:
+        L = query_positions.shape[0]
+        return (
+            query_positions.unsqueeze(1)
+            .expand(L, K, 3)
+            .reshape(L * K, 3)
+        )
+    B, L, _ = query_positions.shape
+    return (
+        query_positions.unsqueeze(2)
+        .expand(B, L, K, 3)
+        .reshape(B, L * K, 3)
+    )
+
+
+def anchor_position_deltas(
+    means: torch.Tensor,
+    anchors: torch.Tensor,
+) -> torch.Tensor:
+    """Per-Gaussian displacement from anchor to predicted mean."""
+    return means - anchors
+
+
+def anchor_delta_loss(pos_deltas: torch.Tensor) -> torch.Tensor:
+    """Mean squared L2 anchor offset penalty (AnchorSplat-style soft regulariser).
+
+    AnchorSplat hard-constrains offsets with ``tanh(raw) * (10/128)`` at decode time;
+    this loss term provides a differentiable soft alternative when no hard cap is set.
+    """
+    return (pos_deltas ** 2).sum(dim=-1).mean()
+
+
+@torch.no_grad()
+def compute_anchor_drift_metrics(
+    means: torch.Tensor,
+    anchors: torch.Tensor,
+    drift_threshold: float = 0.1,
+) -> Dict[str, float]:
+    """Scalar drift statistics for eval (means vs FPS anchors)."""
+    delta = anchor_position_deltas(means, anchors)
+    drift_l2 = delta.norm(dim=-1)
+    return {
+        "mean_drift_l2": float(drift_l2.mean().item()),
+        "max_drift_l2": float(drift_l2.max().item()),
+        "p95_drift_l2": float(torch.quantile(drift_l2, 0.95).item()),
+        "mean_delta_l2_sq": float((delta ** 2).sum(dim=-1).mean().item()),
+        "frac_drift_gt_thresh": float((drift_l2 > drift_threshold).float().mean().item()),
+        "drift_threshold": drift_threshold,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Rendering loss
 # ---------------------------------------------------------------------------
 
 class RGBDLoss(nn.Module):
     """Multi-view RGBD reconstruction loss for 3DGS.
 
-    Loss = L1(pred_rgb, gt_rgb)                       [full-image, unmasked]
+    Loss = rgb_loss(pred_rgb, gt_rgb)                  [full-image, unmasked; L1 or MSE]
          + lambda_ssim*(1-SSIM(pred_rgb, gt_rgb))     [full-image, unmasked]
          + lambda_lpips*LPIPS(pred_rgb, gt_rgb)        [full-image, unmasked]
          + lambda_d * L1(pred_depth, gt_depth)         [full-image; bg gt_depth=0]
          + lambda_alpha * L1(pred_alpha, gt_alpha)     [gt_alpha = valid_mask as float]
          + lambda_scale * mean(s0*s1*s2)               [AnchorSplat volume penalty]
          + lambda_opa   * mean(1 - opacity)            [AnchorSplat opacity penalty]
+         + lambda_delta * mean(||pos_delta||^2)       [anchor offset L2 penalty]
 
     SSIM is computed with background pixels replaced by GT background in the
     prediction, so the network receives no SSIM gradient from background regions.
@@ -441,6 +511,8 @@ class RGBDLoss(nn.Module):
         alpha_bg_weight   : multiplier on BG alpha L1 before lambda_alpha (default 5.0).
         lambda_scale      : weight for AnchorSplat volume penalty mean(s0*s1*s2) (default 0.01).
         lambda_opa        : weight for AnchorSplat opacity penalty mean(1 - opacity) (default 0.01).
+        lambda_delta      : weight for mean squared anchor offset ||means - anchor||^2 (default 0).
+        rgb_loss_type     : ``'l1'`` or ``'mse'`` for the photometric RGB term.
         fg_weight         : unused, kept for API compatibility.
         alpha_bg_weight   : unused, kept for API compatibility.
         min_valid_ratio   : if foreground pixel fraction falls below this, depth terms
@@ -455,11 +527,16 @@ class RGBDLoss(nn.Module):
         lambda_alpha: float = 0.05,
         lambda_scale: float = 0.01,
         lambda_opa: float = 0.01,
+        lambda_delta: float = 0.0,
+        rgb_loss_type: str = "mse",
         fg_weight: float = 0.75,
         min_valid_ratio: float = 0.02,
         alpha_bg_weight: float = 5.0,
+        lpips_warmup_steps: int = 0,
     ):
         super().__init__()
+        if rgb_loss_type not in ("l1", "mse"):
+            raise ValueError(f"rgb_loss_type must be 'l1' or 'mse', got {rgb_loss_type!r}")
         self.lambda_ssim = lambda_ssim
         self.lambda_lpips = lambda_lpips
         self.lambda_d = lambda_d
@@ -467,9 +544,12 @@ class RGBDLoss(nn.Module):
         self.lambda_alpha = lambda_alpha
         self.lambda_scale = lambda_scale
         self.lambda_opa = lambda_opa
+        self.lambda_delta = lambda_delta
+        self.rgb_loss_type = rgb_loss_type
         self.fg_weight = fg_weight
         self.min_valid_ratio = min_valid_ratio
         self.alpha_bg_weight = alpha_bg_weight
+        self.lpips_warmup_steps = lpips_warmup_steps
 
     def _compute_lpips(
         self,
@@ -524,8 +604,11 @@ class RGBDLoss(nn.Module):
         valid_ratio = valid_mask.float().mean()
         depth_scale = (valid_ratio >= self.min_valid_ratio).to(pred_depth.dtype)
 
-        # ---- Full-image RGB L1 ----
-        loss_l1 = F.l1_loss(pred_rgb, gt_rgb)
+        # ---- Full-image RGB photometric ----
+        if self.rgb_loss_type == "mse":
+            loss_rgb = F.mse_loss(pred_rgb, gt_rgb)
+        else:
+            loss_rgb = F.l1_loss(pred_rgb, gt_rgb)
 
         # ---- Full-image SSIM ----
         pred_rgb_nchw = pred_rgb.permute(0, 3, 1, 2).contiguous()
@@ -562,7 +645,7 @@ class RGBDLoss(nn.Module):
             loss_opa = pred_rgb.new_zeros(())
 
         total = (
-            loss_l1
+            loss_rgb
             + self.lambda_ssim * loss_ssim
             + self.lambda_lpips * loss_lpips
             + self.lambda_d * loss_depth
@@ -572,7 +655,7 @@ class RGBDLoss(nn.Module):
         )
 
         components = {
-            'l1': loss_l1,
+            self.rgb_loss_type: loss_rgb,
             'ssim': loss_ssim,
             'lpips': loss_lpips,
             'depth': loss_depth,
@@ -583,6 +666,18 @@ class RGBDLoss(nn.Module):
             'valid_ratio': valid_ratio.detach(),
         }
         return total, components
+
+    def anchor_delta_regularizer(
+        self,
+        pos_deltas: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Anchor offset penalty applied once per training step (not per view)."""
+        loss_delta = anchor_delta_loss(pos_deltas)
+        weighted = self.lambda_delta * loss_delta
+        return weighted, {
+            "delta_reg": loss_delta.detach(),
+            "total": weighted.detach(),
+        }
 
 
 # ---------------------------------------------------------------------------

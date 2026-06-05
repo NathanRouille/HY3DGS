@@ -50,7 +50,9 @@ from hy3dgen.shapegen.gs_renderer import (
     RGBDLoss,
     TOTAL_V46_STAGGER,
     VIEW46_TRAIN_ALLOWED,
+    anchor_position_deltas,
     build_view46_c2ws,
+    expand_anchor_positions,
 )
 from hy3dgen.shapegen.eval_metrics import compute_psnr, compute_ssim_fg
 
@@ -871,6 +873,7 @@ def train(args):
         num_gs_per_anchor=args.num_gs_per_anchor,
         deterministic_encoder=args.deterministic_encoder,
         sh_degree=args.sh_degree,
+        max_anchor_delta=args.max_anchor_delta,
     ).to(device)
 
     if args.shapevae_ckpt:
@@ -895,6 +898,9 @@ def train(args):
         lambda_alpha=args.lambda_alpha,
         lambda_scale=args.lambda_scale,
         lambda_opa=args.lambda_opa,
+        lambda_delta=args.lambda_delta,
+        rgb_loss_type=args.rgb_loss_type,
+        lpips_warmup_steps=args.lpips_warmup_steps,
     )
 
     # ---- Data ----
@@ -913,6 +919,16 @@ def train(args):
         precache_full_views=False,
         require_cached_gt=not args.allow_on_the_fly_gt,
         use_experiment_manifest=not args.no_experiment_manifest,
+    )
+    views_loaded = int(dataset.gt_renderer.num_views)
+    views_per_step_cfg = (
+        views_loaded if args.views_per_step is None else max(1, int(args.views_per_step))
+    )
+    logger.info(
+        "View sampling: loaded_views=%d (from --num_views=%d), views_per_step=%d",
+        views_loaded,
+        args.num_views,
+        min(views_per_step_cfg, views_loaded),
     )
     loader = DataLoader(
         dataset,
@@ -1021,18 +1037,38 @@ def train(args):
             gt_depths = batch['depths'] # list of (B, H, W, 1)
             c2ws = batch['c2ws']        # list of (4,4)
 
-            # Forward pass
-            means, scales, rotations, opacities, sh_coeffs = model(surface)
+            # Forward pass (encode+decode so anchor deltas are available for regularisation)
+            latents, query_positions = model.encode(surface)
+            means, scales, rotations, opacities, sh_coeffs = model.decode(
+                latents, query_positions,
+            )
+            anchors = expand_anchor_positions(query_positions, model.num_gs_per_anchor)
+            pos_deltas = anchor_position_deltas(means, anchors)
 
             # Accumulate rendering loss over all views
             total_loss = torch.zeros((), device=device)
             log_components: Dict[str, torch.Tensor] = {}
 
             B = surface.shape[0]
-            num_views = len(c2ws)
-            for view_idx, (gt_rgb_b, gt_depth_b, c2w) in enumerate(
-                zip(gt_rgbs, gt_depths, c2ws)
-            ):
+            num_views_total = len(c2ws)
+            if num_views_total == 0:
+                logger.warning("Batch has zero GT views; skipping.")
+                t_data_start = time.time()
+                continue
+
+            views_per_step = int(getattr(args, "views_per_step", 0) or 0)
+            if views_per_step <= 0:
+                views_per_step = num_views_total
+            views_per_step = min(views_per_step, num_views_total)
+            if views_per_step < num_views_total:
+                sampled_view_indices = sorted(random.sample(range(num_views_total), views_per_step))
+            else:
+                sampled_view_indices = list(range(num_views_total))
+
+            for view_idx in sampled_view_indices:
+                gt_rgb_b = gt_rgbs[view_idx]
+                gt_depth_b = gt_depths[view_idx]
+                c2w = c2ws[view_idx]
                 gt_rgb_b = gt_rgb_b.to(device)       # (B, H, W, 3)
                 gt_depth_b = gt_depth_b.to(device)   # (B, H, W, 1)
                 c2w = c2w.to(device)
@@ -1067,11 +1103,22 @@ def train(args):
                 for k, v in comps.items():
                     _accum_train_log(log_components, k, v)
 
-            # Mean over views: keeps loss magnitude constant across 6/14/22/etc.
-            if num_views > 0:
-                inv_n = 1.0 / num_views
+            # Mean over sampled views: keeps loss magnitude stable when varying
+            # views_per_step while providing an unbiased estimate of the
+            # full-view objective over training.
+            if views_per_step > 0:
+                inv_n = 1.0 / views_per_step
                 total_loss = total_loss * inv_n
                 log_components = {k: v * inv_n for k, v in log_components.items()}
+                log_components["n_views_total"] = torch.tensor(float(num_views_total), device=device)
+                log_components["n_views_sampled"] = torch.tensor(float(views_per_step), device=device)
+
+            if args.lambda_delta > 0:
+                delta_loss, delta_comps = criterion.anchor_delta_regularizer(pos_deltas)
+                total_loss = total_loss + delta_loss
+                for k, v in delta_comps.items():
+                    if k != "total":
+                        _accum_train_log(log_components, k, v)
 
             optimizer.zero_grad()
             total_loss.backward()
@@ -1104,15 +1151,17 @@ def train(args):
                         grad_norm_preclip.detach().item()
                         if torch.is_tensor(grad_norm_preclip) else grad_norm_preclip
                     )
+                    mean_drift_l2 = float(pos_deltas.detach().norm(dim=-1).mean().item())
                     wandb_log: Dict[str, float] = {
                         "train/lr": float(lr),
                         "train/grad_norm": grad_norm_val,
+                        "train/mean_drift_l2": mean_drift_l2,
                     }
                     # Regularisers first
-                    for k in ("scale_reg", "opa_reg"):
+                    for k in ("scale_reg", "opa_reg", "delta_reg"):
                         if k in log_floats:
                             wandb_log[f"train/{k}"] = log_floats[k]
-                    # Per-loss components
+                    # Per-loss components (rgb_loss_type is 'mse' or 'l1')
                     for k in (args.rgb_loss_type, "ssim", "lpips", "depth", "alpha_sup"):
                         if k in log_floats:
                             wandb_log[f"train/{k}"] = log_floats[k]
@@ -1208,6 +1257,14 @@ def parse_args():
             f'{list(VIEW46_TRAIN_ALLOWED)}. Validation always uses 6 canonical views.'
         ),
     )
+    p.add_argument(
+        '--views_per_step', type=int, default=None,
+        help=(
+            'How many views to sample from the loaded --num_views at each optimization '
+            'step. Default: use all loaded views. Example: --num_views 22 '
+            '--views_per_step 6.'
+        ),
+    )
     p.add_argument('--camera_distance', type=float, default=3.5)
     p.add_argument('--elevation_deg', type=float, default=20.0)
     p.add_argument(
@@ -1257,6 +1314,12 @@ def parse_args():
                         '(carves thin features) or fully transparent (carves holes). Replaces '
                         'AnchorSplat\'s linear (1-opacity) penalty which allowed semi-transparent '
                         'Gaussians at 0.5 ("vanishing colors").')
+    p.add_argument('--lambda_delta', type=float, default=0.0,
+                   help='Anchor offset L2 penalty: mean(||means - anchor||^2). '
+                        'Use with --max_anchor_delta for AnchorSplat-style hard+soft constraints.')
+    p.add_argument('--max_anchor_delta', type=float, default=None,
+                   help='Hard cap on anchor offsets via tanh(raw)*(max). AnchorSplat uses 10/128 '
+                        '≈ 0.078 in normalised space. Default None = unbounded raw offsets.')
 
     # Optimiser
     p.add_argument('--lr', type=float, default=1e-4)
