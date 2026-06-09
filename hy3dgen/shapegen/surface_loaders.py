@@ -1,7 +1,33 @@
+import hashlib
+import os
+from contextlib import contextmanager
+from typing import Iterator, Optional, Union
+
 import numpy as np
 
 import torch
 import trimesh
+
+
+def stable_mesh_seed(global_seed: int, mesh_path: Union[str, os.PathLike]) -> int:
+    """Per-mesh seed derived from the training seed and canonical mesh path."""
+    canonical = os.path.realpath(os.path.abspath(str(mesh_path)))
+    digest = hashlib.sha256(f"{int(global_seed)}:{canonical}".encode()).hexdigest()
+    return int(digest[:8], 16)
+
+
+@contextmanager
+def _numpy_seed_context(seed: Optional[int]) -> Iterator[np.random.Generator]:
+    """Seed legacy ``np.random`` (for trimesh) and yield a ``default_rng``."""
+    if seed is None:
+        yield np.random.default_rng()
+        return
+    legacy_state = np.random.get_state()
+    np.random.seed(int(seed) % (2**32))
+    try:
+        yield np.random.default_rng(int(seed))
+    finally:
+        np.random.set_state(legacy_state)
 
 
 def normalize_mesh(mesh, scale=0.9999):
@@ -212,8 +238,14 @@ def sample_pointcloud_with_color(mesh, num=200000):
     )
 
 
-def sharp_sample_pointcloud_with_color(mesh, num=16384):
+def sharp_sample_pointcloud_with_color(
+    mesh,
+    num=16384,
+    rng: Optional[np.random.Generator] = None,
+):
     """Sample points along sharp edges with interpolated normals and RGB colors."""
+    if rng is None:
+        rng = np.random.default_rng()
     V = mesh.vertices
     N = mesh.face_normals
     VN = mesh.vertex_normals
@@ -247,8 +279,8 @@ def sharp_sample_pointcloud_with_color(mesh, num=16384):
     weights = np.linalg.norm(sharp_verts_b - sharp_verts_a, axis=-1)
     weights /= np.sum(weights)
 
-    random_number = np.random.rand(num)
-    w = np.random.rand(num, 1)
+    random_number = rng.random(num)
+    w = rng.random((num, 1))
     index = np.searchsorted(weights.cumsum(), random_number)
     index = np.clip(index, 0, len(edge_a) - 1)
 
@@ -259,76 +291,86 @@ def sharp_sample_pointcloud_with_color(mesh, num=16384):
     return samples, normals, colors
 
 
-def load_surface_sharpedge_rgb(mesh, num_points=4096, num_sharp_points=4096):
+def load_surface_sharpedge_rgb(
+    mesh,
+    num_points=4096,
+    num_sharp_points=4096,
+    seed: Optional[int] = None,
+):
     """Build an RGB surface tensor of shape (1, num_points+num_sharp_points, 9).
 
     Channel layout: xyz(0:3) | normals(3:6) | rgb(6:9).
+
+    When ``seed`` is set, all subsampling (including trimesh face sampling) is
+    reproducible for a given mesh geometry.
     """
-    try:
-        mesh_full = trimesh.util.concatenate(mesh.dump())
-    except Exception:
-        mesh_full = trimesh.util.concatenate(mesh)
-    mesh_full = normalize_mesh(mesh_full)
+    with _numpy_seed_context(seed) as rng:
+        try:
+            mesh_full = trimesh.util.concatenate(mesh.dump())
+        except Exception:
+            mesh_full = trimesh.util.concatenate(mesh)
+        mesh_full = normalize_mesh(mesh_full)
 
-    origin_num = mesh_full.faces.shape[0]
-    original_vertices = mesh_full.vertices
-    original_faces = mesh_full.faces
+        origin_num = mesh_full.faces.shape[0]
+        original_vertices = mesh_full.vertices
+        original_faces = mesh_full.faces
 
-    mesh_geo = trimesh.Trimesh(vertices=original_vertices, faces=original_faces[:origin_num])
-    mesh_fill = trimesh.Trimesh(vertices=original_vertices, faces=original_faces[origin_num:])
+        mesh_geo = trimesh.Trimesh(vertices=original_vertices, faces=original_faces[:origin_num])
+        mesh_fill = trimesh.Trimesh(vertices=original_vertices, faces=original_faces[origin_num:])
 
-    # Copy visual from full mesh so color sampling works on geometry submesh
-    try:
-        mesh_geo.visual = mesh_full.visual
-    except Exception:
-        pass
+        # Copy visual from full mesh so color sampling works on geometry submesh
+        try:
+            mesh_geo.visual = mesh_full.visual
+        except Exception:
+            pass
 
-    area = mesh_geo.area
-    area_fill = mesh_fill.area
-    sample_num = 499712 // 2
-    num_fill = int(sample_num * (area_fill / (area + area_fill)))
-    num = sample_num - num_fill
+        area = mesh_geo.area
+        area_fill = mesh_fill.area
+        sample_num = 499712 // 2
+        num_fill = int(sample_num * (area_fill / (area + area_fill)))
+        num = sample_num - num_fill
 
-    pts, nrm, clr = sample_pointcloud_with_color(mesh_geo, num=num)
-    pts = pts.numpy()
-    nrm = nrm.numpy()
-    clr = clr.numpy()
+        pts, nrm, clr = sample_pointcloud_with_color(mesh_geo, num=num)
+        pts = pts.numpy()
+        nrm = nrm.numpy()
+        clr = clr.numpy()
 
-    if num_fill == 0:
-        pts_fill = np.zeros((0, 3), dtype=np.float32)
-        nrm_fill = np.zeros((0, 3), dtype=np.float32)
-        clr_fill = np.zeros((0, 3), dtype=np.float32)
-    else:
-        pts_fill, nrm_fill, clr_fill = sample_pointcloud_with_color(mesh_fill, num=num_fill)
-        pts_fill = pts_fill.numpy()
-        nrm_fill = nrm_fill.numpy()
-        clr_fill = clr_fill.numpy()
+        if num_fill == 0:
+            pts_fill = np.zeros((0, 3), dtype=np.float32)
+            nrm_fill = np.zeros((0, 3), dtype=np.float32)
+            clr_fill = np.zeros((0, 3), dtype=np.float32)
+        else:
+            pts_fill, nrm_fill, clr_fill = sample_pointcloud_with_color(mesh_fill, num=num_fill)
+            pts_fill = pts_fill.numpy()
+            nrm_fill = nrm_fill.numpy()
+            clr_fill = clr_fill.numpy()
 
-    sharp_pts, sharp_nrm, sharp_clr = sharp_sample_pointcloud_with_color(mesh_geo, num=sample_num)
+        sharp_pts, sharp_nrm, sharp_clr = sharp_sample_pointcloud_with_color(
+            mesh_geo, num=sample_num, rng=rng,
+        )
 
-    # Build surface block (random + fill) and sharp block
-    surface = np.concatenate(
-        [np.concatenate([pts, nrm, clr], axis=1),
-         np.concatenate([pts_fill, nrm_fill, clr_fill], axis=1)],
-        axis=0
-    ).astype(np.float16)
+        # Build surface block (random + fill) and sharp block
+        surface = np.concatenate(
+            [np.concatenate([pts, nrm, clr], axis=1),
+             np.concatenate([pts_fill, nrm_fill, clr_fill], axis=1)],
+            axis=0
+        ).astype(np.float16)
 
-    if len(sharp_pts) == 0:
-        # Fall back to uniform samples when no sharp edges detected
-        sharp_pts, sharp_nrm, sharp_clr = sample_pointcloud_with_color(mesh_geo, num=sample_num)
-        sharp_pts = sharp_pts.numpy()
-        sharp_nrm = sharp_nrm.numpy()
-        sharp_clr = sharp_clr.numpy()
+        if len(sharp_pts) == 0:
+            # Fall back to uniform samples when no sharp edges detected
+            sharp_pts, sharp_nrm, sharp_clr = sample_pointcloud_with_color(mesh_geo, num=sample_num)
+            sharp_pts = sharp_pts.numpy()
+            sharp_nrm = sharp_nrm.numpy()
+            sharp_clr = sharp_clr.numpy()
 
-    sharp_surface = np.concatenate([sharp_pts, sharp_nrm, sharp_clr], axis=1).astype(np.float16)
+        sharp_surface = np.concatenate([sharp_pts, sharp_nrm, sharp_clr], axis=1).astype(np.float16)
 
-    rng = np.random.default_rng()
-    ind = rng.choice(surface.shape[0], num_points, replace=False)
-    surface = torch.FloatTensor(surface[ind])
-    ind = rng.choice(sharp_surface.shape[0], num_sharp_points, replace=False)
-    sharp_surface = torch.FloatTensor(sharp_surface[ind])
+        ind = rng.choice(surface.shape[0], num_points, replace=False)
+        surface = torch.FloatTensor(surface[ind])
+        ind = rng.choice(sharp_surface.shape[0], num_sharp_points, replace=False)
+        sharp_surface = torch.FloatTensor(sharp_surface[ind])
 
-    return torch.cat([surface, sharp_surface], dim=0).unsqueeze(0), mesh_full
+        return torch.cat([surface, sharp_surface], dim=0).unsqueeze(0), mesh_full
 
 
 class RGBSharpEdgeSurfaceLoader:
@@ -338,10 +380,20 @@ class RGBSharpEdgeSurfaceLoader:
         channels: xyz(0:3) | normals(3:6) | rgb(6:9)
     """
 
-    def __init__(self, num_uniform_points=8192, num_sharp_points=8192, **kwargs):
+    def __init__(
+        self,
+        num_uniform_points=8192,
+        num_sharp_points=8192,
+        *,
+        seed: Optional[int] = None,
+        deterministic: bool = False,
+        **kwargs,
+    ):
         self.num_uniform_points = num_uniform_points
         self.num_sharp_points = num_sharp_points
         self.num_points = num_uniform_points + num_sharp_points
+        self.seed = seed
+        self.deterministic = deterministic
 
     def __call__(self, mesh_or_mesh_path, num_uniform_points=None, num_sharp_points=None):
         if num_uniform_points is None:
@@ -349,15 +401,22 @@ class RGBSharpEdgeSurfaceLoader:
         if num_sharp_points is None:
             num_sharp_points = self.num_sharp_points
 
+        mesh_path: Optional[str] = None
         mesh = mesh_or_mesh_path
         if isinstance(mesh, str):
+            mesh_path = mesh
             mesh = trimesh.load(mesh, process=False)
         if isinstance(mesh, trimesh.scene.Scene):
             mesh = mesh.dump(concatenate=True)
+
+        subsample_seed: Optional[int] = None
+        if self.deterministic and self.seed is not None and mesh_path is not None:
+            subsample_seed = stable_mesh_seed(self.seed, mesh_path)
 
         surface, _ = load_surface_sharpedge_rgb(
             mesh,
             num_points=num_uniform_points,
             num_sharp_points=num_sharp_points,
+            seed=subsample_seed,
         )
         return surface

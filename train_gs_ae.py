@@ -613,11 +613,15 @@ class MeshDataset(Dataset):
         require_cached_gt: bool = True,
         use_experiment_manifest: bool = True,
         train_view_indices: Optional[List[int]] = None,
+        seed: Optional[int] = None,
+        deterministic_encoder: bool = True,
     ):
         self.require_cached_gt = require_cached_gt
         self.loader = RGBSharpEdgeSurfaceLoader(
             num_uniform_points=pc_size,
             num_sharp_points=pc_sharpedge_size,
+            seed=seed,
+            deterministic=deterministic_encoder,
         )
 
         if train_view_indices is not None:
@@ -856,6 +860,17 @@ def train(args):
 
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     logger.info(f"Training on device: {device}")
+    if args.deterministic_encoder:
+        logger.info(
+            "Deterministic encoder: sequential point subset + FPS random_start=False; "
+            "surface subsampling seeded per mesh (global seed=%d).",
+            args.seed,
+        )
+    else:
+        logger.info(
+            "Stochastic encoder (--no-deterministic_encoder): random FPS starts and "
+            "unseeded surface subsampling."
+        )
     max_grad_norm = 1.0
 
     # ---- Model ----
@@ -919,6 +934,8 @@ def train(args):
         precache_full_views=False,
         require_cached_gt=not args.allow_on_the_fly_gt,
         use_experiment_manifest=not args.no_experiment_manifest,
+        seed=args.seed,
+        deterministic_encoder=args.deterministic_encoder,
     )
     views_loaded = int(dataset.gt_renderer.num_views)
     views_per_step_cfg = (
@@ -959,6 +976,8 @@ def train(args):
             require_cached_gt=not args.allow_on_the_fly_gt,
             use_experiment_manifest=not args.no_experiment_manifest,
             train_view_indices=list(range(6)),
+            seed=args.seed,
+            deterministic_encoder=args.deterministic_encoder,
         )
         logger.info(f"Val set: {len(val_dataset)} meshes in {args.val_dir}")
 

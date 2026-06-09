@@ -604,6 +604,16 @@ def evaluate_checkpoint(
     )
 
     model = load_model(checkpoint, args, device)
+    det_enc = bool(
+        train_args.get(
+            "deterministic_encoder",
+            getattr(args, "deterministic_encoder", True),
+        )
+    )
+    logger.info(
+        "Model encoder mode: deterministic=%s (from checkpoint args when present)",
+        det_enc,
+    )
     renderer = GaussianRenderer(
         height=args.render_height,
         width=args.render_width,
@@ -958,6 +968,22 @@ def main():
     if categories is not None:
         logger.info("Category filter: %s", sorted(categories))
 
+    surface_seed = args.seed
+    surface_deterministic = args.deterministic_encoder
+    if args.checkpoints:
+        ckpt0 = torch.load(args.checkpoints[0], map_location="cpu", weights_only=False)
+        train_args0 = ckpt0.get("args", {}) if isinstance(ckpt0, dict) else {}
+        if train_args0:
+            surface_seed = int(train_args0.get("seed", surface_seed))
+            surface_deterministic = bool(
+                train_args0.get("deterministic_encoder", surface_deterministic)
+            )
+            logger.info(
+                "Surface loader from checkpoint: deterministic=%s seed=%d",
+                surface_deterministic,
+                surface_seed,
+            )
+
     # Surface loader only; GT RGBD is read from full v46 cache inside evaluate_sample.
     dataset = MeshDataset(
         data_dir=args.data_dir,
@@ -973,6 +999,8 @@ def main():
         categories=categories,
         precache_full_views=True,
         require_cached_gt=args.only_cached_gt,
+        seed=surface_seed,
+        deterministic_encoder=surface_deterministic,
     )
     logger.info(f"Dataset: {len(dataset)} meshes in {args.data_dir}")
 
