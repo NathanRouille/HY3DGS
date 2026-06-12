@@ -491,30 +491,38 @@ def compute_anchor_drift_metrics(
 class RGBDLoss(nn.Module):
     """Multi-view RGBD reconstruction loss for 3DGS.
 
-    Loss = rgb_loss(pred_rgb, gt_rgb)                  [full-image, unmasked; L1 or MSE]
-         + lambda_ssim*(1-SSIM(pred_rgb, gt_rgb))     [full-image, unmasked]
-         + lambda_lpips*LPIPS(pred_rgb, gt_rgb)        [full-image, unmasked]
-         + lambda_d * L1(pred_depth, gt_depth)         [full-image; bg gt_depth=0]
-         + lambda_alpha * L1(pred_alpha, gt_alpha)     [gt_alpha = valid_mask as float]
+    Loss = rgb_loss(pred_rgb[fg], gt_rgb[fg])          [foreground-only; L1 or MSE]
+         + lambda_ssim*(1-SSIM(pred_rgb, gt_rgb))     [full-image; flat white bg ≈ 0 gradient]
+         + lambda_lpips*LPIPS(pred_rgb, gt_rgb)        [full-image; VGG ignores flat bg]
+         + lambda_d * L1(pred_depth[fg], gt_depth[fg]) [foreground-only; avoids depth halos]
+         + lambda_alpha * (L1_fg(alpha→1) + alpha_bg_weight*L1_bg(alpha→0))
          + lambda_scale * mean(s0*s1*s2)               [AnchorSplat volume penalty]
          + lambda_opa   * mean(1 - opacity)            [AnchorSplat opacity penalty]
          + lambda_delta * mean(||pos_delta||^2)       [anchor offset L2 penalty]
 
-    SSIM is computed with background pixels replaced by GT background in the
-    prediction, so the network receives no SSIM gradient from background regions.
+    The RGB and depth losses are computed on foreground pixels only (valid_mask = gt_depth>0)
+    to prevent the white background from dominating photometric gradients and washing out
+    dark object colours.  SSIM and LPIPS remain full-image so that holes and voids in the
+    object (e.g. chair grid backs) still generate structural gradients; the flat white
+    background contributes negligible signal to both.
+
+    Background suppression is handled by the alpha supervision term: foreground pixels
+    push pred_alpha→1 with weight 1; background pixels push pred_alpha→0 with weight
+    alpha_bg_weight (default 5).  Combined with the opacity regulariser (all Gaussians
+    toward opacity=1), the optimiser can only satisfy alpha=0 on background by not placing
+    Gaussians there, effectively confining Gaussians to the object.
 
     Args:
         lambda_ssim       : weight for SSIM term (default 0.2).
-        lambda_lpips      : weight for LPIPS on foreground-masked RGB (default 0.1).
-        lambda_d          : weight for depth L1 + BG depth-to-zero (default 1.0).
-        lambda_alpha      : weight for alpha supervision on fg (→1) and bg (→0).
-        alpha_bg_weight   : multiplier on BG alpha L1 before lambda_alpha (default 5.0).
+        lambda_lpips      : weight for LPIPS (full-image, default 0.1).
+        lambda_d          : weight for foreground depth L1 (default 1.0).
+        lambda_alpha      : weight for alpha supervision fg+bg (default 0.05).
+        alpha_bg_weight   : extra multiplier on background alpha L1 (default 5.0).
         lambda_scale      : weight for AnchorSplat volume penalty mean(s0*s1*s2) (default 0.01).
         lambda_opa        : weight for AnchorSplat opacity penalty mean(1 - opacity) (default 0.01).
         lambda_delta      : weight for mean squared anchor offset ||means - anchor||^2 (default 0).
         rgb_loss_type     : ``'l1'`` or ``'mse'`` for the photometric RGB term.
         fg_weight         : unused, kept for API compatibility.
-        alpha_bg_weight   : unused, kept for API compatibility.
         min_valid_ratio   : if foreground pixel fraction falls below this, depth terms
                             are zeroed for that view (degenerate camera / bad mesh).
     """
@@ -532,7 +540,6 @@ class RGBDLoss(nn.Module):
         fg_weight: float = 0.75,
         min_valid_ratio: float = 0.02,
         alpha_bg_weight: float = 5.0,
-        lpips_warmup_steps: int = 0,
     ):
         super().__init__()
         if rgb_loss_type not in ("l1", "mse"):
@@ -549,7 +556,6 @@ class RGBDLoss(nn.Module):
         self.fg_weight = fg_weight
         self.min_valid_ratio = min_valid_ratio
         self.alpha_bg_weight = alpha_bg_weight
-        self.lpips_warmup_steps = lpips_warmup_steps
 
     def _compute_lpips(
         self,
@@ -604,28 +610,60 @@ class RGBDLoss(nn.Module):
         valid_ratio = valid_mask.float().mean()
         depth_scale = (valid_ratio >= self.min_valid_ratio).to(pred_depth.dtype)
 
-        # ---- Full-image RGB photometric ----
-        if self.rgb_loss_type == "mse":
-            loss_rgb = F.mse_loss(pred_rgb, gt_rgb)
+        # ---- Foreground-only RGB photometric ----
+        # Masking prevents the white background (≈85% of pixels) from dominating
+        # gradients and pulling dark object colours toward white.
+        fg_rgb = valid_mask.expand_as(pred_rgb)
+        fg_pred_rgb = pred_rgb[fg_rgb]
+        fg_gt_rgb = gt_rgb[fg_rgb]
+        if fg_pred_rgb.numel() > 0:
+            if self.rgb_loss_type == "mse":
+                loss_rgb = F.mse_loss(fg_pred_rgb, fg_gt_rgb)
+            else:
+                loss_rgb = F.l1_loss(fg_pred_rgb, fg_gt_rgb)
         else:
-            loss_rgb = F.l1_loss(pred_rgb, gt_rgb)
+            loss_rgb = pred_rgb.new_zeros(())
 
-        # ---- Full-image SSIM ----
+        # ---- Full-image SSIM + LPIPS ----
+        # Kept full-image so that holes and voids in the object (e.g. chair grid
+        # backs) still produce structural gradients; the flat white background
+        # contributes negligible signal to both metrics.
         pred_rgb_nchw = pred_rgb.permute(0, 3, 1, 2).contiguous()
         gt_rgb_nchw = gt_rgb.permute(0, 3, 1, 2).contiguous()
         loss_ssim = 1.0 - _ssim(pred_rgb_nchw, gt_rgb_nchw)
         loss_lpips = self._compute_lpips(pred_rgb_nchw, gt_rgb_nchw)
 
-        # ---- Full-image depth L1 ----
-        # gt_depth == 0 for background pixels, so this naturally pushes the
-        # renderer to produce zero depth in empty regions.
-        loss_depth = depth_scale * F.l1_loss(pred_depth, gt_depth)
+        # ---- Foreground-only depth L1 ----
+        # Foreground-only avoids depth halos: edge Gaussians with soft 2D footprints
+        # that bleed into adjacent background pixels are no longer penalised for
+        # having non-zero depth there.  Background suppression is handled instead
+        # by the alpha supervision term below.
+        fg_d = valid_mask.expand_as(pred_depth)
+        if fg_d.any():
+            loss_depth = depth_scale * F.l1_loss(pred_depth[fg_d], gt_depth[fg_d])
+        else:
+            loss_depth = pred_depth.new_zeros(())
 
-        # ---- Full-image alpha L1 (gt_alpha = valid_mask as float) ----
+        # ---- Alpha supervision with background weighting ----
+        # Foreground pixels: pred_alpha → 1 (weight 1).
+        # Background pixels: pred_alpha → 0 (weight alpha_bg_weight).
+        # Combined with the opacity regulariser (Gaussians → opacity=1), the
+        # optimizer can only satisfy alpha=0 on background by not placing Gaussians
+        # there, confining Gaussians to the object surface.
         loss_alpha = pred_depth.new_zeros(())
         if pred_alpha is not None and self.lambda_alpha > 0:
             gt_alpha = valid_mask.float().expand_as(pred_alpha)
-            loss_alpha = F.l1_loss(pred_alpha, gt_alpha)
+            fg_a = valid_mask.expand_as(pred_alpha)
+            bg_a = ~fg_a
+            fg_alpha_loss = (
+                F.l1_loss(pred_alpha[fg_a], gt_alpha[fg_a])
+                if fg_a.any() else pred_alpha.new_zeros(())
+            )
+            bg_alpha_loss = (
+                F.l1_loss(pred_alpha[bg_a], gt_alpha[bg_a])
+                if bg_a.any() else pred_alpha.new_zeros(())
+            )
+            loss_alpha = fg_alpha_loss + self.alpha_bg_weight * bg_alpha_loss
 
         # ---- AnchorSplat 3D regularisers ----
         # Volume penalty: penalise the mean physical volume of each Gaussian.

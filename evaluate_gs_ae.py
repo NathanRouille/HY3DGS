@@ -2,10 +2,10 @@
 """Standalone evaluation script for ShapeGSAE checkpoints.
 
 Evaluates one or more checkpoints on a validation set and produces:
-  - Per-sample and mean PSNR (foreground only)
-  - Per-sample and mean SSIM (foreground only)
-  - Mean predicted alpha on foreground
-  - Mean predicted depth coverage
+  - Per-sample and mean PSNR (foreground-only and full-image)
+  - Per-sample and mean SSIM (full-image; no GT background replacement)
+  - Mean predicted composited alpha on foreground and background
+  - Full-image LPIPS and foreground depth L1
   - Visual comparison grids (GT RGB | Pred RGB | GT depth | Pred depth)
   - Input surface point clouds (``.ply``)
   - FPS encoder anchors / ``query_positions`` (``.ply``)
@@ -81,7 +81,13 @@ from hy3dgen.shapegen.gs_renderer import (
     compute_anchor_drift_metrics,
     expand_anchor_positions,
 )
-from hy3dgen.shapegen.eval_metrics import compute_psnr, compute_ssim_fg
+from hy3dgen.shapegen.eval_metrics import (
+    compute_mean_alpha_bg,
+    compute_mean_alpha_fg,
+    compute_psnr_fg,
+    compute_psnr_full,
+    compute_ssim_full,
+)
 from hy3dgen.shapegen.models.autoencoders.model import ShapeGSAE
 from hy3dgen.shapegen.surface_loaders import normalize_mesh
 from train_gs_ae import (
@@ -334,6 +340,24 @@ def eval_holdout_view_indices_v46_14grid() -> List[int]:
     return [g(r, c) for r in (0, 3) for c in (1, 3, 5, 7)]
 
 
+def true_holdout_view_indices_v46() -> List[int]:
+    """8 row-2 grid views never included in any training set (6-, 14-, or 22-view).
+
+    The v46 layout is:
+      indices 0–5   : 6 canonical views
+      indices 6–45  : 5 elevation rows × 8 azimuth columns (row-major)
+        row 0  → indices  6–13   (included in 14-view and 22-view training)
+        row 1  → indices 14–21   (included in 22-view training)
+        row 2  → indices 22–29   ← true holdout (never trained on)
+        row 3  → indices 30–37   (included in 14-view and 22-view training)
+        row 4  → indices 38–45   (included in 22-view training)
+
+    Use these for a genuine generalization check independent of num_views config.
+    """
+    g = lambda r, c: 6 + r * 8 + c
+    return [g(2, c) for c in range(8)]
+
+
 def train_view_indices_from_checkpoint(train_args: dict) -> List[int]:
     """Training view indices implied by checkpoint ``args['num_views']``."""
     num_views = int(train_args.get("num_views", 14))
@@ -436,7 +460,9 @@ def _evaluate_views_subset(
     if depth_vmin is not None and depth_vmax is not None:
         depth_err_vmax = max((depth_vmax - depth_vmin) / 5.0, 1e-3)
 
-    psnr_list, ssim_list, lpips_list, depth_l1_list = [], [], [], []
+    psnr_fg_list, psnr_full_list = [], []
+    ssim_full_list, lpips_list, depth_l1_list = [], [], []
+    alpha_bg_list, alpha_fg_list = [], []
     row_images: List[Image.Image] = []
 
     for gt_rgb, gt_depth, c2w in zip(gt_rgbs, gt_depths, c2ws):
@@ -448,9 +474,13 @@ def _evaluate_views_subset(
         out = renderer(means, scales, rotations, opacities, sh_coeffs, c2w.to(device))
         pred_rgb = out["rgb"].cpu()
         pred_depth = out["depth"].cpu()
+        pred_alpha = out["alpha"].cpu()
 
-        psnr_list.append(compute_psnr(pred_rgb, gt_rgb, valid_mask))
-        ssim_list.append(compute_ssim_fg(pred_rgb, gt_rgb, valid_mask))
+        psnr_fg_list.append(compute_psnr_fg(pred_rgb, gt_rgb, valid_mask))
+        psnr_full_list.append(compute_psnr_full(pred_rgb, gt_rgb))
+        ssim_full_list.append(compute_ssim_full(pred_rgb, gt_rgb))
+        alpha_bg_list.append(compute_mean_alpha_bg(pred_alpha, valid_mask))
+        alpha_fg_list.append(compute_mean_alpha_fg(pred_alpha, valid_mask))
 
         if lpips_net is not None:
             pred_nchw = pred_rgb.unsqueeze(0).permute(0, 3, 1, 2).to(device)
@@ -478,11 +508,16 @@ def _evaluate_views_subset(
         row_images.append(row)
 
     metrics = {
-        "psnr_fg": _mean_metric(psnr_list),
-        "ssim_fg": _mean_metric(ssim_list),
+        "psnr_fg": _mean_metric(psnr_fg_list),
+        "psnr_full": _mean_metric(psnr_full_list),
+        "ssim_full": _mean_metric(ssim_full_list),
+        # Backward-compatible alias (now honest full-image SSIM, no GT bg fill).
+        "ssim_fg": _mean_metric(ssim_full_list),
         "lpips_fg": _mean_metric(lpips_list),
+        "mean_alpha_bg": _mean_metric(alpha_bg_list),
+        "mean_alpha_fg": _mean_metric(alpha_fg_list),
         "mean_depth_l1": _mean_metric(depth_l1_list),
-        "n_views": len(psnr_list),
+        "n_views": len(psnr_fg_list),
     }
     return metrics, row_images
 
@@ -500,13 +535,14 @@ def evaluate_sample(
     gt_renderer: GTRGBDRenderer,
     canonical_view_indices: List[int],
     holdout_view_indices: List[int],
+    true_holdout_view_indices: Optional[List[int]] = None,
     ckpt_train_view_indices: Optional[List[int]] = None,
     lpips_net=None,
     drift_threshold: float = 0.1,
 ) -> Tuple[Dict[str, float], Dict[str, List[Image.Image]], Dict[str, torch.Tensor]]:
-    """Evaluate canonical (6) + holdout (8) view sets using full v46 GT from disk.
+    """Evaluate canonical (6) + holdout (8) + optional true holdout (8) view sets.
 
-    Returns (flat_metrics_dict, {"canonical": rows, "holdout": rows}, export_tensors).
+    Returns (flat_metrics_dict, {"canonical": rows, "holdout": rows, ...}, export_tensors).
     """
     mesh_path = sample["mesh_path"]
     rgbs_full, depths_full, c2ws_full, _ = gt_renderer.get_or_render(
@@ -519,6 +555,10 @@ def evaluate_sample(
     hold_rgbs, hold_depths, hold_c2ws = _slice_views_by_indices(
         rgbs_full, depths_full, c2ws_full, holdout_view_indices,
     )
+    if true_holdout_view_indices:
+        thold_rgbs, thold_depths, thold_c2ws = _slice_views_by_indices(
+            rgbs_full, depths_full, c2ws_full, true_holdout_view_indices,
+        )
 
     surface = sample["surface"].unsqueeze(0).to(device)
     latents, query_positions = model.encode(surface)
@@ -554,6 +594,18 @@ def evaluate_sample(
         "canonical_view_indices": canonical_view_indices,
         "holdout_view_indices": holdout_view_indices,
     }
+
+    row_images = {"canonical": rows_canon, "holdout": rows_holdout}
+
+    if true_holdout_view_indices:
+        metrics_true_holdout, rows_true_holdout = _evaluate_views_subset(
+            means, scales, rotations, opacities, sh_coeffs,
+            renderer, device, thold_rgbs, thold_depths, thold_c2ws, lpips_net,
+        )
+        flat_metrics.update(_prefix_metrics(metrics_true_holdout, "true_holdout"))
+        flat_metrics["true_holdout_view_indices"] = true_holdout_view_indices
+        row_images["true_holdout"] = rows_true_holdout
+
     if ckpt_train_view_indices is not None:
         flat_metrics["ckpt_train_view_indices"] = ckpt_train_view_indices
     export_tensors = {
@@ -566,7 +618,6 @@ def evaluate_sample(
         "sh_coeffs": sh_coeffs.detach().cpu(),
         "features": features.detach().cpu(),
     }
-    row_images = {"canonical": rows_canon, "holdout": rows_holdout}
     return flat_metrics, row_images, export_tensors
 
 
@@ -594,11 +645,13 @@ def evaluate_checkpoint(
     train_args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
     canonical_view_indices = list(CANONICAL_VIEW_INDICES_V46)
     holdout_view_indices = eval_holdout_view_indices_v46_14grid()
+    th_indices = true_holdout_view_indices_v46()
     ckpt_train_view_indices = train_view_indices_from_checkpoint(train_args)
     logger.info(
-        "Eval canonical=%s | holdout=%s | checkpoint trained on %d views %s",
+        "Eval canonical=%s | holdout=%s | true_holdout=%s | checkpoint trained on %d views %s",
         canonical_view_indices,
         holdout_view_indices,
+        th_indices,
         len(ckpt_train_view_indices),
         ckpt_train_view_indices,
     )
@@ -669,6 +722,7 @@ def evaluate_checkpoint(
             dataset.gt_renderer,
             canonical_view_indices,
             holdout_view_indices,
+            true_holdout_view_indices=th_indices,
             ckpt_train_view_indices=ckpt_train_view_indices,
             lpips_net=lpips_net,
             drift_threshold=args.drift_threshold,
@@ -726,18 +780,21 @@ def evaluate_checkpoint(
                 sh_degree=model.sh_degree,
             )
 
-        for split_name in ("canonical", "holdout"):
+        for split_name in ("canonical", "holdout", "true_holdout"):
             rows = row_images_by_split.get(split_name) or []
             if not rows:
                 continue
-            m_psnr = metrics.get(f"psnr_fg_{split_name}", float("nan"))
-            m_ssim = metrics.get(f"ssim_fg_{split_name}", float("nan"))
+            m_psnr_fg = metrics.get(f"psnr_fg_{split_name}", float("nan"))
+            m_psnr_full = metrics.get(f"psnr_full_{split_name}", float("nan"))
+            m_ssim = metrics.get(f"ssim_full_{split_name}", float("nan"))
             m_lpips = metrics.get(f"lpips_fg_{split_name}", float("nan"))
+            m_alpha_bg = metrics.get(f"mean_alpha_bg_{split_name}", float("nan"))
             grid = _vconcat(rows)
             grid_labeled = add_label_bar(
                 grid,
                 f"{ckpt_tag} | {mesh_stem} | {split_name} | "
-                f"PSNR={m_psnr:.2f}dB  SSIM={m_ssim:.4f}  LPIPS={m_lpips:.4f}",
+                f"PSNR_fg={m_psnr_fg:.2f}  PSNR={m_psnr_full:.2f}  "
+                f"SSIM={m_ssim:.4f}  LPIPS={m_lpips:.4f}  α_bg={m_alpha_bg:.4f}",
             )
             grid_labeled.save(viz_dir / f"{rank:03d}_{mesh_stem}_{split_name}.png")
 
@@ -750,20 +807,37 @@ def evaluate_checkpoint(
         }
         results.append(result)
         logger.info(
-            "  canonical: PSNR=%.2fdB SSIM=%.4f LPIPS=%.4f L1depth=%.4f (n=%s)",
+            "  canonical:    PSNR_fg=%.2f PSNR=%.2f SSIM=%.4f LPIPS=%.4f "
+            "α_bg=%.4f L1depth=%.4f (n=%s)",
             metrics.get("psnr_fg_canonical", float("nan")),
-            metrics.get("ssim_fg_canonical", float("nan")),
+            metrics.get("psnr_full_canonical", float("nan")),
+            metrics.get("ssim_full_canonical", float("nan")),
             metrics.get("lpips_fg_canonical", float("nan")),
+            metrics.get("mean_alpha_bg_canonical", float("nan")),
             metrics.get("mean_depth_l1_canonical", float("nan")),
             metrics.get("n_views_canonical", "?"),
         )
         logger.info(
-            "  holdout: PSNR=%.2fdB SSIM=%.4f LPIPS=%.4f L1depth=%.4f (n=%s)",
+            "  holdout:      PSNR_fg=%.2f PSNR=%.2f SSIM=%.4f LPIPS=%.4f "
+            "α_bg=%.4f L1depth=%.4f (n=%s)",
             metrics.get("psnr_fg_holdout", float("nan")),
-            metrics.get("ssim_fg_holdout", float("nan")),
+            metrics.get("psnr_full_holdout", float("nan")),
+            metrics.get("ssim_full_holdout", float("nan")),
             metrics.get("lpips_fg_holdout", float("nan")),
+            metrics.get("mean_alpha_bg_holdout", float("nan")),
             metrics.get("mean_depth_l1_holdout", float("nan")),
             metrics.get("n_views_holdout", "?"),
+        )
+        logger.info(
+            "  true_holdout: PSNR_fg=%.2f PSNR=%.2f SSIM=%.4f LPIPS=%.4f "
+            "α_bg=%.4f L1depth=%.4f (n=%s)",
+            metrics.get("psnr_fg_true_holdout", float("nan")),
+            metrics.get("psnr_full_true_holdout", float("nan")),
+            metrics.get("ssim_full_true_holdout", float("nan")),
+            metrics.get("lpips_fg_true_holdout", float("nan")),
+            metrics.get("mean_alpha_bg_true_holdout", float("nan")),
+            metrics.get("mean_depth_l1_true_holdout", float("nan")),
+            metrics.get("n_views_true_holdout", "?"),
         )
         logger.info(
             "  drift: mean_l2=%.4f max_l2=%.4f p95_l2=%.4f frac_gt_%.2f=%.4f",
@@ -789,14 +863,28 @@ def evaluate_checkpoint(
             writer.writeheader()
             writer.writerow(summary_row)
         logger.info(f"Summary CSV saved to {csv_path}")
+        th_psnr = summary_row.get('mean_psnr_full_true_holdout', float('nan'))
+        th_ssim = summary_row.get('mean_ssim_full_true_holdout', float('nan'))
+        th_lpips = summary_row.get('mean_lpips_fg_true_holdout', float('nan'))
+        th_alpha_bg = summary_row.get('mean_alpha_bg_true_holdout', float('nan'))
+        th_str = (
+            f"    true_holdout PSNR={th_psnr:.3f}  SSIM={th_ssim:.4f}  "
+            f"LPIPS={th_lpips:.4f}  α_bg={th_alpha_bg:.4f}\n"
+            if not math.isnan(th_psnr) else ""
+        )
         logger.info(
             f"\n  SUMMARY [{ckpt_tag}] n={summary_row['n_samples']} samples\n"
-            f"    canonical PSNR={summary_row['mean_psnr_fg_canonical']:.3f}  "
-            f"SSIM={summary_row['mean_ssim_fg_canonical']:.4f}  "
-            f"LPIPS={summary_row['mean_lpips_fg_canonical']:.4f}\n"
-            f"    holdout  PSNR={summary_row['mean_psnr_fg_holdout']:.3f}  "
-            f"SSIM={summary_row['mean_ssim_fg_holdout']:.4f}  "
-            f"LPIPS={summary_row['mean_lpips_fg_holdout']:.4f}\n"
+            f"    canonical    PSNR_fg={summary_row['mean_psnr_fg_canonical']:.3f}  "
+            f"PSNR={summary_row['mean_psnr_full_canonical']:.3f}  "
+            f"SSIM={summary_row['mean_ssim_full_canonical']:.4f}  "
+            f"LPIPS={summary_row['mean_lpips_fg_canonical']:.4f}  "
+            f"α_bg={summary_row['mean_alpha_bg_canonical']:.4f}\n"
+            f"    holdout      PSNR_fg={summary_row['mean_psnr_fg_holdout']:.3f}  "
+            f"PSNR={summary_row['mean_psnr_full_holdout']:.3f}  "
+            f"SSIM={summary_row['mean_ssim_full_holdout']:.4f}  "
+            f"LPIPS={summary_row['mean_lpips_fg_holdout']:.4f}  "
+            f"α_bg={summary_row['mean_alpha_bg_holdout']:.4f}\n"
+            f"{th_str}"
             f"    drift mean_l2={summary_row['mean_drift_l2']:.4f}  "
             f"max_l2={summary_row['mean_max_drift_l2']:.4f}  "
             f"frac_gt_thresh={summary_row['mean_frac_drift_gt_thresh']:.4f}"
@@ -827,13 +915,29 @@ def _summarize_checkpoint_results(
         "tag": ckpt_tag,
         "n_samples": len(valid),
         "mean_psnr_fg_canonical": _mean_key("psnr_fg_canonical"),
+        "mean_psnr_full_canonical": _mean_key("psnr_full_canonical"),
+        "mean_ssim_full_canonical": _mean_key("ssim_full_canonical"),
         "mean_ssim_fg_canonical": _mean_key("ssim_fg_canonical"),
         "mean_lpips_fg_canonical": _mean_key("lpips_fg_canonical"),
+        "mean_alpha_bg_canonical": _mean_key("mean_alpha_bg_canonical"),
+        "mean_alpha_fg_canonical": _mean_key("mean_alpha_fg_canonical"),
         "mean_depth_l1_canonical": _mean_key("mean_depth_l1_canonical"),
         "mean_psnr_fg_holdout": _mean_key("psnr_fg_holdout"),
+        "mean_psnr_full_holdout": _mean_key("psnr_full_holdout"),
+        "mean_ssim_full_holdout": _mean_key("ssim_full_holdout"),
         "mean_ssim_fg_holdout": _mean_key("ssim_fg_holdout"),
         "mean_lpips_fg_holdout": _mean_key("lpips_fg_holdout"),
+        "mean_alpha_bg_holdout": _mean_key("mean_alpha_bg_holdout"),
+        "mean_alpha_fg_holdout": _mean_key("mean_alpha_fg_holdout"),
         "mean_depth_l1_holdout": _mean_key("mean_depth_l1_holdout"),
+        "mean_psnr_fg_true_holdout": _mean_key("psnr_fg_true_holdout"),
+        "mean_psnr_full_true_holdout": _mean_key("psnr_full_true_holdout"),
+        "mean_ssim_full_true_holdout": _mean_key("ssim_full_true_holdout"),
+        "mean_ssim_fg_true_holdout": _mean_key("ssim_fg_true_holdout"),
+        "mean_lpips_fg_true_holdout": _mean_key("lpips_fg_true_holdout"),
+        "mean_alpha_bg_true_holdout": _mean_key("mean_alpha_bg_true_holdout"),
+        "mean_alpha_fg_true_holdout": _mean_key("mean_alpha_fg_true_holdout"),
+        "mean_depth_l1_true_holdout": _mean_key("mean_depth_l1_true_holdout"),
         "mean_drift_l2": _mean_key("mean_drift_l2"),
         "mean_max_drift_l2": _mean_key("max_drift_l2"),
         "mean_p95_drift_l2": _mean_key("p95_drift_l2"),
@@ -844,6 +948,9 @@ def _summarize_checkpoint_results(
             valid[0].get("canonical_view_indices", []),
         )
         row["holdout_view_indices"] = json.dumps(valid[0].get("holdout_view_indices", []))
+        row["true_holdout_view_indices"] = json.dumps(
+            valid[0].get("true_holdout_view_indices", []),
+        )
         row["ckpt_train_view_indices"] = json.dumps(
             valid[0].get("ckpt_train_view_indices", []),
         )
@@ -1053,21 +1160,24 @@ def main():
         print("EVALUATION SUMMARY")
         print("=" * 80)
         hdr = (
-            f"{'Checkpoint':<40} "
-            f"{'CA_PSNR':>8} {'CA_SSIM':>8} {'HO_PSNR':>8} {'HO_SSIM':>8}"
+            f"{'Checkpoint':<36} "
+            f"{'CA_PSNR':>8} {'CA_SSIM':>8} {'CA_aBG':>7} "
+            f"{'HO_PSNR':>8} {'HO_SSIM':>8} {'HO_aBG':>7}"
         )
         print(hdr)
         print("-" * len(hdr))
-        for row in sorted(summary_rows, key=lambda x: -x["mean_psnr_fg_canonical"]):
+        for row in sorted(summary_rows, key=lambda x: -x["mean_psnr_full_canonical"]):
             name = Path(row["checkpoint"]).parent.name + "/" + Path(row["checkpoint"]).stem
-            if len(name) > 38:
-                name = ".." + name[-36:]
+            if len(name) > 34:
+                name = ".." + name[-32:]
             print(
-                f"  {name:<40} "
-                f"{row['mean_psnr_fg_canonical']:>8.3f} "
-                f"{row['mean_ssim_fg_canonical']:>8.4f} "
-                f"{row['mean_psnr_fg_holdout']:>8.3f} "
-                f"{row['mean_ssim_fg_holdout']:>8.4f}"
+                f"  {name:<36} "
+                f"{row['mean_psnr_full_canonical']:>8.3f} "
+                f"{row['mean_ssim_full_canonical']:>8.4f} "
+                f"{row['mean_alpha_bg_canonical']:>7.4f} "
+                f"{row['mean_psnr_full_holdout']:>8.3f} "
+                f"{row['mean_ssim_full_holdout']:>8.4f} "
+                f"{row['mean_alpha_bg_holdout']:>7.4f}"
             )
         print("=" * 80 + "\n")
 

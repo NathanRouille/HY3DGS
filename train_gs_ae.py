@@ -54,7 +54,12 @@ from hy3dgen.shapegen.gs_renderer import (
     build_view46_c2ws,
     expand_anchor_positions,
 )
-from hy3dgen.shapegen.eval_metrics import compute_psnr, compute_ssim_fg
+from hy3dgen.shapegen.eval_metrics import (
+    compute_mean_alpha_bg,
+    compute_psnr_fg,
+    compute_psnr_full,
+    compute_ssim_full,
+)
 
 
 class GtCacheNotFoundError(FileNotFoundError):
@@ -181,10 +186,10 @@ def run_validation(
 ) -> Dict[str, float]:
     """Evaluate model on a subset of val_dataset.
 
-    Returns mean PSNR (fg) and mean SSIM (fg) across all samples and views.
+    Returns foreground/full PSNR, full-image SSIM, and mean background alpha.
     """
     model.eval()
-    psnr_list, ssim_list = [], []
+    psnr_fg_list, psnr_full_list, ssim_full_list, alpha_bg_list = [], [], [], []
 
     indices = list(range(len(val_dataset)))[:num_samples]
     for idx in indices:
@@ -215,16 +220,27 @@ def run_validation(
                 continue
             out = renderer(means, scales, rotations, opacities, sh_coeffs, c2w.to(device))
             pred_rgb = out['rgb'].cpu()
+            pred_alpha = out['alpha'].cpu()
 
-            psnr_list.append(compute_psnr(pred_rgb, gt_rgb, valid_mask))
-            ssim_list.append(compute_ssim_fg(pred_rgb, gt_rgb, valid_mask))
+            psnr_fg_list.append(compute_psnr_fg(pred_rgb, gt_rgb, valid_mask))
+            psnr_full_list.append(compute_psnr_full(pred_rgb, gt_rgb))
+            ssim_full_list.append(compute_ssim_full(pred_rgb, gt_rgb))
+            alpha_bg_list.append(compute_mean_alpha_bg(pred_alpha, valid_mask))
 
     model.train()
-    if not psnr_list:
-        return {'val/psnr_fg': 0.0, 'val/ssim_fg': 0.0}
+    if not psnr_fg_list:
+        return {
+            'val/psnr_fg': 0.0,
+            'val/psnr_full': 0.0,
+            'val/ssim_full': 0.0,
+            'val/mean_alpha_bg': 0.0,
+        }
+    n = len(psnr_fg_list)
     return {
-        'val/psnr_fg': float(sum(psnr_list) / len(psnr_list)),
-        'val/ssim_fg': float(sum(ssim_list) / len(ssim_list)),
+        'val/psnr_fg': float(sum(psnr_fg_list) / n),
+        'val/psnr_full': float(sum(psnr_full_list) / n),
+        'val/ssim_full': float(sum(ssim_full_list) / n),
+        'val/mean_alpha_bg': float(sum(alpha_bg_list) / n),
     }
 
 
@@ -911,11 +927,11 @@ def train(args):
         lambda_lpips=args.lambda_lpips,
         lambda_d=args.lambda_d,
         lambda_alpha=args.lambda_alpha,
+        alpha_bg_weight=args.alpha_bg_weight,
         lambda_scale=args.lambda_scale,
         lambda_opa=args.lambda_opa,
         lambda_delta=args.lambda_delta,
         rgb_loss_type=args.rgb_loss_type,
-        lpips_warmup_steps=args.lpips_warmup_steps,
     )
 
     # ---- Data ----
@@ -1318,14 +1334,16 @@ def parse_args():
     p.add_argument('--lambda_ssim', type=float, default=0.2,
                    help='SSIM loss weight. Full-image (no masking).')
     p.add_argument('--lambda_lpips', type=float, default=0.1,
-                   help='LPIPS perceptual loss weight. Full-image; ramped in via --lpips_warmup_steps.')
-    p.add_argument('--lpips_warmup_steps', type=int, default=5000,
-                   help='Linear LPIPS ramp 0→1 over this many steps (0 disables). Mitigates the '
-                        '"perceptual mean" texture-washout failure mode.')
+                   help='LPIPS perceptual loss weight. Full-image (VGG ignores flat white bg).')
     p.add_argument('--lambda_d', type=float, default=1.0,
-                   help='Full-image depth L1 weight (GT background depth is 0).')
+                   help='Foreground-only depth L1 weight. Set 0 to disable depth supervision.')
     p.add_argument('--lambda_alpha', type=float, default=0.05,
-                   help='Alpha supervision L1: gt_alpha = valid_mask (full image).')
+                   help='Alpha supervision weight. Foreground→1 and background→0 (weighted by '
+                        '--alpha_bg_weight). Essential when using foreground-masked RGB loss to '
+                        'prevent Gaussians drifting into the background.')
+    p.add_argument('--alpha_bg_weight', type=float, default=5.0,
+                   help='Extra multiplier on the background alpha L1 term (pred_alpha→0 on bg '
+                        'pixels). Higher values push harder against background Gaussians.')
     p.add_argument('--lambda_scale', type=float, default=0.01,
                    help='AnchorSplat volume penalty: penalises mean(s0*s1*s2) per Gaussian.')
     p.add_argument('--lambda_opa', type=float, default=0.05,

@@ -51,7 +51,7 @@ if str(ROOT) not in sys.path:
 
 from hy3dgen.shapegen.gs_renderer import GaussianRenderer, RGBDLoss
 from hy3dgen.shapegen.surface_loaders import RGBSharpEdgeSurfaceLoader
-from hy3dgen.shapegen.eval_metrics import compute_psnr, compute_ssim_fg
+from hy3dgen.shapegen.eval_metrics import compute_psnr_fg, compute_ssim_full
 from train_gs_ae import GTRGBDRenderer
 
 logging.basicConfig(
@@ -253,7 +253,6 @@ def train(args: argparse.Namespace) -> None:
         lambda_scale=args.lambda_scale,
         lambda_opa=args.lambda_opa,
         rgb_loss_type=args.rgb_loss_type,
-        lpips_warmup_steps=0,
     )
 
     # ---- Optimiser ----
@@ -318,8 +317,10 @@ def train(args: argparse.Namespace) -> None:
                     if float(valid_mask.float().mean()) < 0.02:
                         continue
                     out = renderer(means, scales, rotations, opacities, colors, c2w.to(device))
-                    psnr_list.append(compute_psnr(out["rgb"].cpu(), gt_rgb.cpu(), valid_mask.cpu()))
-                    ssim_list.append(compute_ssim_fg(out["rgb"].cpu(), gt_rgb.cpu(), valid_mask.cpu()))
+                    pred_rgb = out["rgb"].cpu()
+                    gt_rgb_cpu = gt_rgb.cpu()
+                    psnr_list.append(compute_psnr_fg(pred_rgb, gt_rgb_cpu, valid_mask.cpu()))
+                    ssim_list.append(compute_ssim_full(pred_rgb, gt_rgb_cpu))
 
             mean_psnr = sum(psnr_list) / len(psnr_list) if psnr_list else float("nan")
             mean_ssim = sum(ssim_list) / len(ssim_list) if ssim_list else float("nan")
