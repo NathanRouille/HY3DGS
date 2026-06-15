@@ -868,6 +868,56 @@ def _train_log_to_floats(comp: Dict[str, torch.Tensor]) -> Dict[str, float]:
     return {k: float(v.item()) if torch.is_tensor(v) else float(v) for k, v in comp.items()}
 
 
+def _accum_train_component(
+    acc: Dict[str, torch.Tensor],
+    key: str,
+    val: torch.Tensor,
+) -> None:
+    """Accumulate loss components with gradients (for per-term grad-norm logging)."""
+    if key in acc:
+        acc[key] = acc[key] + val
+    else:
+        acc[key] = val
+
+
+def _grad_norm_for_loss(
+    parameters: List[torch.nn.Parameter],
+    loss_scalar: torch.Tensor,
+) -> float:
+    """L2 norm of gradients of ``loss_scalar`` w.r.t. trainable parameters."""
+    if not loss_scalar.requires_grad:
+        return 0.0
+    params = [p for p in parameters if p.requires_grad]
+    grads = torch.autograd.grad(
+        loss_scalar,
+        params,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    total_sq = sum(
+        g.detach().float().norm().pow(2).item()
+        for g in grads
+        if g is not None
+    )
+    return float(total_sq ** 0.5)
+
+
+def _compute_loss_grad_norms(
+    model: torch.nn.Module,
+    criterion: RGBDLoss,
+    components: Dict[str, torch.Tensor],
+    delta_loss: Optional[torch.Tensor] = None,
+) -> Dict[str, float]:
+    """Per-term gradient L2 norms (approximate loss balancing diagnostic)."""
+    params = list(model.parameters())
+    norms: Dict[str, float] = {}
+    for name, term in criterion.weighted_terms_for_grad_norm(components).items():
+        norms[name] = _grad_norm_for_loss(params, term)
+    if delta_loss is not None and criterion.lambda_delta > 0:
+        norms["delta_reg"] = _grad_norm_for_loss(params, delta_loss)
+    return norms
+
+
 def train(args):
     # ---- Resolve category filter ----
     categories = resolve_category_ids(args.categories)
@@ -932,6 +982,8 @@ def train(args):
         lambda_opa=args.lambda_opa,
         lambda_delta=args.lambda_delta,
         rgb_loss_type=args.rgb_loss_type,
+        lambda_rgb=args.lambda_rgb,
+        lambda_edge=args.lambda_edge,
     )
 
     # ---- Data ----
@@ -1083,6 +1135,9 @@ def train(args):
             # Accumulate rendering loss over all views
             total_loss = torch.zeros((), device=device)
             log_components: Dict[str, torch.Tensor] = {}
+            grad_components: Optional[Dict[str, torch.Tensor]] = (
+                {} if (will_log and use_wandb and args.log_grad_norms) else None
+            )
 
             B = surface.shape[0]
             num_views_total = len(c2ws)
@@ -1137,6 +1192,8 @@ def train(args):
 
                 for k, v in comps.items():
                     _accum_train_log(log_components, k, v)
+                    if grad_components is not None and k not in ("total", "valid_ratio"):
+                        _accum_train_component(grad_components, k, v)
 
             # Mean over sampled views: keeps loss magnitude stable when varying
             # views_per_step while providing an unbiased estimate of the
@@ -1147,13 +1204,22 @@ def train(args):
                 log_components = {k: v * inv_n for k, v in log_components.items()}
                 log_components["n_views_total"] = torch.tensor(float(num_views_total), device=device)
                 log_components["n_views_sampled"] = torch.tensor(float(views_per_step), device=device)
+                if grad_components is not None:
+                    grad_components = {k: v * inv_n for k, v in grad_components.items()}
 
+            delta_loss_tensor: Optional[torch.Tensor] = None
             if args.lambda_delta > 0:
-                delta_loss, delta_comps = criterion.anchor_delta_regularizer(pos_deltas)
-                total_loss = total_loss + delta_loss
+                delta_loss_tensor, delta_comps = criterion.anchor_delta_regularizer(pos_deltas)
+                total_loss = total_loss + delta_loss_tensor
                 for k, v in delta_comps.items():
                     if k != "total":
                         _accum_train_log(log_components, k, v)
+
+            grad_norms: Optional[Dict[str, float]] = None
+            if grad_components is not None:
+                grad_norms = _compute_loss_grad_norms(
+                    model, criterion, grad_components, delta_loss_tensor,
+                )
 
             optimizer.zero_grad()
             total_loss.backward()
@@ -1179,24 +1245,21 @@ def train(args):
                 )
 
                 if use_wandb:
-                    # Panels follow dict insertion order in wandb. Order chosen so
-                    # the most important plots (lr, grad_norm, regularisers) come
-                    # first, then individual loss components, with total_loss last.
                     grad_norm_val = float(
                         grad_norm_preclip.detach().item()
                         if torch.is_tensor(grad_norm_preclip) else grad_norm_preclip
                     )
                     mean_drift_l2 = float(pos_deltas.detach().norm(dim=-1).mean().item())
                     wandb_log: Dict[str, float] = {
-                        "train/lr": float(lr),
                         "train/grad_norm": grad_norm_val,
                         "train/mean_drift_l2": mean_drift_l2,
                     }
-                    # Regularisers first
+                    if grad_norms is not None:
+                        for term_name, gn in grad_norms.items():
+                            wandb_log[f"grad_norm/{term_name}"] = gn
                     for k in ("scale_reg", "opa_reg", "delta_reg"):
                         if k in log_floats:
                             wandb_log[f"train/{k}"] = log_floats[k]
-                    # Per-loss components (rgb_loss_type is 'mse' or 'l1')
                     for k in (args.rgb_loss_type, "ssim", "lpips", "depth", "alpha_sup"):
                         if k in log_floats:
                             wandb_log[f"train/{k}"] = log_floats[k]
@@ -1331,6 +1394,11 @@ def parse_args():
     p.add_argument('--rgb_loss_type', choices=('mse', 'l1'), default='mse',
                    help='RGB photometric loss: MSE (LGM/GRM/GS-LRM default; preserves high frequencies) '
                         'or L1.')
+    p.add_argument('--lambda_rgb', type=float, default=1.0,
+                   help='Global multiplier on the foreground RGB (L1/MSE) term.')
+    p.add_argument('--lambda_edge', type=float, default=4.0,
+                   help='Extra per-pixel weight on high-|∇GT| foreground pixels in the RGB '
+                        'term (0 = uniform foreground L1/MSE).')
     p.add_argument('--lambda_ssim', type=float, default=0.2,
                    help='SSIM loss weight. Full-image (no masking).')
     p.add_argument('--lambda_lpips', type=float, default=0.1,
@@ -1370,6 +1438,12 @@ def parse_args():
     # Misc
     p.add_argument('--device', type=str, default='cuda')
     p.add_argument('--log_every', type=int, default=50)
+    p.add_argument(
+        '--log_grad_norms',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Log per-loss-term gradient L2 norms to wandb (grad_norm/*) for weight tuning.',
+    )
     p.add_argument('--save_every', type=int, default=5_000)
     p.add_argument('--val_every', type=int, default=2000,
                    help='Run validation every N steps (requires --val_dir).')

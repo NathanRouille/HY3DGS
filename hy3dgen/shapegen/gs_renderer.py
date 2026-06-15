@@ -112,6 +112,54 @@ def _ssim(
     return (num / den.clamp_min(1e-8)).mean()
 
 
+def _compute_gt_edge_weight_map(
+    gt_rgb: torch.Tensor,
+    lambda_edge: float,
+) -> torch.Tensor:
+    """Per-pixel weights in ``[1, 1 + lambda_edge]`` from GT RGB image gradients.
+
+    Args:
+        gt_rgb: ``(B, H, W, 3)`` in ``[0, 1]``.
+        lambda_edge: extra weight on high-gradient pixels (0 = uniform).
+
+    Returns:
+        ``(B, H, W, 1)`` weight map (detached).
+    """
+    if lambda_edge <= 0:
+        return torch.ones(*gt_rgb.shape[:-1], 1, device=gt_rgb.device, dtype=gt_rgb.dtype)
+    gt = gt_rgb.detach()
+    gt_nchw = gt.permute(0, 3, 1, 2).contiguous()
+    gx = (gt_nchw[:, :, :, 1:] - gt_nchw[:, :, :, :-1]).abs().mean(dim=1, keepdim=True)
+    gy = (gt_nchw[:, :, 1:, :] - gt_nchw[:, :, :-1, :]).abs().mean(dim=1, keepdim=True)
+    B, _, H, W = gt_nchw.shape
+    edge = torch.zeros(B, 1, H, W, device=gt.device, dtype=gt.dtype)
+    edge[:, :, :, 1:] += gx
+    edge[:, :, 1:, :] += gy
+    emax = edge.flatten(1).amax(dim=1).view(B, 1, 1, 1).clamp_min(1e-6)
+    edge_norm = edge / emax
+    return (1.0 + lambda_edge * edge_norm).permute(0, 2, 3, 1)
+
+
+def _foreground_weighted_rgb_loss(
+    pred_rgb: torch.Tensor,
+    gt_rgb: torch.Tensor,
+    valid_mask: torch.Tensor,
+    rgb_loss_type: str,
+    edge_weight: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Foreground-only RGB loss with optional per-pixel edge weights."""
+    if rgb_loss_type == "mse":
+        per_pixel = (pred_rgb - gt_rgb).pow(2).sum(dim=-1, keepdim=True)
+    else:
+        per_pixel = (pred_rgb - gt_rgb).abs().sum(dim=-1, keepdim=True)
+    fg = valid_mask.float()
+    if fg.dim() == pred_rgb.dim() - 1:
+        fg = fg.unsqueeze(-1)
+    w = fg if edge_weight is None else fg * edge_weight
+    denom = w.sum().clamp_min(1.0)
+    return (per_pixel * w).sum() / denom
+
+
 # ---------------------------------------------------------------------------
 # Camera utilities
 # ---------------------------------------------------------------------------
@@ -190,6 +238,24 @@ GT_CACHE_TAG_V46: str = "v46_fp16_norm"
 
 # Allowed training subsample counts (must match presets in train_gs_ae.snap_train_views_v46)
 VIEW46_TRAIN_ALLOWED: Tuple[int, ...] = (6, 14, 22, 30, 38, 46)
+
+# v46 layout: indices 0–5 canonical; indices 6–45 = 5 elevation rows × 8 azimuth cols.
+CANONICAL_VIEW_INDICES_V46: Tuple[int, ...] = tuple(range(6))
+
+
+def v46_grid_view_index(row: int, col: int) -> int:
+    """Global view index for grid row ``row`` (0–4) and column ``col`` (0–7)."""
+    return 6 + row * 8 + col
+
+
+def holdout_view_indices_v46() -> List[int]:
+    """Elevation grid rows 1 and 2 (16 views).
+
+    For 22-view training (rows 0 and 3 only), these views are never seen during
+    training.  Fixed across experiments so canonical vs holdout comparisons use
+    the same cameras.
+    """
+    return [v46_grid_view_index(r, c) for r in (1, 2) for c in range(8)]
 
 
 def mesh_seed_from_path(mesh_path: str, extra: int = 0) -> int:
@@ -491,7 +557,7 @@ def compute_anchor_drift_metrics(
 class RGBDLoss(nn.Module):
     """Multi-view RGBD reconstruction loss for 3DGS.
 
-    Loss = rgb_loss(pred_rgb[fg], gt_rgb[fg])          [foreground-only; L1 or MSE]
+    Loss = lambda_rgb * rgb_loss(pred_rgb[fg], gt_rgb[fg])  [foreground-only; edge-weighted L1/MSE]
          + lambda_ssim*(1-SSIM(pred_rgb, gt_rgb))     [full-image; flat white bg ≈ 0 gradient]
          + lambda_lpips*LPIPS(pred_rgb, gt_rgb)        [full-image; VGG ignores flat bg]
          + lambda_d * L1(pred_depth[fg], gt_depth[fg]) [foreground-only; avoids depth halos]
@@ -522,7 +588,9 @@ class RGBDLoss(nn.Module):
         lambda_opa        : weight for AnchorSplat opacity penalty mean(1 - opacity) (default 0.01).
         lambda_delta      : weight for mean squared anchor offset ||means - anchor||^2 (default 0).
         rgb_loss_type     : ``'l1'`` or ``'mse'`` for the photometric RGB term.
-        fg_weight         : unused, kept for API compatibility.
+        lambda_rgb        : global multiplier on the foreground RGB term (default 1.0).
+        lambda_edge       : extra per-pixel weight on high-|∇GT| fg pixels (default 4.0;
+                            0 = uniform foreground L1/MSE).
         min_valid_ratio   : if foreground pixel fraction falls below this, depth terms
                             are zeroed for that view (degenerate camera / bad mesh).
     """
@@ -537,7 +605,8 @@ class RGBDLoss(nn.Module):
         lambda_opa: float = 0.01,
         lambda_delta: float = 0.0,
         rgb_loss_type: str = "mse",
-        fg_weight: float = 0.75,
+        lambda_rgb: float = 1.0,
+        lambda_edge: float = 4.0,
         min_valid_ratio: float = 0.02,
         alpha_bg_weight: float = 5.0,
     ):
@@ -553,7 +622,8 @@ class RGBDLoss(nn.Module):
         self.lambda_opa = lambda_opa
         self.lambda_delta = lambda_delta
         self.rgb_loss_type = rgb_loss_type
-        self.fg_weight = fg_weight
+        self.lambda_rgb = lambda_rgb
+        self.lambda_edge = lambda_edge
         self.min_valid_ratio = min_valid_ratio
         self.alpha_bg_weight = alpha_bg_weight
 
@@ -610,17 +680,19 @@ class RGBDLoss(nn.Module):
         valid_ratio = valid_mask.float().mean()
         depth_scale = (valid_ratio >= self.min_valid_ratio).to(pred_depth.dtype)
 
-        # ---- Foreground-only RGB photometric ----
+        # ---- Foreground-only RGB photometric (optional GT-gradient edge weights) ----
         # Masking prevents the white background (≈85% of pixels) from dominating
-        # gradients and pulling dark object colours toward white.
-        fg_rgb = valid_mask.expand_as(pred_rgb)
-        fg_pred_rgb = pred_rgb[fg_rgb]
-        fg_gt_rgb = gt_rgb[fg_rgb]
-        if fg_pred_rgb.numel() > 0:
-            if self.rgb_loss_type == "mse":
-                loss_rgb = F.mse_loss(fg_pred_rgb, fg_gt_rgb)
-            else:
-                loss_rgb = F.l1_loss(fg_pred_rgb, fg_gt_rgb)
+        # gradients and pulling dark object colours toward white.  Edge weights
+        # upweight material boundaries (high |∇GT|) to reduce colour bleeding.
+        edge_weight = _compute_gt_edge_weight_map(gt_rgb, self.lambda_edge)
+        if valid_mask.any():
+            loss_rgb = _foreground_weighted_rgb_loss(
+                pred_rgb,
+                gt_rgb,
+                valid_mask,
+                self.rgb_loss_type,
+                edge_weight=edge_weight,
+            )
         else:
             loss_rgb = pred_rgb.new_zeros(())
 
@@ -682,8 +754,9 @@ class RGBDLoss(nn.Module):
         else:
             loss_opa = pred_rgb.new_zeros(())
 
+        loss_rgb_weighted = self.lambda_rgb * loss_rgb
         total = (
-            loss_rgb
+            loss_rgb_weighted
             + self.lambda_ssim * loss_ssim
             + self.lambda_lpips * loss_lpips
             + self.lambda_d * loss_depth
@@ -704,6 +777,23 @@ class RGBDLoss(nn.Module):
             'valid_ratio': valid_ratio.detach(),
         }
         return total, components
+
+    def weighted_terms_for_grad_norm(
+        self,
+        components: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """Return per-term scalar losses as they enter ``total`` (for grad-norm logging)."""
+        rgb_key = self.rgb_loss_type
+        terms: Dict[str, torch.Tensor] = {
+            rgb_key: self.lambda_rgb * components[rgb_key],
+            "ssim": self.lambda_ssim * components["ssim"],
+            "lpips": self.lambda_lpips * components["lpips"],
+            "depth": self.lambda_d * components["depth"],
+            "alpha_sup": self.lambda_alpha * components["alpha_sup"],
+            "scale_reg": self.lambda_scale * components["scale_reg"],
+            "opa_reg": self.lambda_opa * components["opa_reg"],
+        }
+        return terms
 
     def anchor_delta_regularizer(
         self,

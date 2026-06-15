@@ -34,12 +34,12 @@ Usage — evaluate a single checkpoint on training data (overfit test)
 
 Per checkpoint, evaluates two view sets from the full v46 GT cache:
 
-  * **canonical** — always the 6 axis-aligned views (indices 0..5), so 6-view
-    and 14-view models are compared fairly on the same cameras
-  * **holdout** — 8 grid views not in 14-view training (rows 0 & 3, odd
-    azimuth columns 1/3/5/7)
+  * **canonical** — always the 6 axis-aligned views (indices 0..5)
+  * **holdout** — elevation grid rows 1 and 2 (16 views; not used in 22-view
+    training).  Same fixed cameras across all experiments.
 
 Saves separate visuals/metrics (``*_canonical`` / ``*_holdout``).
+Summary CSV uses ``canonical/holdout`` slash format per metric.
 """
 
 from __future__ import annotations
@@ -77,9 +77,11 @@ from hy3dgen.shapegen.gs_export import (
     export_xyz_pointcloud_ply,
 )
 from hy3dgen.shapegen.gs_renderer import (
+    CANONICAL_VIEW_INDICES_V46,
     GaussianRenderer,
     compute_anchor_drift_metrics,
     expand_anchor_positions,
+    holdout_view_indices_v46,
 )
 from hy3dgen.shapegen.eval_metrics import (
     compute_mean_alpha_bg,
@@ -95,8 +97,6 @@ from train_gs_ae import (
     MeshDataset,
     mesh_path_has_usable_gt_cache,
     resolve_category_ids,
-    snap_train_views_v46,
-    train_view_indices_v46,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -327,44 +327,6 @@ def pca_features_to_rgb(features: torch.Tensor) -> torch.Tensor:
     return rgb.clamp(0.0, 1.0)
 
 
-# ---------------------------------------------------------------------------
-# v46 view index sets (canonical vs 14-view holdout)
-# ---------------------------------------------------------------------------
-
-CANONICAL_VIEW_INDICES_V46: List[int] = list(range(6))
-
-
-def eval_holdout_view_indices_v46_14grid() -> List[int]:
-    """8 grid views omitted from 14-view training (rows 0 & 3, odd az columns)."""
-    g = lambda r, c: 6 + r * 8 + c
-    return [g(r, c) for r in (0, 3) for c in (1, 3, 5, 7)]
-
-
-def true_holdout_view_indices_v46() -> List[int]:
-    """8 row-2 grid views never included in any training set (6-, 14-, or 22-view).
-
-    The v46 layout is:
-      indices 0–5   : 6 canonical views
-      indices 6–45  : 5 elevation rows × 8 azimuth columns (row-major)
-        row 0  → indices  6–13   (included in 14-view and 22-view training)
-        row 1  → indices 14–21   (included in 22-view training)
-        row 2  → indices 22–29   ← true holdout (never trained on)
-        row 3  → indices 30–37   (included in 14-view and 22-view training)
-        row 4  → indices 38–45   (included in 22-view training)
-
-    Use these for a genuine generalization check independent of num_views config.
-    """
-    g = lambda r, c: 6 + r * 8 + c
-    return [g(2, c) for c in range(8)]
-
-
-def train_view_indices_from_checkpoint(train_args: dict) -> List[int]:
-    """Training view indices implied by checkpoint ``args['num_views']``."""
-    num_views = int(train_args.get("num_views", 14))
-    snapped = snap_train_views_v46(num_views)
-    return train_view_indices_v46(snapped)
-
-
 def _slice_views_by_indices(
     rgbs: List[torch.Tensor],
     depths: List[torch.Tensor],
@@ -535,14 +497,12 @@ def evaluate_sample(
     gt_renderer: GTRGBDRenderer,
     canonical_view_indices: List[int],
     holdout_view_indices: List[int],
-    true_holdout_view_indices: Optional[List[int]] = None,
-    ckpt_train_view_indices: Optional[List[int]] = None,
     lpips_net=None,
     drift_threshold: float = 0.1,
 ) -> Tuple[Dict[str, float], Dict[str, List[Image.Image]], Dict[str, torch.Tensor]]:
-    """Evaluate canonical (6) + holdout (8) + optional true holdout (8) view sets.
+    """Evaluate canonical (6) + holdout (16) view sets.
 
-    Returns (flat_metrics_dict, {"canonical": rows, "holdout": rows, ...}, export_tensors).
+    Returns (flat_metrics_dict, {"canonical": rows, "holdout": rows}, export_tensors).
     """
     mesh_path = sample["mesh_path"]
     rgbs_full, depths_full, c2ws_full, _ = gt_renderer.get_or_render(
@@ -555,10 +515,6 @@ def evaluate_sample(
     hold_rgbs, hold_depths, hold_c2ws = _slice_views_by_indices(
         rgbs_full, depths_full, c2ws_full, holdout_view_indices,
     )
-    if true_holdout_view_indices:
-        thold_rgbs, thold_depths, thold_c2ws = _slice_views_by_indices(
-            rgbs_full, depths_full, c2ws_full, true_holdout_view_indices,
-        )
 
     surface = sample["surface"].unsqueeze(0).to(device)
     latents, query_positions = model.encode(surface)
@@ -591,23 +547,10 @@ def evaluate_sample(
         **_prefix_metrics(metrics_canon, "canonical"),
         **_prefix_metrics(metrics_holdout, "holdout"),
         **drift_metrics,
-        "canonical_view_indices": canonical_view_indices,
-        "holdout_view_indices": holdout_view_indices,
     }
 
     row_images = {"canonical": rows_canon, "holdout": rows_holdout}
 
-    if true_holdout_view_indices:
-        metrics_true_holdout, rows_true_holdout = _evaluate_views_subset(
-            means, scales, rotations, opacities, sh_coeffs,
-            renderer, device, thold_rgbs, thold_depths, thold_c2ws, lpips_net,
-        )
-        flat_metrics.update(_prefix_metrics(metrics_true_holdout, "true_holdout"))
-        flat_metrics["true_holdout_view_indices"] = true_holdout_view_indices
-        row_images["true_holdout"] = rows_true_holdout
-
-    if ckpt_train_view_indices is not None:
-        flat_metrics["ckpt_train_view_indices"] = ckpt_train_view_indices
     export_tensors = {
         "surface": sample["surface"].detach().cpu(),
         "query_positions": query_positions.detach().cpu(),
@@ -644,16 +587,11 @@ def evaluate_checkpoint(
     ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
     train_args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
     canonical_view_indices = list(CANONICAL_VIEW_INDICES_V46)
-    holdout_view_indices = eval_holdout_view_indices_v46_14grid()
-    th_indices = true_holdout_view_indices_v46()
-    ckpt_train_view_indices = train_view_indices_from_checkpoint(train_args)
+    holdout_view_indices = holdout_view_indices_v46()
     logger.info(
-        "Eval canonical=%s | holdout=%s | true_holdout=%s | checkpoint trained on %d views %s",
+        "Eval canonical=%s | holdout=%s",
         canonical_view_indices,
         holdout_view_indices,
-        th_indices,
-        len(ckpt_train_view_indices),
-        ckpt_train_view_indices,
     )
 
     model = load_model(checkpoint, args, device)
@@ -722,8 +660,6 @@ def evaluate_checkpoint(
             dataset.gt_renderer,
             canonical_view_indices,
             holdout_view_indices,
-            true_holdout_view_indices=th_indices,
-            ckpt_train_view_indices=ckpt_train_view_indices,
             lpips_net=lpips_net,
             drift_threshold=args.drift_threshold,
         )
@@ -780,7 +716,7 @@ def evaluate_checkpoint(
                 sh_degree=model.sh_degree,
             )
 
-        for split_name in ("canonical", "holdout", "true_holdout"):
+        for split_name in ("canonical", "holdout"):
             rows = row_images_by_split.get(split_name) or []
             if not rows:
                 continue
@@ -829,17 +765,6 @@ def evaluate_checkpoint(
             metrics.get("n_views_holdout", "?"),
         )
         logger.info(
-            "  true_holdout: PSNR_fg=%.2f PSNR=%.2f SSIM=%.4f LPIPS=%.4f "
-            "α_bg=%.4f L1depth=%.4f (n=%s)",
-            metrics.get("psnr_fg_true_holdout", float("nan")),
-            metrics.get("psnr_full_true_holdout", float("nan")),
-            metrics.get("ssim_full_true_holdout", float("nan")),
-            metrics.get("lpips_fg_true_holdout", float("nan")),
-            metrics.get("mean_alpha_bg_true_holdout", float("nan")),
-            metrics.get("mean_depth_l1_true_holdout", float("nan")),
-            metrics.get("n_views_true_holdout", "?"),
-        )
-        logger.info(
             "  drift: mean_l2=%.4f max_l2=%.4f p95_l2=%.4f frac_gt_%.2f=%.4f",
             metrics.get("mean_drift_l2", float("nan")),
             metrics.get("max_drift_l2", float("nan")),
@@ -863,34 +788,22 @@ def evaluate_checkpoint(
             writer.writeheader()
             writer.writerow(summary_row)
         logger.info(f"Summary CSV saved to {csv_path}")
-        th_psnr = summary_row.get('mean_psnr_full_true_holdout', float('nan'))
-        th_ssim = summary_row.get('mean_ssim_full_true_holdout', float('nan'))
-        th_lpips = summary_row.get('mean_lpips_fg_true_holdout', float('nan'))
-        th_alpha_bg = summary_row.get('mean_alpha_bg_true_holdout', float('nan'))
-        th_str = (
-            f"    true_holdout PSNR={th_psnr:.3f}  SSIM={th_ssim:.4f}  "
-            f"LPIPS={th_lpips:.4f}  α_bg={th_alpha_bg:.4f}\n"
-            if not math.isnan(th_psnr) else ""
-        )
         logger.info(
             f"\n  SUMMARY [{ckpt_tag}] n={summary_row['n_samples']} samples\n"
-            f"    canonical    PSNR_fg={summary_row['mean_psnr_fg_canonical']:.3f}  "
-            f"PSNR={summary_row['mean_psnr_full_canonical']:.3f}  "
-            f"SSIM={summary_row['mean_ssim_full_canonical']:.4f}  "
-            f"LPIPS={summary_row['mean_lpips_fg_canonical']:.4f}  "
-            f"α_bg={summary_row['mean_alpha_bg_canonical']:.4f}\n"
-            f"    holdout      PSNR_fg={summary_row['mean_psnr_fg_holdout']:.3f}  "
-            f"PSNR={summary_row['mean_psnr_full_holdout']:.3f}  "
-            f"SSIM={summary_row['mean_ssim_full_holdout']:.4f}  "
-            f"LPIPS={summary_row['mean_lpips_fg_holdout']:.4f}  "
-            f"α_bg={summary_row['mean_alpha_bg_holdout']:.4f}\n"
-            f"{th_str}"
-            f"    drift mean_l2={summary_row['mean_drift_l2']:.4f}  "
-            f"max_l2={summary_row['mean_max_drift_l2']:.4f}  "
-            f"frac_gt_thresh={summary_row['mean_frac_drift_gt_thresh']:.4f}"
+            f"    psnr:      {summary_row['psnr']}\n"
+            f"    ssim:      {summary_row['ssim']}\n"
+            f"    lpips:     {summary_row['lpips']}\n"
+            f"    l1_depth:  {summary_row['l1_depth']}"
         )
 
     return results
+
+
+def _fmt_metric_pair(canonical: float, holdout: float, precision: int) -> str:
+    """Format ``canonical/holdout`` for summary CSV (canonical left, holdout right)."""
+    if math.isnan(canonical) or math.isnan(holdout):
+        return "nan/nan"
+    return f"{canonical:.{precision}f}/{holdout:.{precision}f}"
 
 
 def _summarize_checkpoint_results(
@@ -898,63 +811,36 @@ def _summarize_checkpoint_results(
     ckpt_tag: str,
     results: List[Dict],
 ) -> Optional[Dict]:
-    """Aggregate per-sample rows into one summary dict, or None if no valid samples."""
+    """Aggregate per-sample rows into one compact summary dict."""
     valid = [
         r for r in results
-        if not math.isnan(r.get("psnr_fg_canonical", float("nan")))
+        if not math.isnan(r.get("psnr_full_canonical", float("nan")))
     ]
     if not valid:
         return None
 
     def _mean_key(key: str) -> float:
         vals = [r[key] for r in valid if not math.isnan(r.get(key, float("nan")))]
-        return round(sum(vals) / len(vals), 4) if vals else float("nan")
+        return sum(vals) / len(vals) if vals else float("nan")
 
-    row = {
+    psnr_c = _mean_key("psnr_full_canonical")
+    psnr_h = _mean_key("psnr_full_holdout")
+    ssim_c = _mean_key("ssim_full_canonical")
+    ssim_h = _mean_key("ssim_full_holdout")
+    lpips_c = _mean_key("lpips_fg_canonical")
+    lpips_h = _mean_key("lpips_fg_holdout")
+    depth_c = _mean_key("mean_depth_l1_canonical")
+    depth_h = _mean_key("mean_depth_l1_holdout")
+
+    return {
         "checkpoint": checkpoint,
         "tag": ckpt_tag,
         "n_samples": len(valid),
-        "mean_psnr_fg_canonical": _mean_key("psnr_fg_canonical"),
-        "mean_psnr_full_canonical": _mean_key("psnr_full_canonical"),
-        "mean_ssim_full_canonical": _mean_key("ssim_full_canonical"),
-        "mean_ssim_fg_canonical": _mean_key("ssim_fg_canonical"),
-        "mean_lpips_fg_canonical": _mean_key("lpips_fg_canonical"),
-        "mean_alpha_bg_canonical": _mean_key("mean_alpha_bg_canonical"),
-        "mean_alpha_fg_canonical": _mean_key("mean_alpha_fg_canonical"),
-        "mean_depth_l1_canonical": _mean_key("mean_depth_l1_canonical"),
-        "mean_psnr_fg_holdout": _mean_key("psnr_fg_holdout"),
-        "mean_psnr_full_holdout": _mean_key("psnr_full_holdout"),
-        "mean_ssim_full_holdout": _mean_key("ssim_full_holdout"),
-        "mean_ssim_fg_holdout": _mean_key("ssim_fg_holdout"),
-        "mean_lpips_fg_holdout": _mean_key("lpips_fg_holdout"),
-        "mean_alpha_bg_holdout": _mean_key("mean_alpha_bg_holdout"),
-        "mean_alpha_fg_holdout": _mean_key("mean_alpha_fg_holdout"),
-        "mean_depth_l1_holdout": _mean_key("mean_depth_l1_holdout"),
-        "mean_psnr_fg_true_holdout": _mean_key("psnr_fg_true_holdout"),
-        "mean_psnr_full_true_holdout": _mean_key("psnr_full_true_holdout"),
-        "mean_ssim_full_true_holdout": _mean_key("ssim_full_true_holdout"),
-        "mean_ssim_fg_true_holdout": _mean_key("ssim_fg_true_holdout"),
-        "mean_lpips_fg_true_holdout": _mean_key("lpips_fg_true_holdout"),
-        "mean_alpha_bg_true_holdout": _mean_key("mean_alpha_bg_true_holdout"),
-        "mean_alpha_fg_true_holdout": _mean_key("mean_alpha_fg_true_holdout"),
-        "mean_depth_l1_true_holdout": _mean_key("mean_depth_l1_true_holdout"),
-        "mean_drift_l2": _mean_key("mean_drift_l2"),
-        "mean_max_drift_l2": _mean_key("max_drift_l2"),
-        "mean_p95_drift_l2": _mean_key("p95_drift_l2"),
-        "mean_frac_drift_gt_thresh": _mean_key("frac_drift_gt_thresh"),
+        "psnr": _fmt_metric_pair(psnr_c, psnr_h, 2),
+        "ssim": _fmt_metric_pair(ssim_c, ssim_h, 3),
+        "lpips": _fmt_metric_pair(lpips_c, lpips_h, 3),
+        "l1_depth": _fmt_metric_pair(depth_c, depth_h, 3),
     }
-    if valid:
-        row["canonical_view_indices"] = json.dumps(
-            valid[0].get("canonical_view_indices", []),
-        )
-        row["holdout_view_indices"] = json.dumps(valid[0].get("holdout_view_indices", []))
-        row["true_holdout_view_indices"] = json.dumps(
-            valid[0].get("true_holdout_view_indices", []),
-        )
-        row["ckpt_train_view_indices"] = json.dumps(
-            valid[0].get("ckpt_train_view_indices", []),
-        )
-    return row
 
 
 # ---------------------------------------------------------------------------
@@ -1156,30 +1042,24 @@ def main():
         logger.info(f"Combined summary CSV saved to {combined_csv}")
 
     if summary_rows:
-        print("\n" + "=" * 80)
-        print("EVALUATION SUMMARY")
-        print("=" * 80)
-        hdr = (
-            f"{'Checkpoint':<36} "
-            f"{'CA_PSNR':>8} {'CA_SSIM':>8} {'CA_aBG':>7} "
-            f"{'HO_PSNR':>8} {'HO_SSIM':>8} {'HO_aBG':>7}"
-        )
+        print("\n" + "=" * 72)
+        print("EVALUATION SUMMARY  (canonical / holdout)")
+        print("=" * 72)
+        hdr = f"{'Checkpoint':<32} {'psnr':>14} {'ssim':>14} {'lpips':>14} {'l1_depth':>14}"
         print(hdr)
         print("-" * len(hdr))
-        for row in sorted(summary_rows, key=lambda x: -x["mean_psnr_full_canonical"]):
+        for row in summary_rows:
             name = Path(row["checkpoint"]).parent.name + "/" + Path(row["checkpoint"]).stem
-            if len(name) > 34:
-                name = ".." + name[-32:]
+            if len(name) > 30:
+                name = ".." + name[-28:]
             print(
-                f"  {name:<36} "
-                f"{row['mean_psnr_full_canonical']:>8.3f} "
-                f"{row['mean_ssim_full_canonical']:>8.4f} "
-                f"{row['mean_alpha_bg_canonical']:>7.4f} "
-                f"{row['mean_psnr_full_holdout']:>8.3f} "
-                f"{row['mean_ssim_full_holdout']:>8.4f} "
-                f"{row['mean_alpha_bg_holdout']:>7.4f}"
+                f"  {name:<32} "
+                f"{row['psnr']:>14} "
+                f"{row['ssim']:>14} "
+                f"{row['lpips']:>14} "
+                f"{row['l1_depth']:>14}"
             )
-        print("=" * 80 + "\n")
+        print("=" * 72 + "\n")
 
 
 if __name__ == "__main__":
