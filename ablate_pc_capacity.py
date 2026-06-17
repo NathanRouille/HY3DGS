@@ -289,8 +289,6 @@ def train(args: argparse.Namespace) -> None:
                 out["depth"], gt_depth,
                 pred_alpha=out["alpha"],
                 valid_mask=valid_mask,
-                scales=scales.log(),          # pass log(physical_scale)
-                opacities=opacities,
             )
             total_loss = total_loss + view_loss
             num_valid += 1
@@ -300,6 +298,12 @@ def train(args: argparse.Namespace) -> None:
             continue
 
         total_loss = total_loss / num_valid
+        if criterion.lambda_scale > 0 or criterion.lambda_opa > 0:
+            gaussian_loss, _ = criterion.gaussian_regularizer(
+                scales.log(),
+                opacities,
+            )
+            total_loss = total_loss + gaussian_loss
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()

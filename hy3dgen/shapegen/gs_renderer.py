@@ -527,8 +527,13 @@ def anchor_delta_loss(pos_deltas: torch.Tensor) -> torch.Tensor:
 
     AnchorSplat hard-constrains offsets with ``tanh(raw) * (10/128)`` at decode time;
     this loss term provides a differentiable soft alternative when no hard cap is set.
+
+    Averages over Gaussians within each object, then over objects in the batch.
     """
-    return (pos_deltas ** 2).sum(dim=-1).mean()
+    sq = (pos_deltas ** 2).sum(dim=-1)
+    if sq.dim() == 1:
+        return sq.mean()
+    return sq.mean(dim=-1).mean()
 
 
 @torch.no_grad()
@@ -562,9 +567,11 @@ class RGBDLoss(nn.Module):
          + lambda_lpips*LPIPS(pred_rgb, gt_rgb)        [full-image; VGG ignores flat bg]
          + lambda_d * L1(pred_depth[fg], gt_depth[fg]) [foreground-only; avoids depth halos]
          + lambda_alpha * (L1_fg(alpha→1) + alpha_bg_weight*L1_bg(alpha→0))
-         + lambda_scale * mean(s0*s1*s2)               [AnchorSplat volume penalty]
-         + lambda_opa   * mean(1 - opacity)            [AnchorSplat opacity penalty]
-         + lambda_delta * mean(||pos_delta||^2)       [anchor offset L2 penalty]
+
+    Per-view image terms average over objects in the batch (not pooled across pixels).
+    Scale, opacity, and delta regularisers are applied once per step via
+    ``gaussian_regularizer`` and ``anchor_delta_regularizer`` (mean over Gaussians
+    within each object, then mean over batch).
 
     The RGB and depth losses are computed on foreground pixels only (valid_mask = gt_depth>0)
     to prevent the white background from dominating photometric gradients and washing out
@@ -658,10 +665,8 @@ class RGBDLoss(nn.Module):
         gt_depth: torch.Tensor,
         pred_alpha: Optional[torch.Tensor] = None,  # same spatial shape as depth, float [0,1]
         valid_mask: Optional[torch.Tensor] = None,  # same shape as depth, bool
-        scales: Optional[torch.Tensor] = None,      # (N, 3) or (B, N, 3) log-scales
-        opacities: Optional[torch.Tensor] = None,   # (N, 1) or (B, N, 1)
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Compute combined loss and return (total, component_dict)."""
+        """Per-view image loss: mean over objects, then weighted sum of terms."""
 
         # Bring to (B, C, H, W) for SSIM if needed
         if pred_rgb.dim() == 3:
@@ -677,92 +682,87 @@ class RGBDLoss(nn.Module):
         if valid_mask is None:
             valid_mask = gt_depth > 0
 
-        valid_ratio = valid_mask.float().mean()
-        depth_scale = (valid_ratio >= self.min_valid_ratio).to(pred_depth.dtype)
-
-        # ---- Foreground-only RGB photometric (optional GT-gradient edge weights) ----
-        # Masking prevents the white background (≈85% of pixels) from dominating
-        # gradients and pulling dark object colours toward white.  Edge weights
-        # upweight material boundaries (high |∇GT|) to reduce colour bleeding.
+        batch_size = pred_rgb.shape[0]
         edge_weight = _compute_gt_edge_weight_map(gt_rgb, self.lambda_edge)
-        if valid_mask.any():
-            loss_rgb = _foreground_weighted_rgb_loss(
-                pred_rgb,
-                gt_rgb,
-                valid_mask,
-                self.rgb_loss_type,
-                edge_weight=edge_weight,
-            )
+
+        rgb_losses: List[torch.Tensor] = []
+        depth_losses: List[torch.Tensor] = []
+        alpha_losses: List[torch.Tensor] = []
+        valid_ratios: List[torch.Tensor] = []
+
+        for b in range(batch_size):
+            vm = valid_mask[b]
+            valid_ratio_b = vm.float().mean()
+            valid_ratios.append(valid_ratio_b)
+            depth_scale_b = (valid_ratio_b >= self.min_valid_ratio).to(pred_depth.dtype)
+
+            pred_b = pred_rgb[b : b + 1]
+            gt_b = gt_rgb[b : b + 1]
+            vm_b = vm.unsqueeze(0)
+
+            if vm.any():
+                ew_b = edge_weight[b : b + 1] if self.lambda_edge > 0 else None
+                rgb_losses.append(
+                    _foreground_weighted_rgb_loss(
+                        pred_b, gt_b, vm_b, self.rgb_loss_type, edge_weight=ew_b,
+                    )
+                )
+            else:
+                rgb_losses.append(pred_rgb.new_zeros(()))
+
+            fg_d = vm.expand_as(pred_depth[b])
+            if fg_d.any():
+                depth_losses.append(
+                    depth_scale_b * F.l1_loss(pred_depth[b][fg_d], gt_depth[b][fg_d])
+                )
+            else:
+                depth_losses.append(pred_depth.new_zeros(()))
+
+            if pred_alpha is not None and self.lambda_alpha > 0:
+                gt_alpha = vm.float().expand_as(pred_alpha[b])
+                fg_a = vm.expand_as(pred_alpha[b])
+                bg_a = ~fg_a
+                fg_alpha_loss = (
+                    F.l1_loss(pred_alpha[b][fg_a], gt_alpha[fg_a])
+                    if fg_a.any() else pred_alpha.new_zeros(())
+                )
+                bg_alpha_loss = (
+                    F.l1_loss(pred_alpha[b][bg_a], gt_alpha[bg_a])
+                    if bg_a.any() else pred_alpha.new_zeros(())
+                )
+                alpha_losses.append(fg_alpha_loss + self.alpha_bg_weight * bg_alpha_loss)
+
+        if rgb_losses:
+            loss_rgb = torch.stack(rgb_losses).mean()
         else:
             loss_rgb = pred_rgb.new_zeros(())
 
-        # ---- Full-image SSIM + LPIPS ----
-        # Kept full-image so that holes and voids in the object (e.g. chair grid
-        # backs) still produce structural gradients; the flat white background
-        # contributes negligible signal to both metrics.
+        if depth_losses:
+            loss_depth = torch.stack(depth_losses).mean()
+        else:
+            loss_depth = pred_depth.new_zeros(())
+
+        loss_alpha = pred_depth.new_zeros(())
+        if alpha_losses:
+            loss_alpha = torch.stack(alpha_losses).mean()
+
+        valid_ratio = (
+            torch.stack(valid_ratios).mean()
+            if valid_ratios else valid_mask.new_zeros(())
+        )
+
+        # ---- Full-image SSIM + LPIPS (already mean over batch) ----
         pred_rgb_nchw = pred_rgb.permute(0, 3, 1, 2).contiguous()
         gt_rgb_nchw = gt_rgb.permute(0, 3, 1, 2).contiguous()
         loss_ssim = 1.0 - _ssim(pred_rgb_nchw, gt_rgb_nchw)
         loss_lpips = self._compute_lpips(pred_rgb_nchw, gt_rgb_nchw)
 
-        # ---- Foreground-only depth L1 ----
-        # Foreground-only avoids depth halos: edge Gaussians with soft 2D footprints
-        # that bleed into adjacent background pixels are no longer penalised for
-        # having non-zero depth there.  Background suppression is handled instead
-        # by the alpha supervision term below.
-        fg_d = valid_mask.expand_as(pred_depth)
-        if fg_d.any():
-            loss_depth = depth_scale * F.l1_loss(pred_depth[fg_d], gt_depth[fg_d])
-        else:
-            loss_depth = pred_depth.new_zeros(())
-
-        # ---- Alpha supervision with background weighting ----
-        # Foreground pixels: pred_alpha → 1 (weight 1).
-        # Background pixels: pred_alpha → 0 (weight alpha_bg_weight).
-        # Combined with the opacity regulariser (Gaussians → opacity=1), the
-        # optimizer can only satisfy alpha=0 on background by not placing Gaussians
-        # there, confining Gaussians to the object surface.
-        loss_alpha = pred_depth.new_zeros(())
-        if pred_alpha is not None and self.lambda_alpha > 0:
-            gt_alpha = valid_mask.float().expand_as(pred_alpha)
-            fg_a = valid_mask.expand_as(pred_alpha)
-            bg_a = ~fg_a
-            fg_alpha_loss = (
-                F.l1_loss(pred_alpha[fg_a], gt_alpha[fg_a])
-                if fg_a.any() else pred_alpha.new_zeros(())
-            )
-            bg_alpha_loss = (
-                F.l1_loss(pred_alpha[bg_a], gt_alpha[bg_a])
-                if bg_a.any() else pred_alpha.new_zeros(())
-            )
-            loss_alpha = fg_alpha_loss + self.alpha_bg_weight * bg_alpha_loss
-
-        # ---- AnchorSplat 3D regularisers ----
-        # Volume penalty: penalise the mean physical volume of each Gaussian.
-        # scales are log(physical_scale); sum over dims gives log-volume.
-        # Clamp before exp for numerical safety (scale≫e^10 is already degenerate).
-        if scales is not None:
-            log_vol = scales.view(-1, 3).sum(dim=-1)           # log(s0*s1*s2) per splat
-            loss_scale = torch.exp(log_vol.clamp(max=10.0)).mean()
-        else:
-            loss_scale = pred_rgb.new_zeros(())
-
-        # Opacity penalty: pull each Gaussian toward fully opaque (opacity → 1).
-        # opacities are sigmoid outputs in [0, 1].
-        if opacities is not None:
-            loss_opa = (1.0 - opacities.view(-1)).abs().mean()
-        else:
-            loss_opa = pred_rgb.new_zeros(())
-
-        loss_rgb_weighted = self.lambda_rgb * loss_rgb
         total = (
-            loss_rgb_weighted
+            self.lambda_rgb * loss_rgb
             + self.lambda_ssim * loss_ssim
             + self.lambda_lpips * loss_lpips
             + self.lambda_d * loss_depth
             + self.lambda_alpha * loss_alpha
-            + self.lambda_scale * loss_scale
-            + self.lambda_opa * loss_opa
         )
 
         components = {
@@ -771,18 +771,49 @@ class RGBDLoss(nn.Module):
             'lpips': loss_lpips,
             'depth': loss_depth,
             'alpha_sup': loss_alpha,
-            'scale_reg': loss_scale,
-            'opa_reg': loss_opa,
             'total': total,
             'valid_ratio': valid_ratio.detach(),
         }
         return total, components
 
+    def gaussian_regularizer(
+        self,
+        log_scales: torch.Tensor,
+        opacities: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Volume and opacity penalties applied once per step (not per view).
+
+        Args:
+            log_scales: log physical scales, shape ``(N, 3)`` or ``(B, N, 3)``.
+            opacities: sigmoid opacities in ``[0, 1]``, shape ``(N, 1)`` or ``(B, N, 1)``.
+
+        Returns:
+            Weighted sum and unweighted component dict (``scale_reg``, ``opa_reg``).
+        """
+        if log_scales.dim() == 2:
+            log_scales = log_scales.unsqueeze(0)
+            opacities = opacities.unsqueeze(0)
+
+        scale_losses: List[torch.Tensor] = []
+        opa_losses: List[torch.Tensor] = []
+        for b in range(log_scales.shape[0]):
+            log_vol = log_scales[b].sum(dim=-1)
+            scale_losses.append(torch.exp(log_vol.clamp(max=10.0)).mean())
+            opa_losses.append((1.0 - opacities[b].reshape(-1)).abs().mean())
+
+        loss_scale = torch.stack(scale_losses).mean()
+        loss_opa = torch.stack(opa_losses).mean()
+        weighted = self.lambda_scale * loss_scale + self.lambda_opa * loss_opa
+        return weighted, {
+            'scale_reg': loss_scale,
+            'opa_reg': loss_opa,
+        }
+
     def weighted_terms_for_grad_norm(
         self,
         components: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
-        """Return per-term scalar losses as they enter ``total`` (for grad-norm logging)."""
+        """Return per-term image losses as they enter ``total`` (for grad-norm logging)."""
         rgb_key = self.rgb_loss_type
         terms: Dict[str, torch.Tensor] = {
             rgb_key: self.lambda_rgb * components[rgb_key],
@@ -790,10 +821,18 @@ class RGBDLoss(nn.Module):
             "lpips": self.lambda_lpips * components["lpips"],
             "depth": self.lambda_d * components["depth"],
             "alpha_sup": self.lambda_alpha * components["alpha_sup"],
-            "scale_reg": self.lambda_scale * components["scale_reg"],
-            "opa_reg": self.lambda_opa * components["opa_reg"],
         }
         return terms
+
+    def weighted_3d_terms_for_grad_norm(
+        self,
+        gaussian_components: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """Weighted scale/opacity terms for grad-norm logging."""
+        return {
+            "scale_reg": self.lambda_scale * gaussian_components["scale_reg"],
+            "opa_reg": self.lambda_opa * gaussian_components["opa_reg"],
+        }
 
     def anchor_delta_regularizer(
         self,

@@ -907,15 +907,30 @@ def _compute_loss_grad_norms(
     criterion: RGBDLoss,
     components: Dict[str, torch.Tensor],
     delta_loss: Optional[torch.Tensor] = None,
+    gaussian_components: Optional[Dict[str, torch.Tensor]] = None,
 ) -> Dict[str, float]:
     """Per-term gradient L2 norms (approximate loss balancing diagnostic)."""
     params = list(model.parameters())
     norms: Dict[str, float] = {}
     for name, term in criterion.weighted_terms_for_grad_norm(components).items():
         norms[name] = _grad_norm_for_loss(params, term)
+    if gaussian_components is not None:
+        for name, term in criterion.weighted_3d_terms_for_grad_norm(gaussian_components).items():
+            norms[name] = _grad_norm_for_loss(params, term)
     if delta_loss is not None and criterion.lambda_delta > 0:
         norms["delta_reg"] = _grad_norm_for_loss(params, delta_loss)
     return norms
+
+
+def _global_grad_norm(model: torch.nn.Module) -> float:
+    """L2 norm of all parameter gradients (after backward)."""
+    total_sq = 0.0
+    for p in model.parameters():
+        if p.grad is None:
+            continue
+        g = p.grad.detach().float()
+        total_sq += float(g.norm().pow(2).item())
+    return float(total_sq ** 0.5)
 
 
 def train(args):
@@ -937,7 +952,11 @@ def train(args):
             "Stochastic encoder (--no-deterministic_encoder): random FPS starts and "
             "unseeded surface subsampling."
         )
-    max_grad_norm = 1.0
+    max_grad_norm = float(args.max_grad_norm)
+    if max_grad_norm > 0:
+        logger.info(f"Gradient clipping enabled: max_grad_norm={max_grad_norm:.4f}")
+    else:
+        logger.info("Gradient clipping disabled (--max_grad_norm <= 0)")
 
     # ---- Model ----
     model = ShapeGSAE(
@@ -1185,8 +1204,6 @@ def train(args):
                     pred_depth, gt_depth_b,
                     pred_alpha=pred_alpha,
                     valid_mask=valid_mask,
-                    scales=scales.view(-1, 3).log(),
-                    opacities=opacities.view(-1, 1),
                 )
                 total_loss = total_loss + view_loss
 
@@ -1207,6 +1224,16 @@ def train(args):
                 if grad_components is not None:
                     grad_components = {k: v * inv_n for k, v in grad_components.items()}
 
+            gaussian_components: Optional[Dict[str, torch.Tensor]] = None
+            if args.lambda_scale > 0 or args.lambda_opa > 0:
+                gaussian_loss, gaussian_components = criterion.gaussian_regularizer(
+                    scales.log(),
+                    opacities,
+                )
+                total_loss = total_loss + gaussian_loss
+                for k, v in gaussian_components.items():
+                    _accum_train_log(log_components, k, v)
+
             delta_loss_tensor: Optional[torch.Tensor] = None
             if args.lambda_delta > 0:
                 delta_loss_tensor, delta_comps = criterion.anchor_delta_regularizer(pos_deltas)
@@ -1219,11 +1246,18 @@ def train(args):
             if grad_components is not None:
                 grad_norms = _compute_loss_grad_norms(
                     model, criterion, grad_components, delta_loss_tensor,
+                    gaussian_components=gaussian_components,
                 )
 
             optimizer.zero_grad()
             total_loss.backward()
-            grad_norm_preclip = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+            if max_grad_norm > 0:
+                grad_norm_preclip = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    max_norm=max_grad_norm,
+                )
+            else:
+                grad_norm_preclip = _global_grad_norm(model)
             optimizer.step()
             scheduler.step()
             t_step_end = time.time()
@@ -1429,6 +1463,12 @@ def parse_args():
     # Optimiser
     p.add_argument('--lr', type=float, default=1e-4)
     p.add_argument('--weight_decay', type=float, default=1e-2)
+    p.add_argument(
+        '--max_grad_norm',
+        type=float,
+        default=1.0,
+        help='Global gradient clipping threshold. Set <= 0 to disable clipping.',
+    )
     p.add_argument('--warmup_steps', type=int, default=500,
                    help='Linear LR warmup steps before cosine decay. Set 0 to disable.')
     p.add_argument('--max_steps', type=int, default=200_000)
