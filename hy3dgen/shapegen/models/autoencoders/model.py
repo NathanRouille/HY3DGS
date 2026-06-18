@@ -459,11 +459,17 @@ class ShapeGSAE(nn.Module):
     # Core forward methods
     # ------------------------------------------------------------------
 
-    def encode(self, surface: torch.FloatTensor):
+    def encode(
+        self,
+        surface: torch.FloatTensor,
+        encoder_seeds: Optional[torch.Tensor] = None,
+    ):
         """Encode a colored surface point cloud to compact latents.
 
         Args:
             surface: [B, N, 9]  xyz | normals | rgb
+            encoder_seeds: optional ``(B,)`` int64 seeds for per-object encoder
+                subsampling when ``deterministic_encoder`` is disabled.
 
         Returns:
             latents        : [B, num_latents, embed_dim]
@@ -471,7 +477,7 @@ class ShapeGSAE(nn.Module):
         """
         pc = surface[:, :, :3]
         feats = surface[:, :, 3:]           # normals(3) + rgb(3) = 6 channels
-        latents, pc_infos = self.encoder(pc, feats)
+        latents, pc_infos = self.encoder(pc, feats, encoder_seeds=encoder_seeds)
         query_positions = pc_infos[0]       # concatenated random + sharpedge FPS queries
         latents = self.bottleneck_down(latents)
         return latents, query_positions

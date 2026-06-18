@@ -778,27 +778,27 @@ class RGBDLoss(nn.Module):
 
     def gaussian_regularizer(
         self,
-        log_scales: torch.Tensor,
+        scales: torch.Tensor,
         opacities: torch.Tensor,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Volume and opacity penalties applied once per step (not per view).
 
         Args:
-            log_scales: log physical scales, shape ``(N, 3)`` or ``(B, N, 3)``.
+            scales: physical axis scales (post-``exp``), shape ``(N, 3)`` or ``(B, N, 3)``.
             opacities: sigmoid opacities in ``[0, 1]``, shape ``(N, 1)`` or ``(B, N, 1)``.
 
         Returns:
             Weighted sum and unweighted component dict (``scale_reg``, ``opa_reg``).
         """
-        if log_scales.dim() == 2:
-            log_scales = log_scales.unsqueeze(0)
+        if scales.dim() == 2:
+            scales = scales.unsqueeze(0)
             opacities = opacities.unsqueeze(0)
 
+        max_volume = math.exp(10.0)
         scale_losses: List[torch.Tensor] = []
         opa_losses: List[torch.Tensor] = []
-        for b in range(log_scales.shape[0]):
-            log_vol = log_scales[b].sum(dim=-1)
-            scale_losses.append(torch.exp(log_vol.clamp(max=10.0)).mean())
+        for b in range(scales.shape[0]):
+            scale_losses.append(scales[b].prod(dim=-1).clamp(max=max_volume).mean())
             opa_losses.append((1.0 - opacities[b].reshape(-1)).abs().mean())
 
         loss_scale = torch.stack(scale_losses).mean()

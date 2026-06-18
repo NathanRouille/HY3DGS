@@ -37,7 +37,7 @@ except ImportError:
     wandb = None
 
 from hy3dgen.shapegen.models.autoencoders.model import ShapeGSAE
-from hy3dgen.shapegen.surface_loaders import RGBSharpEdgeSurfaceLoader, normalize_mesh
+from hy3dgen.shapegen.surface_loaders import RGBSharpEdgeSurfaceLoader, normalize_mesh, stable_mesh_seed
 from hy3dgen.shapegen.gt_cache_util import (
     canonical_obj_path,
     experiment_manifest_path,
@@ -200,14 +200,28 @@ def run_validation(
             continue
 
         surface = sample['surface'].unsqueeze(0).to(device)
+        encoder_seed = sample.get('encoder_seed')
+        if encoder_seed is None:
+            mesh_path = sample.get('mesh_path')
+            if mesh_path is not None:
+                seed = val_dataset.seed if val_dataset.seed is not None else 0
+                encoder_seed = stable_mesh_seed(seed, mesh_path)
+        if encoder_seed is not None:
+            encoder_seeds = torch.tensor(
+                [int(encoder_seed)], dtype=torch.long, device=device,
+            )
+            latents, query_positions = model.encode(surface, encoder_seeds=encoder_seeds)
+            means, scales, rotations, opacities, sh_coeffs = model.decode(
+                latents, query_positions,
+            )
+        else:
+            means, scales, rotations, opacities, sh_coeffs = model(surface)
         # Defensive slice: even if val_dataset was built with more views, we always
         # evaluate on the 6 canonical views (indices 0..5 in v46) for fair
         # cross-experiment comparison.
         gt_rgbs = sample['rgbs'][:6]
         gt_depths = sample['depths'][:6]
         c2ws = sample['c2ws'][:6]
-
-        means, scales, rotations, opacities, sh_coeffs = model(surface)
         means = means[0]
         scales = scales[0]
         rotations = rotations[0]
@@ -633,6 +647,7 @@ class MeshDataset(Dataset):
         deterministic_encoder: bool = True,
     ):
         self.require_cached_gt = require_cached_gt
+        self.seed = seed
         self.loader = RGBSharpEdgeSurfaceLoader(
             num_uniform_points=pc_size,
             num_sharp_points=pc_sharpedge_size,
@@ -782,6 +797,7 @@ class MeshDataset(Dataset):
             'depths': [t.clone() for t in sample['depths']],
             'c2ws': [t.clone() for t in sample['c2ws']],
             'mesh_path': sample['mesh_path'],
+            'encoder_seed': sample['encoder_seed'],
         }
         if 'view_params' in sample:
             out['view_params'] = sample['view_params']
@@ -806,6 +822,7 @@ class MeshDataset(Dataset):
                     'depths': depths,
                     'c2ws': c2ws,
                     'mesh_path': path,
+                    'encoder_seed': stable_mesh_seed(self.seed if self.seed is not None else 0, path),
                 }
                 if view_params is not None:
                     out['view_params'] = view_params
@@ -835,12 +852,19 @@ def collate_fn(batch):
         torch.stack([item['depths'][v] for item in batch], dim=0)
         for v in range(num_views)
     ]
-    c2ws = [batch[0]['c2ws'][v] for v in range(num_views)]  # cameras are shared
+    c2ws = [
+        torch.stack([item['c2ws'][v] for item in batch], dim=0)  # (B, 4, 4) per view
+        for v in range(num_views)
+    ]
     out = {
         'surface': surfaces,
         'rgbs': rgbs,
         'depths': depths,
         'c2ws': c2ws,
+        'encoder_seeds': torch.tensor(
+            [item['encoder_seed'] for item in batch],
+            dtype=torch.long,
+        ),
     }
     if batch[0].get('view_params') is not None:
         out['view_params'] = [batch[0]['view_params'][v] for v in range(num_views)]
@@ -1139,12 +1163,13 @@ def train(args):
             will_log = (global_step + 1) % args.log_every == 0
 
             surface = batch['surface'].to(device, non_blocking=True)   # (B, N, 9)
+            encoder_seeds = batch['encoder_seeds'].to(device, non_blocking=True)  # (B,)
             gt_rgbs = batch['rgbs']     # list of (B, H, W, 3)
             gt_depths = batch['depths'] # list of (B, H, W, 1)
-            c2ws = batch['c2ws']        # list of (4,4)
+            c2ws = batch['c2ws']        # list of (B, 4, 4)
 
             # Forward pass (encode+decode so anchor deltas are available for regularisation)
-            latents, query_positions = model.encode(surface)
+            latents, query_positions = model.encode(surface, encoder_seeds=encoder_seeds)
             means, scales, rotations, opacities, sh_coeffs = model.decode(
                 latents, query_positions,
             )
@@ -1174,60 +1199,66 @@ def train(args):
             else:
                 sampled_view_indices = list(range(num_views_total))
 
-            for view_idx in sampled_view_indices:
-                gt_rgb_b = gt_rgbs[view_idx]
-                gt_depth_b = gt_depths[view_idx]
-                c2w = c2ws[view_idx]
-                gt_rgb_b = gt_rgb_b.to(device)       # (B, H, W, 3)
-                gt_depth_b = gt_depth_b.to(device)   # (B, H, W, 1)
-                c2w = c2w.to(device)
+            for b in range(B):
+                obj_view_loss = torch.zeros((), device=device)
+                obj_grad_components: Optional[Dict[str, torch.Tensor]] = (
+                    {} if (will_log and use_wandb and args.log_grad_norms) else None
+                )
 
-                # Render each item in the batch separately (gsplat is per-scene)
-                pred_rgbs_list, pred_depths_list, pred_alphas_list = [], [], []
-                for b in range(B):
+                for view_idx in sampled_view_indices:
+                    gt_rgb_b = gt_rgbs[view_idx][b:b + 1].to(device)       # (1, H, W, 3)
+                    gt_depth_b = gt_depths[view_idx][b:b + 1].to(device)   # (1, H, W, 1)
+                    c2w_b = c2ws[view_idx][b].to(device)
+
                     out = renderer(
                         means[b], scales[b], rotations[b],
-                        opacities[b], sh_coeffs[b], c2w,
+                        opacities[b], sh_coeffs[b], c2w_b,
                     )
-                    pred_rgbs_list.append(out['rgb'])
-                    pred_depths_list.append(out['depth'])
-                    pred_alphas_list.append(out['alpha'])
+                    pred_rgb = out['rgb'].unsqueeze(0)      # (1, H, W, 3)
+                    pred_depth = out['depth'].unsqueeze(0)  # (1, H, W, 1)
+                    pred_alpha = out['alpha'].unsqueeze(0)  # (1, H, W, 1)
+                    valid_mask = gt_depth_b > 0
 
-                pred_rgb = torch.stack(pred_rgbs_list, dim=0)     # (B, H, W, 3)
-                pred_depth = torch.stack(pred_depths_list, dim=0) # (B, H, W, 1)
-                pred_alpha = torch.stack(pred_alphas_list, dim=0) # (B, H, W, 1)
+                    view_loss, comps = criterion(
+                        pred_rgb, gt_rgb_b,
+                        pred_depth, gt_depth_b,
+                        pred_alpha=pred_alpha,
+                        valid_mask=valid_mask,
+                    )
+                    obj_view_loss = obj_view_loss + view_loss
 
-                valid_mask = gt_depth_b > 0
+                    for k, v in comps.items():
+                        _accum_train_log(log_components, k, v)
+                    if obj_grad_components is not None:
+                        for k, v in comps.items():
+                            if k not in ("total", "valid_ratio"):
+                                _accum_train_component(obj_grad_components, k, v)
 
-                view_loss, comps = criterion(
-                    pred_rgb, gt_rgb_b,
-                    pred_depth, gt_depth_b,
-                    pred_alpha=pred_alpha,
-                    valid_mask=valid_mask,
-                )
-                total_loss = total_loss + view_loss
+                inv_views = 1.0 / views_per_step
+                obj_view_loss = obj_view_loss * inv_views
+                total_loss = total_loss + obj_view_loss
 
-                for k, v in comps.items():
-                    _accum_train_log(log_components, k, v)
-                    if grad_components is not None and k not in ("total", "valid_ratio"):
+                if obj_grad_components is not None:
+                    obj_grad_components = {k: v * inv_views for k, v in obj_grad_components.items()}
+                    for k, v in obj_grad_components.items():
                         _accum_train_component(grad_components, k, v)
 
-            # Mean over sampled views: keeps loss magnitude stable when varying
-            # views_per_step while providing an unbiased estimate of the
-            # full-view objective over training.
-            if views_per_step > 0:
-                inv_n = 1.0 / views_per_step
-                total_loss = total_loss * inv_n
-                log_components = {k: v * inv_n for k, v in log_components.items()}
-                log_components["n_views_total"] = torch.tensor(float(num_views_total), device=device)
-                log_components["n_views_sampled"] = torch.tensor(float(views_per_step), device=device)
-                if grad_components is not None:
-                    grad_components = {k: v * inv_n for k, v in grad_components.items()}
+            # Mean over batch objects and sampled views.
+            inv_batch = 1.0 / B
+            inv_views = 1.0 / views_per_step
+            inv_norm = inv_batch * inv_views
+            total_loss = total_loss * inv_batch
+            log_components = {k: v * inv_norm for k, v in log_components.items()}
+            if grad_components is not None:
+                grad_components = {k: v * inv_batch for k, v in grad_components.items()}
+
+            log_components["n_views_total"] = torch.tensor(float(num_views_total), device=device)
+            log_components["n_views_sampled"] = torch.tensor(float(views_per_step), device=device)
 
             gaussian_components: Optional[Dict[str, torch.Tensor]] = None
             if args.lambda_scale > 0 or args.lambda_opa > 0:
                 gaussian_loss, gaussian_components = criterion.gaussian_regularizer(
-                    scales.log(),
+                    scales,
                     opacities,
                 )
                 total_loss = total_loss + gaussian_loss

@@ -91,7 +91,7 @@ from hy3dgen.shapegen.eval_metrics import (
     compute_ssim_full,
 )
 from hy3dgen.shapegen.models.autoencoders.model import ShapeGSAE
-from hy3dgen.shapegen.surface_loaders import normalize_mesh
+from hy3dgen.shapegen.surface_loaders import normalize_mesh, stable_mesh_seed
 from train_gs_ae import (
     GTRGBDRenderer,
     MeshDataset,
@@ -392,6 +392,16 @@ def _mean_metric(lst: List[float]) -> float:
     return float(sum(lst) / len(lst)) if lst else float("nan")
 
 
+def _encoder_seed_for_sample(sample: Dict, train_seed: int) -> int:
+    """Match training-time FPS subsampling (``MeshDataset`` / ``train_gs_ae``)."""
+    if "encoder_seed" in sample:
+        return int(sample["encoder_seed"])
+    mesh_path = sample.get("mesh_path")
+    if not mesh_path:
+        raise ValueError("sample must include encoder_seed or mesh_path")
+    return stable_mesh_seed(train_seed, mesh_path)
+
+
 @torch.no_grad()
 def _evaluate_views_subset(
     means: torch.Tensor,
@@ -499,6 +509,7 @@ def evaluate_sample(
     holdout_view_indices: List[int],
     lpips_net=None,
     drift_threshold: float = 0.1,
+    train_seed: int = 42,
 ) -> Tuple[Dict[str, float], Dict[str, List[Image.Image]], Dict[str, torch.Tensor]]:
     """Evaluate canonical (6) + holdout (16) view sets.
 
@@ -517,7 +528,9 @@ def evaluate_sample(
     )
 
     surface = sample["surface"].unsqueeze(0).to(device)
-    latents, query_positions = model.encode(surface)
+    encoder_seed = _encoder_seed_for_sample(sample, train_seed)
+    encoder_seeds = torch.tensor([encoder_seed], dtype=torch.long, device=device)
+    latents, query_positions = model.encode(surface, encoder_seeds=encoder_seeds)
     means, scales, rotations, opacities, sh_coeffs, features = model.decode(
         latents, query_positions, return_features=True,
     )
@@ -601,9 +614,12 @@ def evaluate_checkpoint(
             getattr(args, "deterministic_encoder", True),
         )
     )
+    train_seed = int(train_args.get("seed", getattr(args, "seed", 42)))
     logger.info(
-        "Model encoder mode: deterministic=%s (from checkpoint args when present)",
+        "Model encoder mode: deterministic=%s, train_seed=%d "
+        "(encoder_seeds aligned with training)",
         det_enc,
+        train_seed,
     )
     renderer = GaussianRenderer(
         height=args.render_height,
@@ -662,6 +678,7 @@ def evaluate_checkpoint(
             holdout_view_indices,
             lpips_net=lpips_net,
             drift_threshold=args.drift_threshold,
+            train_seed=train_seed,
         )
 
         if not getattr(args, "no_export_3d", False):

@@ -300,7 +300,7 @@ def train(args: argparse.Namespace) -> None:
         total_loss = total_loss / num_valid
         if criterion.lambda_scale > 0 or criterion.lambda_opa > 0:
             gaussian_loss, _ = criterion.gaussian_regularizer(
-                scales.log(),
+                scales,
                 opacities,
             )
             total_loss = total_loss + gaussian_loss
