@@ -91,7 +91,7 @@ from hy3dgen.shapegen.eval_metrics import (
     compute_ssim_full,
 )
 from hy3dgen.shapegen.models.autoencoders.model import ShapeGSAE
-from hy3dgen.shapegen.surface_loaders import normalize_mesh, stable_mesh_seed
+from hy3dgen.shapegen.surface_loaders import normalize_mesh
 from train_gs_ae import (
     GTRGBDRenderer,
     MeshDataset,
@@ -392,16 +392,6 @@ def _mean_metric(lst: List[float]) -> float:
     return float(sum(lst) / len(lst)) if lst else float("nan")
 
 
-def _encoder_seed_for_sample(sample: Dict, train_seed: int) -> int:
-    """Match training-time FPS subsampling (``MeshDataset`` / ``train_gs_ae``)."""
-    if "encoder_seed" in sample:
-        return int(sample["encoder_seed"])
-    mesh_path = sample.get("mesh_path")
-    if not mesh_path:
-        raise ValueError("sample must include encoder_seed or mesh_path")
-    return stable_mesh_seed(train_seed, mesh_path)
-
-
 @torch.no_grad()
 def _evaluate_views_subset(
     means: torch.Tensor,
@@ -509,7 +499,6 @@ def evaluate_sample(
     holdout_view_indices: List[int],
     lpips_net=None,
     drift_threshold: float = 0.1,
-    train_seed: int = 42,
 ) -> Tuple[Dict[str, float], Dict[str, List[Image.Image]], Dict[str, torch.Tensor]]:
     """Evaluate canonical (6) + holdout (16) view sets.
 
@@ -528,9 +517,7 @@ def evaluate_sample(
     )
 
     surface = sample["surface"].unsqueeze(0).to(device)
-    encoder_seed = _encoder_seed_for_sample(sample, train_seed)
-    encoder_seeds = torch.tensor([encoder_seed], dtype=torch.long, device=device)
-    latents, query_positions = model.encode(surface, encoder_seeds=encoder_seeds)
+    latents, query_positions = model.encode(surface)
     means, scales, rotations, opacities, sh_coeffs, features = model.decode(
         latents, query_positions, return_features=True,
     )
@@ -616,8 +603,7 @@ def evaluate_checkpoint(
     )
     train_seed = int(train_args.get("seed", getattr(args, "seed", 42)))
     logger.info(
-        "Model encoder mode: deterministic=%s, train_seed=%d "
-        "(encoder_seeds aligned with training)",
+        "Model encoder mode: deterministic=%s (train_seed=%d for input surfaces)",
         det_enc,
         train_seed,
     )
@@ -678,7 +664,6 @@ def evaluate_checkpoint(
             holdout_view_indices,
             lpips_net=lpips_net,
             drift_threshold=args.drift_threshold,
-            train_seed=train_seed,
         )
 
         if not getattr(args, "no_export_3d", False):
@@ -979,18 +964,13 @@ def main():
         logger.info("Category filter: %s", sorted(categories))
 
     surface_seed = args.seed
-    surface_deterministic = args.deterministic_encoder
     if args.checkpoints:
         ckpt0 = torch.load(args.checkpoints[0], map_location="cpu", weights_only=False)
         train_args0 = ckpt0.get("args", {}) if isinstance(ckpt0, dict) else {}
         if train_args0:
             surface_seed = int(train_args0.get("seed", surface_seed))
-            surface_deterministic = bool(
-                train_args0.get("deterministic_encoder", surface_deterministic)
-            )
             logger.info(
-                "Surface loader from checkpoint: deterministic=%s seed=%d",
-                surface_deterministic,
+                "Input surfaces from checkpoint: per-mesh seed derived from global seed=%d",
                 surface_seed,
             )
 
@@ -1010,7 +990,6 @@ def main():
         precache_full_views=True,
         require_cached_gt=args.only_cached_gt,
         seed=surface_seed,
-        deterministic_encoder=surface_deterministic,
     )
     logger.info(f"Dataset: {len(dataset)} meshes in {args.data_dir}")
 

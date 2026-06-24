@@ -410,8 +410,11 @@ class RGBSharpEdgeSurfaceLoader:
             mesh = mesh.dump(concatenate=True)
 
         subsample_seed: Optional[int] = None
-        if self.deterministic and self.seed is not None and mesh_path is not None:
+        if self.seed is not None and mesh_path is not None:
+            # Fixed per-mesh surface subsample (cached in MeshDataset RAM cache).
             subsample_seed = stable_mesh_seed(self.seed, mesh_path)
+        elif self.deterministic and self.seed is not None:
+            subsample_seed = int(self.seed)
 
         surface, _ = load_surface_sharpedge_rgb(
             mesh,

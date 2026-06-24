@@ -585,8 +585,6 @@ class PointCrossAttentionEncoder(nn.Module):
         *,
         deterministic: bool,
         batch_size: int,
-        encoder_seeds: Optional[torch.Tensor] = None,
-        seed_offset: int = 0,
     ) -> List[torch.Tensor]:
         """Per-batch-item point indices into a pool of size ``pool_size``."""
         n_select = min(n_select, pool_size)
@@ -594,16 +592,10 @@ class PointCrossAttentionEncoder(nn.Module):
             idx = torch.arange(n_select, device=device)
             return [idx for _ in range(batch_size)]
 
-        indices: List[torch.Tensor] = []
-        for b in range(batch_size):
-            if encoder_seeds is not None:
-                g = torch.Generator(device=device)
-                g.manual_seed((int(encoder_seeds[b].item()) + seed_offset) & 0x7FFFFFFF)
-                idx = torch.randperm(pool_size, device=device, generator=g)[:n_select]
-            else:
-                idx = torch.randperm(pool_size, device=device)[:n_select]
-            indices.append(idx)
-        return indices
+        return [
+            torch.randperm(pool_size, device=device)[:n_select]
+            for _ in range(batch_size)
+        ]
 
     @staticmethod
     def _gather_batch_rows(
@@ -620,7 +612,6 @@ class PointCrossAttentionEncoder(nn.Module):
         self,
         pc: torch.FloatTensor,
         feats: Optional[torch.FloatTensor] = None,
-        encoder_seeds: Optional[torch.Tensor] = None,
     ):
         B, N, D = pc.shape
         num_pts = self.num_latents * self.downsample_ratio
@@ -651,16 +642,13 @@ class PointCrossAttentionEncoder(nn.Module):
             random_pc.device,
             deterministic=self.deterministic,
             batch_size=B,
-            encoder_seeds=encoder_seeds,
-            seed_offset=0,
         )
         input_random_pc = self._gather_batch_rows(random_pc, idx_random_pc_list)
         flatten_input_random_pc = input_random_pc.reshape(B * input_random_pc_size, D)
         N_down = int(flatten_input_random_pc.shape[0] / B)
         batch_down = torch.arange(B).to(pc.device)
         batch_down = torch.repeat_interleave(batch_down, N_down)
-        # When per-mesh seeds are supplied, keep FPS anchors fixed across steps.
-        fps_random_start = not self.deterministic and encoder_seeds is None
+        fps_random_start = not self.deterministic
         idx_query_random = fps(
             flatten_input_random_pc, batch_down, ratio=random_query_ratio,
             random_start=fps_random_start,
@@ -681,8 +669,6 @@ class PointCrossAttentionEncoder(nn.Module):
                 sharpedge_pc.device,
                 deterministic=self.deterministic,
                 batch_size=B,
-                encoder_seeds=encoder_seeds,
-                seed_offset=1,
             )
             input_sharpedge_pc = self._gather_batch_rows(sharpedge_pc, idx_sharpedge_pc_list)
             flatten_input_sharpedge_surface_points = input_sharpedge_pc.reshape(
@@ -760,22 +746,18 @@ class PointCrossAttentionEncoder(nn.Module):
         self,
         pc,
         feats,
-        encoder_seeds: Optional[torch.Tensor] = None,
     ):
         """
 
         Args:
             pc (torch.FloatTensor): [B, N, 3]
             feats (torch.FloatTensor or None): [B, N, C]
-            encoder_seeds: optional ``(B,)`` int64 seeds for per-object subsampling.
 
         Returns:
 
         """
 
-        query, data, pc_infos = self.sample_points_and_latents(
-            pc, feats, encoder_seeds=encoder_seeds,
-        )
+        query, data, pc_infos = self.sample_points_and_latents(pc, feats)
 
         query = self.input_proj(query)
         query = query

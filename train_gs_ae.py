@@ -37,7 +37,7 @@ except ImportError:
     wandb = None
 
 from hy3dgen.shapegen.models.autoencoders.model import ShapeGSAE
-from hy3dgen.shapegen.surface_loaders import RGBSharpEdgeSurfaceLoader, normalize_mesh, stable_mesh_seed
+from hy3dgen.shapegen.surface_loaders import RGBSharpEdgeSurfaceLoader, normalize_mesh
 from hy3dgen.shapegen.gt_cache_util import (
     canonical_obj_path,
     experiment_manifest_path,
@@ -55,7 +55,6 @@ from hy3dgen.shapegen.gs_renderer import (
     expand_anchor_positions,
 )
 from hy3dgen.shapegen.eval_metrics import (
-    compute_mean_alpha_bg,
     compute_psnr_fg,
     compute_psnr_full,
     compute_ssim_full,
@@ -172,56 +171,61 @@ def debug_gt_cache_path(mesh_path: str, debug_root: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Evaluation metrics: imported from hy3dgen.shapegen.eval_metrics
+# Periodic canonical eval (6 v46 views)
 # ---------------------------------------------------------------------------
+
+CANONICAL_EVAL_NUM_VIEWS = 6
+
+
+def _nan_eval_metrics(prefix: str) -> Dict[str, float]:
+    return {
+        f'{prefix}/psnr': float('nan'),
+        f'{prefix}/psnr_fg': float('nan'),
+        f'{prefix}/ssim': float('nan'),
+        f'{prefix}/lpips': float('nan'),
+        f'{prefix}/l1_depth': float('nan'),
+    }
 
 
 @torch.no_grad()
-def run_validation(
+def run_canonical_eval(
     model: torch.nn.Module,
     renderer: GaussianRenderer,
-    val_dataset,
+    eval_dataset,
     device: torch.device,
-    num_samples: int = 20,
+    num_samples: int,
+    prefix: str,
+    lpips_net=None,
 ) -> Dict[str, float]:
-    """Evaluate model on a subset of val_dataset.
+    """Evaluate on a subset of meshes using the 6 canonical v46 views only.
 
-    Returns foreground/full PSNR, full-image SSIM, and mean background alpha.
+    ``{prefix}/psnr`` is full-image PSNR (``psnr_full``), matching
+    ``evaluate_gs_ae.py`` summary.csv canonical scores.
+    ``{prefix}/psnr_fg`` is foreground-only PSNR for diagnostics.
     """
-    model.eval()
-    psnr_fg_list, psnr_full_list, ssim_full_list, alpha_bg_list = [], [], [], []
+    if num_samples <= 0 or eval_dataset is None or len(eval_dataset) == 0:
+        return _nan_eval_metrics(prefix)
 
-    indices = list(range(len(val_dataset)))[:num_samples]
+    model.eval()
+    psnr_full_list, psnr_fg_list = [], []
+    ssim_list, lpips_list, depth_l1_list = [], [], []
+
+    indices = list(range(min(len(eval_dataset), num_samples)))
     for idx in indices:
         try:
-            sample = val_dataset[idx]
+            sample = eval_dataset[idx]
         except Exception as e:
-            logger.warning(f"Val sample {idx} failed: {e}")
+            logger.warning("%s sample %d failed: %s", prefix, idx, e)
             continue
 
         surface = sample['surface'].unsqueeze(0).to(device)
-        encoder_seed = sample.get('encoder_seed')
-        if encoder_seed is None:
-            mesh_path = sample.get('mesh_path')
-            if mesh_path is not None:
-                seed = val_dataset.seed if val_dataset.seed is not None else 0
-                encoder_seed = stable_mesh_seed(seed, mesh_path)
-        if encoder_seed is not None:
-            encoder_seeds = torch.tensor(
-                [int(encoder_seed)], dtype=torch.long, device=device,
-            )
-            latents, query_positions = model.encode(surface, encoder_seeds=encoder_seeds)
-            means, scales, rotations, opacities, sh_coeffs = model.decode(
-                latents, query_positions,
-            )
-        else:
-            means, scales, rotations, opacities, sh_coeffs = model(surface)
-        # Defensive slice: even if val_dataset was built with more views, we always
-        # evaluate on the 6 canonical views (indices 0..5 in v46) for fair
-        # cross-experiment comparison.
-        gt_rgbs = sample['rgbs'][:6]
-        gt_depths = sample['depths'][:6]
-        c2ws = sample['c2ws'][:6]
+        latents, query_positions = model.encode(surface)
+        means, scales, rotations, opacities, sh_coeffs = model.decode(
+            latents, query_positions,
+        )
+        gt_rgbs = sample['rgbs'][:CANONICAL_EVAL_NUM_VIEWS]
+        gt_depths = sample['depths'][:CANONICAL_EVAL_NUM_VIEWS]
+        c2ws = sample['c2ws'][:CANONICAL_EVAL_NUM_VIEWS]
         means = means[0]
         scales = scales[0]
         rotations = rotations[0]
@@ -229,33 +233,122 @@ def run_validation(
         sh_coeffs = sh_coeffs[0]
 
         for gt_rgb, gt_depth, c2w in zip(gt_rgbs, gt_depths, c2ws):
-            valid_mask = (gt_depth > 0)                       # (H, W, 1)
+            valid_mask = gt_depth > 0
             if float(valid_mask.float().mean().item()) < 0.02:
                 continue
             out = renderer(means, scales, rotations, opacities, sh_coeffs, c2w.to(device))
             pred_rgb = out['rgb'].cpu()
-            pred_alpha = out['alpha'].cpu()
+            pred_depth = out['depth'].cpu()
 
-            psnr_fg_list.append(compute_psnr_fg(pred_rgb, gt_rgb, valid_mask))
             psnr_full_list.append(compute_psnr_full(pred_rgb, gt_rgb))
-            ssim_full_list.append(compute_ssim_full(pred_rgb, gt_rgb))
-            alpha_bg_list.append(compute_mean_alpha_bg(pred_alpha, valid_mask))
+            psnr_fg_list.append(compute_psnr_fg(pred_rgb, gt_rgb, valid_mask))
+            ssim_list.append(compute_ssim_full(pred_rgb, gt_rgb))
+            depth_l1_list.append(float(F.l1_loss(
+                pred_depth[valid_mask].float().reshape(-1),
+                gt_depth[valid_mask].float().reshape(-1),
+            ).item()))
+
+            if lpips_net is not None:
+                pred_nchw = pred_rgb.unsqueeze(0).permute(0, 3, 1, 2).to(device)
+                gt_nchw = gt_rgb.unsqueeze(0).permute(0, 3, 1, 2).to(device)
+                lpips_list.append(float(lpips_net(pred_nchw, gt_nchw).mean().item()))
 
     model.train()
-    if not psnr_fg_list:
-        return {
-            'val/psnr_fg': 0.0,
-            'val/psnr_full': 0.0,
-            'val/ssim_full': 0.0,
-            'val/mean_alpha_bg': 0.0,
-        }
-    n = len(psnr_fg_list)
-    return {
-        'val/psnr_fg': float(sum(psnr_fg_list) / n),
-        'val/psnr_full': float(sum(psnr_full_list) / n),
-        'val/ssim_full': float(sum(ssim_full_list) / n),
-        'val/mean_alpha_bg': float(sum(alpha_bg_list) / n),
+    if not psnr_full_list:
+        return _nan_eval_metrics(prefix)
+
+    n = len(psnr_full_list)
+    metrics = {
+        f'{prefix}/psnr': float(sum(psnr_full_list) / n),
+        f'{prefix}/psnr_fg': float(sum(psnr_fg_list) / n),
+        f'{prefix}/ssim': float(sum(ssim_list) / n),
+        f'{prefix}/l1_depth': float(sum(depth_l1_list) / n),
     }
+    if lpips_list:
+        metrics[f'{prefix}/lpips'] = float(sum(lpips_list) / n)
+    else:
+        metrics[f'{prefix}/lpips'] = float('nan')
+    return metrics
+
+
+class EarlyStopping:
+    """Stop training when a monitored metric stops improving."""
+
+    def __init__(
+        self,
+        metric: str,
+        patience: int,
+        min_delta: float = 0.0,
+        mode: str = 'max',
+    ):
+        self.metric = metric
+        self.patience = max(1, int(patience))
+        self.min_delta = float(min_delta)
+        self.mode = mode
+        self.best: Optional[float] = None
+        self.best_step = 0
+        self.bad_epochs = 0
+
+    def _is_improvement(self, value: float) -> bool:
+        if self.best is None or math.isnan(self.best):
+            return True
+        if self.mode == 'max':
+            return value > self.best + self.min_delta
+        return value < self.best - self.min_delta
+
+    def update(self, metrics: Dict[str, float], step: int) -> bool:
+        """Record metrics; return True if training should stop."""
+        if self.metric not in metrics:
+            logger.warning(
+                "Early stopping metric %s missing from eval metrics; skipping check.",
+                self.metric,
+            )
+            return False
+
+        value = metrics[self.metric]
+        if math.isnan(value):
+            return False
+
+        if self._is_improvement(value):
+            self.best = value
+            self.best_step = step
+            self.bad_epochs = 0
+            return False
+
+        self.bad_epochs += 1
+        return self.bad_epochs >= self.patience
+
+
+def _load_lpips_eval_net(device: torch.device):
+    try:
+        import lpips as lpips_mod
+    except ImportError:
+        logger.warning(
+            "lpips not installed — eval lpips will be NaN. Install with: pip install lpips"
+        )
+        return None
+    net = lpips_mod.LPIPS(net='vgg', verbose=False)
+    net.eval()
+    for p in net.parameters():
+        p.requires_grad = False
+    return net.to(device)
+
+
+def _save_checkpoint(
+    path: Path,
+    global_step: int,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler._LRScheduler,
+    args: argparse.Namespace,
+) -> None:
+    torch.save({
+        'step': global_step,
+        'model': model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'scheduler': scheduler.state_dict(),
+        'args': vars(args),
+    }, path)
 
 
 # ---------------------------------------------------------------------------
@@ -644,7 +737,6 @@ class MeshDataset(Dataset):
         use_experiment_manifest: bool = True,
         train_view_indices: Optional[List[int]] = None,
         seed: Optional[int] = None,
-        deterministic_encoder: bool = True,
     ):
         self.require_cached_gt = require_cached_gt
         self.seed = seed
@@ -652,7 +744,6 @@ class MeshDataset(Dataset):
             num_uniform_points=pc_size,
             num_sharp_points=pc_sharpedge_size,
             seed=seed,
-            deterministic=deterministic_encoder,
         )
 
         if train_view_indices is not None:
@@ -797,7 +888,6 @@ class MeshDataset(Dataset):
             'depths': [t.clone() for t in sample['depths']],
             'c2ws': [t.clone() for t in sample['c2ws']],
             'mesh_path': sample['mesh_path'],
-            'encoder_seed': sample['encoder_seed'],
         }
         if 'view_params' in sample:
             out['view_params'] = sample['view_params']
@@ -822,7 +912,6 @@ class MeshDataset(Dataset):
                     'depths': depths,
                     'c2ws': c2ws,
                     'mesh_path': path,
-                    'encoder_seed': stable_mesh_seed(self.seed if self.seed is not None else 0, path),
                 }
                 if view_params is not None:
                     out['view_params'] = view_params
@@ -861,10 +950,6 @@ def collate_fn(batch):
         'rgbs': rgbs,
         'depths': depths,
         'c2ws': c2ws,
-        'encoder_seeds': torch.tensor(
-            [item['encoder_seed'] for item in batch],
-            dtype=torch.long,
-        ),
     }
     if batch[0].get('view_params') is not None:
         out['view_params'] = [batch[0]['view_params'][v] for v in range(num_views)]
@@ -967,14 +1052,19 @@ def train(args):
     logger.info(f"Training on device: {device}")
     if args.deterministic_encoder:
         logger.info(
-            "Deterministic encoder: sequential point subset + FPS random_start=False; "
-            "surface subsampling seeded per mesh (global seed=%d).",
-            args.seed,
+            "Deterministic encoder: sequential point subset + FPS random_start=False "
+            "(fixed FPS anchors across steps)."
         )
     else:
         logger.info(
-            "Stochastic encoder (--no-deterministic_encoder): random FPS starts and "
-            "unseeded surface subsampling."
+            "Stochastic encoder (--no-deterministic_encoder): fresh point subsample "
+            "and FPS random_start=True each forward pass."
+        )
+    if args.seed is not None:
+        logger.info(
+            "Input surfaces: per-mesh subsample seeded from global seed=%d, "
+            "cached in RAM after first load.",
+            args.seed,
         )
     max_grad_norm = float(args.max_grad_norm)
     if max_grad_norm > 0:
@@ -1046,7 +1136,6 @@ def train(args):
         require_cached_gt=not args.allow_on_the_fly_gt,
         use_experiment_manifest=not args.no_experiment_manifest,
         seed=args.seed,
-        deterministic_encoder=args.deterministic_encoder,
     )
     views_loaded = int(dataset.gt_renderer.num_views)
     views_per_step_cfg = (
@@ -1068,29 +1157,71 @@ def train(args):
         drop_last=True,
     )
 
-    # ---- Optional validation dataset ----
-    # Validation always uses the 6 canonical views (indices 0..5) for cross-experiment
-    # comparability, regardless of how many views training uses.
+    # ---- Optional eval datasets (canonical views only, for fast periodic eval) ----
+    canonical_eval_kwargs = dict(
+        pc_size=args.pc_size,
+        pc_sharpedge_size=args.pc_sharpedge_size,
+        render_height=args.render_height,
+        render_width=args.render_width,
+        num_views=CANONICAL_EVAL_NUM_VIEWS,
+        camera_distance=args.camera_distance,
+        elevation_deg=args.elevation_deg,
+        categories=categories,
+        precache_full_views=False,
+        require_cached_gt=not args.allow_on_the_fly_gt,
+        use_experiment_manifest=not args.no_experiment_manifest,
+        train_view_indices=list(range(CANONICAL_EVAL_NUM_VIEWS)),
+        seed=args.seed,
+    )
+
+    train_eval_dataset = None
+    if args.num_train_eval_samples > 0:
+        train_eval_dataset = MeshDataset(
+            data_dir=args.data_dir,
+            **canonical_eval_kwargs,
+        )
+        logger.info(
+            "Train eval: up to %d meshes from %s (6 canonical views)",
+            args.num_train_eval_samples,
+            args.data_dir,
+        )
+
     val_dataset = None
     if args.val_dir:
         val_dataset = MeshDataset(
             data_dir=args.val_dir,
-            pc_size=args.pc_size,
-            pc_sharpedge_size=args.pc_sharpedge_size,
-            render_height=args.render_height,
-            render_width=args.render_width,
-            num_views=6,
-            camera_distance=args.camera_distance,
-            elevation_deg=args.elevation_deg,
-            categories=categories,
-            precache_full_views=False,
-            require_cached_gt=not args.allow_on_the_fly_gt,
-            use_experiment_manifest=not args.no_experiment_manifest,
-            train_view_indices=list(range(6)),
-            seed=args.seed,
-            deterministic_encoder=args.deterministic_encoder,
+            **canonical_eval_kwargs,
         )
-        logger.info(f"Val set: {len(val_dataset)} meshes in {args.val_dir}")
+        logger.info(
+            "Val eval: up to %d meshes from %s (6 canonical views)",
+            args.num_val_samples,
+            args.val_dir,
+        )
+
+    run_periodic_eval = (
+        args.num_train_eval_samples > 0 or (val_dataset is not None and args.num_val_samples > 0)
+    )
+    lpips_eval_net = _load_lpips_eval_net(device) if run_periodic_eval else None
+
+    early_stopper: Optional[EarlyStopping] = None
+    if args.early_stopping:
+        if val_dataset is None or args.num_val_samples <= 0:
+            raise ValueError(
+                "--early_stopping requires --val_dir and --num_val_samples > 0"
+            )
+        early_stopper = EarlyStopping(
+            metric=args.early_stopping_metric,
+            patience=args.early_stopping_patience,
+            min_delta=args.early_stopping_min_delta,
+            mode=args.early_stopping_mode,
+        )
+        logger.info(
+            "Early stopping enabled: metric=%s patience=%d min_delta=%g mode=%s",
+            args.early_stopping_metric,
+            args.early_stopping_patience,
+            args.early_stopping_min_delta,
+            args.early_stopping_mode,
+        )
 
     # ---- Optimiser & LR schedule ----
     optimizer = torch.optim.AdamW(
@@ -1151,8 +1282,9 @@ def train(args):
     epoch = 0
     t0 = time.time()
     t_data_start = time.time()
+    training_done = False
 
-    while global_step < total_steps:
+    while global_step < total_steps and not training_done:
         epoch += 1
         for batch in loader:
             if global_step >= total_steps:
@@ -1163,13 +1295,12 @@ def train(args):
             will_log = (global_step + 1) % args.log_every == 0
 
             surface = batch['surface'].to(device, non_blocking=True)   # (B, N, 9)
-            encoder_seeds = batch['encoder_seeds'].to(device, non_blocking=True)  # (B,)
             gt_rgbs = batch['rgbs']     # list of (B, H, W, 3)
             gt_depths = batch['depths'] # list of (B, H, W, 1)
             c2ws = batch['c2ws']        # list of (B, 4, 4)
 
             # Forward pass (encode+decode so anchor deltas are available for regularisation)
-            latents, query_positions = model.encode(surface, encoder_seeds=encoder_seeds)
+            latents, query_positions = model.encode(surface)
             means, scales, rotations, opacities, sh_coeffs = model.decode(
                 latents, query_positions,
             )
@@ -1331,29 +1462,72 @@ def train(args):
                     wandb_log["train/total_loss"] = float(total_loss.detach().item())
                     wandb.log(wandb_log, step=global_step)
 
-            # Validation
-            if val_dataset is not None and (
+            # Periodic canonical eval (train + val subsets)
+            if run_periodic_eval and (
                 global_step % args.val_every == 0 or global_step == total_steps
             ):
-                val_metrics = run_validation(
-                    model, renderer, val_dataset, device,
-                    num_samples=args.num_val_samples,
-                )
-                val_str = ' | '.join(f"{k}={v:.4f}" for k, v in val_metrics.items())
-                logger.info(f"step={global_step:06d} | VALIDATION | {val_str}")
-                if use_wandb:
-                    wandb.log(val_metrics, step=global_step)
+                eval_metrics: Dict[str, float] = {}
+                val_metrics: Dict[str, float] = {}
+                if train_eval_dataset is not None and args.num_train_eval_samples > 0:
+                    eval_metrics.update(run_canonical_eval(
+                        model, renderer, train_eval_dataset, device,
+                        num_samples=args.num_train_eval_samples,
+                        prefix='train',
+                        lpips_net=lpips_eval_net,
+                    ))
+                if val_dataset is not None and args.num_val_samples > 0:
+                    val_metrics = run_canonical_eval(
+                        model, renderer, val_dataset, device,
+                        num_samples=args.num_val_samples,
+                        prefix='val',
+                        lpips_net=lpips_eval_net,
+                    )
+                    eval_metrics.update(val_metrics)
+
+                if eval_metrics:
+                    eval_str = ' | '.join(
+                        f"{k}={v:.4f}" for k, v in sorted(eval_metrics.items())
+                        if not math.isnan(v)
+                    )
+                    logger.info(f"step={global_step:06d} | EVAL | {eval_str}")
+                    if use_wandb:
+                        wandb.log(eval_metrics, step=global_step)
+
+                if early_stopper is not None and val_metrics:
+                    should_stop = early_stopper.update(val_metrics, global_step)
+                    if (
+                        args.early_stopping_save_best
+                        and early_stopper.bad_epochs == 0
+                        and early_stopper.best is not None
+                    ):
+                        best_path = output_dir / 'ckpt_best.pt'
+                        _save_checkpoint(
+                            best_path, global_step, model, optimizer, scheduler, args,
+                        )
+                        logger.info(
+                            "New best %s=%.4f at step %d → %s",
+                            early_stopper.metric,
+                            early_stopper.best,
+                            global_step,
+                            best_path,
+                        )
+                    if should_stop:
+                        logger.info(
+                            "Early stopping at step %d: %s did not improve for %d eval(s) "
+                            "(best=%.4f at step %d)",
+                            global_step,
+                            early_stopper.metric,
+                            early_stopper.patience,
+                            early_stopper.best,
+                            early_stopper.best_step,
+                        )
+                        training_done = True
+                        break
 
             # Checkpoint
             if global_step % args.save_every == 0 or global_step == total_steps:
                 ckpt_path = output_dir / f"ckpt_{global_step:06d}.pt"
-                torch.save({
-                    'step': global_step,
-                    'model': model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'scheduler': scheduler.state_dict(),
-                    'args': vars(args),
-                }, ckpt_path)
+                _save_checkpoint(ckpt_path, global_step, model, optimizer, scheduler, args)
                 logger.info(f"Saved checkpoint → {ckpt_path}")
 
             t_data_start = time.time()
@@ -1448,10 +1622,10 @@ def parse_args():
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            'Sequential point subset + FPS random_start=False so the encoder is a '
-            'pure function of the parameters (required for clean overfit loss '
-            'curves). Use --no-deterministic_encoder for the original stochastic '
-            'augmentation behaviour during generalisation training.'
+            'Sequential point subset + FPS random_start=False so FPS anchors are '
+            'fixed across training steps (pure function of parameters). '
+            'Use --no-deterministic_encoder for fresh subsampling and FPS anchors '
+            'every forward pass.'
         ),
     )
 
@@ -1517,9 +1691,30 @@ def parse_args():
     )
     p.add_argument('--save_every', type=int, default=5_000)
     p.add_argument('--val_every', type=int, default=2000,
-                   help='Run validation every N steps (requires --val_dir).')
+                   help='Run canonical eval every N steps (train and/or val subsets).')
     p.add_argument('--num_val_samples', type=int, default=20,
-                   help='Max number of val meshes to evaluate per validation pass.')
+                   help='Max val meshes per eval pass (6 canonical views each).')
+    p.add_argument('--num_train_eval_samples', type=int, default=0,
+                   help='Max train meshes per eval pass (6 canonical views each). '
+                        '0 disables train-subset eval.')
+    p.add_argument('--early_stopping', action='store_true',
+                   help='Stop when --early_stopping_metric stops improving on the val subset.')
+    p.add_argument('--early_stopping_patience', type=int, default=10,
+                   help='Number of eval checks without improvement before stopping.')
+    p.add_argument('--early_stopping_metric', type=str, default='val/psnr',
+                   help='Metric key from periodic eval to monitor (e.g. val/psnr '
+                        'for full-image PSNR, val/psnr_fg, val/lpips).')
+    p.add_argument('--early_stopping_min_delta', type=float, default=0.0,
+                   help='Minimum change in the metric to qualify as an improvement.')
+    p.add_argument('--early_stopping_mode', type=str, default='max',
+                   choices=('max', 'min'),
+                   help='max for PSNR/SSIM; min for LPIPS/depth loss.')
+    p.add_argument(
+        '--early_stopping_save_best',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Save ckpt_best.pt whenever the monitored metric improves.',
+    )
     p.add_argument('--resume_ckpt', type=str, default=None)
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--use_wandb', action='store_true',
