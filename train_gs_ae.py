@@ -37,6 +37,7 @@ except ImportError:
     wandb = None
 
 from hy3dgen.shapegen.models.autoencoders.model import ShapeGSAE
+from hy3dgen.shapegen.pretrained_profiles import apply_pretrained_profile, resolve_include_sharp_label
 from hy3dgen.shapegen.surface_loaders import RGBSharpEdgeSurfaceLoader, normalize_mesh
 from hy3dgen.shapegen.gt_cache_util import (
     canonical_obj_path,
@@ -711,7 +712,7 @@ class MeshDataset(Dataset):
     together with pre-rendered GT RGBD views.
 
     Each item is a dict with:
-        surface  : (pc_size+pc_sharpedge_size, 9) float32 tensor
+        surface  : (pc_size+pc_sharpedge_size, 9 or 10) float32 tensor
         rgbs     : list of (H, W, 3) float32 tensors
         depths   : list of (H, W, 1) float32 tensors
         c2ws     : list of (4, 4) float32 tensors
@@ -737,6 +738,7 @@ class MeshDataset(Dataset):
         use_experiment_manifest: bool = True,
         train_view_indices: Optional[List[int]] = None,
         seed: Optional[int] = None,
+        include_sharp_label: bool = False,
     ):
         self.require_cached_gt = require_cached_gt
         self.seed = seed
@@ -744,6 +746,7 @@ class MeshDataset(Dataset):
             num_uniform_points=pc_size,
             num_sharp_points=pc_sharpedge_size,
             seed=seed,
+            include_sharp_label=include_sharp_label,
         )
 
         if train_view_indices is not None:
@@ -1043,6 +1046,10 @@ def _global_grad_norm(model: torch.nn.Module) -> float:
 
 
 def train(args):
+    apply_pretrained_profile(args)
+    include_sharp_label = resolve_include_sharp_label(args)
+    point_feats = int(getattr(args, "point_feats", 6))
+
     # ---- Resolve category filter ----
     categories = resolve_category_ids(args.categories)
     if categories is not None:
@@ -1082,17 +1089,57 @@ def train(args):
         num_encoder_layers=args.num_encoder_layers,
         pc_size=args.pc_size,
         pc_sharpedge_size=args.pc_sharpedge_size,
-        point_feats=6,              # normals(3) + rgb(3)
+        point_feats=point_feats,
         downsample_ratio=args.downsample_ratio,
         num_gs_per_anchor=args.num_gs_per_anchor,
         deterministic_encoder=args.deterministic_encoder,
         sh_degree=args.sh_degree,
         max_anchor_delta=args.max_anchor_delta,
+        qk_norm=getattr(args, "qk_norm", False),
     ).to(device)
 
-    if args.shapevae_ckpt:
+    pretrained_load = getattr(args, "pretrained_load", "none") or "none"
+    if pretrained_load != "none" and not args.resume_ckpt:
+        repo = args.pretrained_repo
+        if not repo:
+            raise ValueError("--pretrained_load requires --pretrained_repo or --pretrained_profile")
+        load_bottleneck = pretrained_load in (
+            "encoder_bottleneck",
+            "encoder_bottleneck_transformer",
+        )
+        load_transformer = pretrained_load == "encoder_bottleneck_transformer"
+        logger.info(
+            "Loading pretrained ShapeVAE weights from %s (load=%s, rgb_feat_init=%s)",
+            repo,
+            pretrained_load,
+            args.rgb_feat_init,
+        )
+        model.load_shapevae_pretrained(
+            repo,
+            load_encoder=True,
+            load_bottleneck=load_bottleneck,
+            load_transformer=load_transformer,
+            rgb_feat_init=args.rgb_feat_init,
+            subfolder=args.pretrained_subfolder or "hunyuan3d-vae-v2-mini-withencoder",
+            shapevae_point_feats=int(getattr(args, "shapevae_point_feats", 4)),
+            use_safetensors=bool(getattr(args, "use_safetensors", False)),
+        )
+    elif args.shapevae_ckpt:
         logger.info(f"Warm-starting encoder from {args.shapevae_ckpt}")
         model.load_shapevae_encoder(args.shapevae_ckpt)
+
+    if args.freeze_encoder or args.freeze_bottleneck or args.freeze_transformer:
+        model.freeze_modules(
+            encoder=args.freeze_encoder,
+            bottleneck=args.freeze_bottleneck,
+            transformer=args.freeze_transformer,
+        )
+        logger.info(
+            "Frozen modules: encoder=%s bottleneck=%s transformer=%s",
+            args.freeze_encoder,
+            args.freeze_bottleneck,
+            args.freeze_transformer,
+        )
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"ShapeGSAE: {total_params / 1e6:.1f}M trainable parameters")
@@ -1136,6 +1183,7 @@ def train(args):
         require_cached_gt=not args.allow_on_the_fly_gt,
         use_experiment_manifest=not args.no_experiment_manifest,
         seed=args.seed,
+        include_sharp_label=include_sharp_label,
     )
     views_loaded = int(dataset.gt_renderer.num_views)
     views_per_step_cfg = (
@@ -1172,6 +1220,7 @@ def train(args):
         use_experiment_manifest=not args.no_experiment_manifest,
         train_view_indices=list(range(CANONICAL_EVAL_NUM_VIEWS)),
         seed=args.seed,
+        include_sharp_label=include_sharp_label,
     )
 
     train_eval_dataset = None
@@ -1224,8 +1273,31 @@ def train(args):
         )
 
     # ---- Optimiser & LR schedule ----
+    use_param_groups = (
+        args.encoder_lr_scale != 1.0 or args.transformer_lr_scale != 1.0
+    )
+    if use_param_groups:
+        param_groups = model.build_optimizer_param_groups(
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            encoder_lr_scale=args.encoder_lr_scale,
+            transformer_lr_scale=args.transformer_lr_scale,
+        )
+        logger.info(
+            "Optimizer param groups: encoder_lr_scale=%.4f transformer_lr_scale=%.4f",
+            args.encoder_lr_scale,
+            args.transformer_lr_scale,
+        )
+    else:
+        param_groups = [
+            {
+                "params": [p for p in model.parameters() if p.requires_grad],
+                "lr": args.lr,
+                "weight_decay": args.weight_decay,
+            }
+        ]
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        param_groups,
         lr=args.lr,
         weight_decay=args.weight_decay,
         betas=(0.9, 0.999),
@@ -1256,8 +1328,17 @@ def train(args):
     if args.resume_ckpt:
         ckpt = torch.load(args.resume_ckpt, map_location=device)
         model.load_state_dict(ckpt['model'])
-        optimizer.load_state_dict(ckpt['optimizer'])
-        scheduler.load_state_dict(ckpt['scheduler'])
+        try:
+            optimizer.load_state_dict(ckpt['optimizer'])
+        except (ValueError, KeyError) as exc:
+            logger.warning(
+                "Could not restore optimizer state (%s); using freshly built param groups",
+                exc,
+            )
+        try:
+            scheduler.load_state_dict(ckpt['scheduler'])
+        except (ValueError, KeyError) as exc:
+            logger.warning("Could not restore scheduler state (%s); using fresh schedule", exc)
         global_step = ckpt['step']
         logger.info(f"Resumed from step {global_step}")
 
@@ -1582,7 +1663,50 @@ def parse_args():
         help='SH degree for view-dependent color (0=flat RGB, 1=SH1).',
     )
     p.add_argument('--shapevae_ckpt', type=str, default=None,
-                   help='Optional ShapeVAE .ckpt for warm-starting the encoder')
+                   help='Optional ShapeVAE .ckpt for warm-starting the encoder (scratch path)')
+    p.add_argument(
+        '--pretrained_profile',
+        type=str,
+        default='none',
+        choices=('none', 'hunyuan_mini'),
+        help='Apply Hunyuan-mini architecture + 10ch surface layout (scratch default: none).',
+    )
+    p.add_argument(
+        '--include_sharp_label',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help='Append sharp-edge label channel before RGB (auto on for hunyuan_mini).',
+    )
+    p.add_argument(
+        '--pretrained_load',
+        type=str,
+        default='none',
+        choices=('none', 'encoder', 'encoder_bottleneck', 'encoder_bottleneck_transformer'),
+        help='Load Hunyuan ShapeVAE weights into ShapeGSAE before training.',
+    )
+    p.add_argument('--pretrained_repo', type=str, default=None,
+                   help='HF repo or local checkpoint for --pretrained_load')
+    p.add_argument('--pretrained_subfolder', type=str, default=None,
+                   help='HF subfolder for --pretrained_load')
+    p.add_argument(
+        '--rgb_feat_init',
+        type=str,
+        default='kaiming',
+        choices=('kaiming', 'zero', 'label_scale'),
+        help='Init strategy for RGB input_proj columns when loading pretrained encoder.',
+    )
+    p.add_argument('--freeze_encoder', action='store_true',
+                   help='Freeze encoder after pretrained load (Phase 1).')
+    p.add_argument('--freeze_bottleneck', action='store_true',
+                   help='Freeze bottleneck after pretrained load (Phase 1).')
+    p.add_argument('--freeze_transformer', action='store_true',
+                   help='Freeze transformer after pretrained load (Phase 1).')
+    p.add_argument('--encoder_lr_scale', type=float, default=1.0,
+                   help='LR multiplier for encoder+bottleneck (Phase 2 finetune).')
+    p.add_argument('--transformer_lr_scale', type=float, default=1.0,
+                   help='LR multiplier for transformer (Phase 2 finetune).')
+    p.add_argument('--qk_norm', action=argparse.BooleanOptionalAction, default=False,
+                   help='QK norm in encoder/transformer (auto-set by hunyuan_mini profile).')
 
     # Rendering
     p.add_argument('--render_height', type=int, default=512)

@@ -91,6 +91,7 @@ from hy3dgen.shapegen.eval_metrics import (
     compute_ssim_full,
 )
 from hy3dgen.shapegen.models.autoencoders.model import ShapeGSAE
+from hy3dgen.shapegen.pretrained_profiles import resolve_include_sharp_label
 from hy3dgen.shapegen.surface_loaders import normalize_mesh
 from train_gs_ae import (
     GTRGBDRenderer,
@@ -101,6 +102,35 @@ from train_gs_ae import (
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
+
+CHECKPOINT_ARCH_KEYS = (
+    "num_latents",
+    "embed_dim",
+    "width",
+    "heads",
+    "num_encoder_layers",
+    "num_decoder_layers",
+    "pc_size",
+    "pc_sharpedge_size",
+    "downsample_ratio",
+    "num_gs_per_anchor",
+    "point_feats",
+    "qk_norm",
+    "pretrained_profile",
+    "include_sharp_label",
+)
+
+
+def merge_checkpoint_train_args(
+    eval_args: argparse.Namespace,
+    train_args: dict,
+) -> None:
+    """Restore architecture and surface layout from a training checkpoint."""
+    if not train_args:
+        return
+    for key in CHECKPOINT_ARCH_KEYS:
+        if key in train_args and train_args[key] is not None:
+            setattr(eval_args, key, train_args[key])
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +392,8 @@ def load_model(
         "max_anchor_delta",
         getattr(args, "max_anchor_delta", None),
     )
+    point_feats = int(train_args.get("point_feats", getattr(args, "point_feats", 6)))
+    qk_norm = bool(train_args.get("qk_norm", getattr(args, "qk_norm", False)))
     model = ShapeGSAE(
         num_latents=args.num_latents,
         embed_dim=args.embed_dim,
@@ -371,12 +403,13 @@ def load_model(
         num_encoder_layers=args.num_encoder_layers,
         pc_size=args.pc_size,
         pc_sharpedge_size=args.pc_sharpedge_size,
-        point_feats=6,
+        point_feats=point_feats,
         downsample_ratio=args.downsample_ratio,
         num_gs_per_anchor=args.num_gs_per_anchor,
         deterministic_encoder=deterministic_encoder,
         sh_degree=sh_degree,
         max_anchor_delta=max_anchor_delta,
+        qk_norm=qk_norm,
     ).to(device)
     state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     model.load_state_dict(state, strict=True)
@@ -892,6 +925,30 @@ def parse_args():
         help="Override checkpoint max_anchor_delta (AnchorSplat uses 10/128 ≈ 0.078).",
     )
     p.add_argument(
+        "--qk_norm",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="QK norm (overridden by checkpoint args when present).",
+    )
+    p.add_argument(
+        "--point_feats",
+        type=int,
+        default=6,
+        help="Encoder feature channels (overridden by checkpoint args when present).",
+    )
+    p.add_argument(
+        "--pretrained_profile",
+        type=str,
+        default="none",
+        help="Pretrained profile stored in checkpoint (overridden when present).",
+    )
+    p.add_argument(
+        "--include_sharp_label",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="10ch surface layout (overridden by checkpoint args when present).",
+    )
+    p.add_argument(
         "--drift_threshold",
         type=float,
         default=0.1,
@@ -964,11 +1021,21 @@ def main():
         logger.info("Category filter: %s", sorted(categories))
 
     surface_seed = args.seed
+    include_sharp_label = resolve_include_sharp_label(args)
     if args.checkpoints:
         ckpt0 = torch.load(args.checkpoints[0], map_location="cpu", weights_only=False)
         train_args0 = ckpt0.get("args", {}) if isinstance(ckpt0, dict) else {}
         if train_args0:
+            merge_checkpoint_train_args(args, train_args0)
+            include_sharp_label = resolve_include_sharp_label(args)
             surface_seed = int(train_args0.get("seed", surface_seed))
+            logger.info(
+                "Restored arch from checkpoint: point_feats=%s include_sharp_label=%s "
+                "pretrained_profile=%s",
+                getattr(args, "point_feats", 6),
+                include_sharp_label,
+                getattr(args, "pretrained_profile", "none"),
+            )
             logger.info(
                 "Input surfaces from checkpoint: per-mesh seed derived from global seed=%d",
                 surface_seed,
@@ -990,6 +1057,7 @@ def main():
         precache_full_views=True,
         require_cached_gt=args.only_cached_gt,
         seed=surface_seed,
+        include_sharp_label=include_sharp_label,
     )
     logger.info(f"Dataset: {len(dataset)} meshes in {args.data_dir}")
 

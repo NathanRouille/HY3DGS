@@ -24,7 +24,7 @@ loader = SharpEdgeSurfaceLoader(
     num_sharp_points=5120,
     num_uniform_points=5120,
 )
-surface = loader('demo.glb').to('cuda', dtype=torch.float16)
+surface = loader('/export/home/nathan/.objaverse/hf-objaverse-v1/glbs/000-100/04fdbe74a47042538f26f467e0d112a2.glb').to('cuda', dtype=torch.float16)
 
 latents = vae.encode(surface)
 latents = vae.decode(latents)

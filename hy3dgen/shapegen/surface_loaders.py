@@ -291,15 +291,29 @@ def sharp_sample_pointcloud_with_color(
     return samples, normals, colors
 
 
+def _append_sharp_label_block(xyz_nrm_rgb: np.ndarray, label_value: float) -> np.ndarray:
+    """Insert sharp_label after normals: xyz | normals | label | rgb."""
+    xyz = xyz_nrm_rgb[:, :3]
+    nrm = xyz_nrm_rgb[:, 3:6]
+    rgb = xyz_nrm_rgb[:, 6:9]
+    label = np.full((xyz_nrm_rgb.shape[0], 1), label_value, dtype=xyz_nrm_rgb.dtype)
+    return np.concatenate([xyz, nrm, label, rgb], axis=1).astype(np.float16)
+
+
 def load_surface_sharpedge_rgb(
     mesh,
     num_points=4096,
     num_sharp_points=4096,
     seed: Optional[int] = None,
+    include_sharp_label: bool = False,
 ):
-    """Build an RGB surface tensor of shape (1, num_points+num_sharp_points, 9).
+    """Build a colored surface tensor for ShapeGSAE.
 
-    Channel layout: xyz(0:3) | normals(3:6) | rgb(6:9).
+    Default layout (9 channels): xyz(0:3) | normals(3:6) | rgb(6:9).
+
+    With ``include_sharp_label=True`` (10 channels, Hunyuan-pretrained path):
+    xyz(0:3) | normals(3:6) | sharp_label(6) | rgb(7:10).
+    Uniform block rows use label 0; sharp-edge block rows use label 1.
 
     When ``seed`` is set, all subsampling (including trimesh face sampling) is
     reproducible for a given mesh geometry.
@@ -365,6 +379,10 @@ def load_surface_sharpedge_rgb(
 
         sharp_surface = np.concatenate([sharp_pts, sharp_nrm, sharp_clr], axis=1).astype(np.float16)
 
+        if include_sharp_label:
+            surface = _append_sharp_label_block(surface, 0.0)
+            sharp_surface = _append_sharp_label_block(sharp_surface, 1.0)
+
         ind = rng.choice(surface.shape[0], num_points, replace=False)
         surface = torch.FloatTensor(surface[ind])
         ind = rng.choice(sharp_surface.shape[0], num_sharp_points, replace=False)
@@ -376,8 +394,11 @@ def load_surface_sharpedge_rgb(
 class RGBSharpEdgeSurfaceLoader:
     """Load a textured mesh and return a colored surface tensor.
 
-    Surface layout: (1, num_uniform_points + num_sharp_points, 9)
+    Surface layout (default): (1, num_uniform_points + num_sharp_points, 9)
         channels: xyz(0:3) | normals(3:6) | rgb(6:9)
+
+    With ``include_sharp_label=True``: 10 channels
+        xyz(0:3) | normals(3:6) | sharp_label(6) | rgb(7:10)
     """
 
     def __init__(
@@ -387,6 +408,7 @@ class RGBSharpEdgeSurfaceLoader:
         *,
         seed: Optional[int] = None,
         deterministic: bool = False,
+        include_sharp_label: bool = False,
         **kwargs,
     ):
         self.num_uniform_points = num_uniform_points
@@ -394,6 +416,7 @@ class RGBSharpEdgeSurfaceLoader:
         self.num_points = num_uniform_points + num_sharp_points
         self.seed = seed
         self.deterministic = deterministic
+        self.include_sharp_label = include_sharp_label
 
     def __call__(self, mesh_or_mesh_path, num_uniform_points=None, num_sharp_points=None):
         if num_uniform_points is None:
@@ -421,5 +444,6 @@ class RGBSharpEdgeSurfaceLoader:
             num_points=num_uniform_points,
             num_sharp_points=num_sharp_points,
             seed=subsample_seed,
+            include_sharp_label=self.include_sharp_label,
         )
         return surface

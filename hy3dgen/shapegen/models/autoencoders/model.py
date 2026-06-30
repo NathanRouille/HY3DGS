@@ -13,6 +13,7 @@
 # by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
 
 
+import math
 import os
 from typing import Union, List, Optional
 
@@ -27,6 +28,31 @@ from .surface_extractors import MCSurfaceExtractor, SurfaceExtractors
 from .volume_decoders import VanillaVolumeDecoder, FlashVDMVolumeDecoding, HierarchicalVolumeDecoding
 from ...gs_renderer import pack_sh_coeffs
 from ...utils import logger, synchronize_timer, smart_load_model
+
+
+def _resolve_and_load_checkpoint(ckpt_path: str, use_safetensors: bool):
+    """Load a checkpoint file, falling back to ``.ckpt`` when safetensors is absent."""
+    if use_safetensors:
+        st_path = ckpt_path.replace(".ckpt", ".safetensors")
+        if os.path.exists(st_path):
+            ckpt_path = st_path
+        elif ckpt_path.endswith(".safetensors") and not os.path.exists(ckpt_path):
+            ckpt_alt = ckpt_path.replace(".safetensors", ".ckpt")
+            if os.path.exists(ckpt_alt):
+                logger.info("Safetensors missing, falling back to %s", ckpt_alt)
+                ckpt_path = ckpt_alt
+                use_safetensors = False
+
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"Model file {ckpt_path} not found")
+
+    logger.info(f"Loading model from {ckpt_path}")
+    if use_safetensors:
+        import safetensors.torch
+        ckpt = safetensors.torch.load_file(ckpt_path, device="cpu")
+    else:
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    return ckpt
 
 
 class DiagonalGaussianDistribution(object):
@@ -97,15 +123,7 @@ class VectsetVAE(nn.Module):
         # load ckpt
         if use_safetensors:
             ckpt_path = ckpt_path.replace('.ckpt', '.safetensors')
-        if not os.path.exists(ckpt_path):
-            raise FileNotFoundError(f"Model file {ckpt_path} not found")
-
-        logger.info(f"Loading model from {ckpt_path}")
-        if use_safetensors:
-            import safetensors.torch
-            ckpt = safetensors.torch.load_file(ckpt_path, device='cpu')
-        else:
-            ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)
+        ckpt = _resolve_and_load_checkpoint(ckpt_path, use_safetensors)
 
         model_kwargs = config['params']
         model_kwargs.update(kwargs)
@@ -331,15 +349,7 @@ class ShapeGSAE(nn.Module):
 
         if use_safetensors:
             ckpt_path = ckpt_path.replace('.ckpt', '.safetensors')
-        if not os.path.exists(ckpt_path):
-            raise FileNotFoundError(f"Model file {ckpt_path} not found")
-
-        logger.info(f"Loading ShapeGSAE from {ckpt_path}")
-        if use_safetensors:
-            import safetensors.torch
-            ckpt = safetensors.torch.load_file(ckpt_path, device='cpu')
-        else:
-            ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)
+        ckpt = _resolve_and_load_checkpoint(ckpt_path, use_safetensors)
 
         model_kwargs = config.get('params', config)
         model_kwargs.update(kwargs)
@@ -378,6 +388,7 @@ class ShapeGSAE(nn.Module):
 
         self.num_latents = num_latents
         self.embed_dim = embed_dim
+        self.point_feats = point_feats
         self.scale_factor = scale_factor  # kept for config/checkpoint compat; not used in forward
         self.latent_shape = (num_latents, embed_dim)
         self.num_gs_per_anchor = num_gs_per_anchor
@@ -594,3 +605,202 @@ class ShapeGSAE(nn.Module):
         logger.info(
             f"Loaded ShapeVAE encoder — {len(missing)} missing, {len(unexpected)} unexpected"
         )
+
+    @staticmethod
+    def _map_input_proj_vae_to_gsae(
+        old_w: torch.Tensor,
+        new_w: torch.Tensor,
+        *,
+        old_point_feats: int,
+        new_point_feats: int,
+        rgb_feat_init: str,
+    ) -> torch.Tensor:
+        """Copy Hunyuan geometry+label columns; initialise RGB feature columns."""
+        fourier_dim = old_w.shape[1] - old_point_feats
+        if new_w.shape[1] - new_point_feats != fourier_dim:
+            raise ValueError(
+                f"Fourier dim mismatch: old feats={old_point_feats}, new feats={new_point_feats}"
+            )
+        out = new_w.clone()
+        out[:, : fourier_dim + old_point_feats] = old_w
+        rgb_cols = new_point_feats - old_point_feats
+        rgb_start = fourier_dim + old_point_feats
+        rgb_weight = out[:, rgb_start : rgb_start + rgb_cols]
+        if rgb_feat_init == "zero":
+            nn.init.zeros_(rgb_weight)
+        elif rgb_feat_init == "kaiming":
+            nn.init.kaiming_uniform_(rgb_weight, a=math.sqrt(5))
+        elif rgb_feat_init == "label_scale":
+            label_col = old_w[:, fourier_dim + 3 : fourier_dim + 4]
+            rgb_weight.copy_(label_col.unsqueeze(1).expand(-1, rgb_cols) * 0.01)
+        else:
+            raise ValueError(f"Unknown rgb_feat_init {rgb_feat_init!r}")
+        return out
+
+    def _load_shapevae_state_dict(
+        self,
+        ckpt_or_repo: str,
+        *,
+        subfolder: str,
+        use_safetensors: bool = False,
+    ) -> dict:
+        if os.path.isfile(ckpt_or_repo):
+            if ckpt_or_repo.endswith(".safetensors"):
+                import safetensors.torch
+                raw = safetensors.torch.load_file(ckpt_or_repo, device="cpu")
+            else:
+                raw = torch.load(ckpt_or_repo, map_location="cpu", weights_only=True)
+            return raw.get("state_dict", raw)
+
+        vae = ShapeVAE.from_pretrained(
+            ckpt_or_repo,
+            subfolder=subfolder,
+            device="cpu",
+            dtype=torch.float32,
+            use_safetensors=use_safetensors,
+        )
+        state_dict = vae.state_dict()
+        del vae
+        return state_dict
+
+    def load_shapevae_pretrained(
+        self,
+        ckpt_or_repo: str,
+        *,
+        load_encoder: bool = True,
+        load_bottleneck: bool = True,
+        load_transformer: bool = True,
+        rgb_feat_init: str = "kaiming",
+        subfolder: str = "hunyuan3d-vae-v2-mini-withencoder",
+        shapevae_point_feats: int = 4,
+        use_safetensors: bool = False,
+    ) -> dict:
+        """Load Hunyuan ShapeVAE weights into ShapeGSAE (geometry path).
+
+        ``input_proj``: copy Fourier + normals + label columns; RGB columns are
+        initialised per ``rgb_feat_init``.  ``pre_kl`` mean half maps to
+        ``bottleneck_down``; ``post_kl`` maps to ``bottleneck_up``.
+        """
+        ckpt = self._load_shapevae_state_dict(
+            ckpt_or_repo,
+            subfolder=subfolder,
+            use_safetensors=use_safetensors,
+        )
+        report = {
+            "source": ckpt_or_repo,
+            "load_encoder": load_encoder,
+            "load_bottleneck": load_bottleneck,
+            "load_transformer": load_transformer,
+            "rgb_feat_init": rgb_feat_init,
+            "encoder_missing": 0,
+            "encoder_unexpected": 0,
+        }
+
+        if load_encoder:
+            enc_prefix = "encoder."
+            enc_ckpt = {
+                k[len(enc_prefix) :]: v for k, v in ckpt.items() if k.startswith(enc_prefix)
+            }
+            ip_key = "input_proj.weight"
+            if ip_key in enc_ckpt:
+                enc_ckpt[ip_key] = self._map_input_proj_vae_to_gsae(
+                    enc_ckpt[ip_key],
+                    self.encoder.input_proj.weight.data,
+                    old_point_feats=shapevae_point_feats,
+                    new_point_feats=self.point_feats,
+                    rgb_feat_init=rgb_feat_init,
+                )
+            missing, unexpected = self.encoder.load_state_dict(enc_ckpt, strict=False)
+            report["encoder_missing"] = len(missing)
+            report["encoder_unexpected"] = len(unexpected)
+            logger.info(
+                "Loaded pretrained encoder — %d missing, %d unexpected keys",
+                len(missing),
+                len(unexpected),
+            )
+
+        if load_bottleneck:
+            if "pre_kl.weight" in ckpt:
+                self.bottleneck_down.weight.data.copy_(ckpt["pre_kl.weight"][: self.embed_dim])
+            if "pre_kl.bias" in ckpt:
+                self.bottleneck_down.bias.data.copy_(ckpt["pre_kl.bias"][: self.embed_dim])
+            post_keys = {k: v for k, v in ckpt.items() if k.startswith("post_kl.")}
+            if post_keys:
+                post_ckpt = {k[len("post_kl.") :]: v for k, v in post_keys.items()}
+                missing, unexpected = self.bottleneck_up.load_state_dict(post_ckpt, strict=False)
+                logger.info(
+                    "Loaded pretrained bottleneck — down from pre_kl mean, up from post_kl "
+                    "(%d missing, %d unexpected)",
+                    len(missing),
+                    len(unexpected),
+                )
+
+        if load_transformer:
+            tr_ckpt = {
+                k[len("transformer.") :]: v
+                for k, v in ckpt.items()
+                if k.startswith("transformer.")
+            }
+            if tr_ckpt:
+                missing, unexpected = self.transformer.load_state_dict(tr_ckpt, strict=False)
+                report["transformer_missing"] = len(missing)
+                report["transformer_unexpected"] = len(unexpected)
+                logger.info(
+                    "Loaded pretrained transformer — %d missing, %d unexpected keys",
+                    len(missing),
+                    len(unexpected),
+                )
+
+        return report
+
+    def freeze_modules(
+        self,
+        *,
+        encoder: bool = False,
+        bottleneck: bool = False,
+        transformer: bool = False,
+    ) -> None:
+        """Freeze selected modules for Phase-1-style training."""
+        if encoder:
+            for param in self.encoder.parameters():
+                param.requires_grad = False
+        if bottleneck:
+            for param in self.bottleneck_down.parameters():
+                param.requires_grad = False
+            for param in self.bottleneck_up.parameters():
+                param.requires_grad = False
+        if transformer:
+            for param in self.transformer.parameters():
+                param.requires_grad = False
+
+    def build_optimizer_param_groups(
+        self,
+        lr: float,
+        weight_decay: float,
+        *,
+        encoder_lr_scale: float = 1.0,
+        transformer_lr_scale: float = 1.0,
+        bottleneck_lr_scale: Optional[float] = None,
+    ) -> List[dict]:
+        """Build AdamW param groups with per-module LR scales."""
+        if bottleneck_lr_scale is None:
+            bottleneck_lr_scale = encoder_lr_scale
+
+        def _collect(module: nn.Module) -> List[nn.Parameter]:
+            return [p for p in module.parameters() if p.requires_grad]
+
+        groups: List[dict] = []
+        module_specs = (
+            (self.gs_head, 1.0),
+            (self.encoder, encoder_lr_scale),
+            (self.bottleneck_down, bottleneck_lr_scale),
+            (self.bottleneck_up, bottleneck_lr_scale),
+            (self.transformer, transformer_lr_scale),
+        )
+        for module, scale in module_specs:
+            params = _collect(module)
+            if params:
+                groups.append(
+                    {"params": params, "lr": lr * scale, "weight_decay": weight_decay}
+                )
+        return groups
