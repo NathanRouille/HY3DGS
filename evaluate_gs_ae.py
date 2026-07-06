@@ -32,14 +32,17 @@ Usage — evaluate a single checkpoint on training data (overfit test)
         --num_samples 10 --shuffle \\
         --categories chair
 
-Per checkpoint, evaluates two view sets from the full v46 GT cache:
+Per checkpoint, evaluates two view sets:
 
-  * **canonical** — always the 6 axis-aligned views (indices 0..5)
-  * **holdout** — elevation grid rows 1 and 2 (16 views; not used in 22-view
-    training).  Same fixed cameras across all experiments.
+  * **canonical** — always the first 6 views (indices 0..5)
+  * **holdout** — ShapeNet v46: elevation grid rows 1–2 (16 views); G-Objaverse:
+    all remaining loaded views (indices 6..N-1)
 
 Saves separate visuals/metrics (``*_canonical`` / ``*_holdout``).
 Summary CSV uses ``canonical/holdout`` slash format per metric.
+
+G-Objaverse: pass ``--data_dir`` to ``.../furniture_351/val``; ``gt_source`` is
+read from manifest / checkpoint. ShapeNet: unchanged v46 GT cache path.
 """
 
 from __future__ import annotations
@@ -76,6 +79,11 @@ from hy3dgen.shapegen.gs_export import (
     export_input_surface_ply,
     export_xyz_pointcloud_ply,
 )
+from hy3dgen.shapegen.gobjaverse_gt import (
+    GOBJAVERSE_GT_TAG,
+    GOBJAVERSE_NUM_VIEWS,
+    normalize_mesh_gobjaverse,
+)
 from hy3dgen.shapegen.gs_renderer import (
     CANONICAL_VIEW_INDICES_V46,
     GaussianRenderer,
@@ -96,6 +104,7 @@ from hy3dgen.shapegen.surface_loaders import normalize_mesh
 from train_gs_ae import (
     GTRGBDRenderer,
     MeshDataset,
+    load_experiment_manifest,
     mesh_path_has_usable_gt_cache,
     resolve_category_ids,
 )
@@ -118,6 +127,12 @@ CHECKPOINT_ARCH_KEYS = (
     "qk_norm",
     "pretrained_profile",
     "include_sharp_label",
+    "gt_source",
+    "num_views",
+    "views_per_step",
+    "gobjaverse_num_views",
+    "render_height",
+    "render_width",
 )
 
 
@@ -244,7 +259,12 @@ def add_label_bar(
 # Debug mesh export (same normalization as RGBSharpEdgeSurfaceLoader)
 # ---------------------------------------------------------------------------
 
-def export_normalized_mesh_obj(mesh_path: str, path: Path) -> None:
+def export_normalized_mesh_obj(
+    mesh_path: str,
+    path: Path,
+    *,
+    gobjaverse_meta: Optional[dict] = None,
+) -> None:
     """Save normalized mesh as OBJ with per-sample MTL + texture for CloudCompare.
 
     Uses the same geometry normalization as ``load_surface_sharpedge_rgb``.
@@ -255,23 +275,45 @@ def export_normalized_mesh_obj(mesh_path: str, path: Path) -> None:
     out_dir = path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    mesh = GTRGBDRenderer._load_mesh(mesh_path)
-    try:
-        mesh_full = trimesh.util.concatenate(mesh.dump())
-    except Exception:
-        mesh_full = trimesh.util.concatenate(mesh)
-    mesh_full = normalize_mesh(mesh_full)
-
-    # If no UV texture is present, bake vertex colors so CloudCompare still shows RGB.
-    has_uv_texture = (
-        isinstance(mesh_full.visual, trimesh.visual.texture.TextureVisuals)
-        and getattr(mesh_full.visual, "uv", None) is not None
-        and mesh_full.visual.material is not None
-        and getattr(mesh_full.visual.material, "image", None) is not None
+    mesh = trimesh.load(mesh_path, process=False)
+    from hy3dgen.shapegen.surface_loaders import (
+        merge_parts_vertex_colored,
+        normalize_parts_gobjaverse,
+        scene_to_parts,
     )
-    if not has_uv_texture:
-        from hy3dgen.shapegen.surface_loaders import _get_vertex_colors
 
+    parts = scene_to_parts(mesh)
+    if gobjaverse_meta is not None:
+        parts = normalize_parts_gobjaverse(parts, gobjaverse_meta)
+        mesh_full = merge_parts_vertex_colored(parts)
+    else:
+        from hy3dgen.shapegen.surface_loaders import normalize_parts
+        parts = normalize_parts(parts)
+        mesh_full = merge_parts_vertex_colored(parts)
+
+    from hy3dgen.shapegen.surface_loaders import extract_mesh_texture, _get_vertex_colors
+
+    vertex_uvs, texture_rgb = extract_mesh_texture(mesh_full)
+    has_uv_texture = vertex_uvs is not None and texture_rgb is not None
+    if has_uv_texture:
+        material = mesh_full.visual.material
+        # NOTE: trimesh's OBJ exporter calls `material.to_simple()`, which for a
+        # PBRMaterial reads `baseColorTexture` (there is no `.image` attribute on
+        # PBRMaterial at all -- setting `.image` silently creates an unused
+        # attribute and the exporter falls back to whatever texture/color was
+        # already on the material, or none). SimpleMaterial uses `.image` instead.
+        # Bake the exact texture we sampled the point cloud from so the exported
+        # OBJ is guaranteed to match training data pixel-for-pixel.
+        if material is not None:
+            from PIL import Image
+            baked_image = Image.fromarray(
+                (np.clip(texture_rgb, 0, 1) * 255.0).round().astype(np.uint8),
+            )
+            if hasattr(material, "baseColorTexture"):
+                material.baseColorTexture = baked_image
+            else:
+                material.image = baked_image
+    else:
         vc = (_get_vertex_colors(mesh_full) * 255.0).round().astype(np.uint8)
         mesh_full.visual = trimesh.visual.ColorVisuals(
             mesh=mesh_full,
@@ -362,12 +404,45 @@ def _slice_views_by_indices(
     depths: List[torch.Tensor],
     c2ws: List[torch.Tensor],
     indices: List[int],
-) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+    view_params: Optional[List[Dict]] = None,
+) -> Tuple[
+    List[torch.Tensor],
+    List[torch.Tensor],
+    List[torch.Tensor],
+    Optional[List[Dict]],
+]:
+    vp_out = None
+    if view_params is not None:
+        vp_out = [view_params[i] for i in indices]
     return (
         [rgbs[i] for i in indices],
         [depths[i] for i in indices],
         [c2ws[i] for i in indices],
+        vp_out,
     )
+
+
+def _eval_view_splits(
+    gt_source: str,
+    num_loaded_views: int,
+    *,
+    match_training: bool,
+) -> Dict[str, List[int]]:
+    """View index groups for evaluation.
+
+    When ``match_training`` and G-Objaverse, score all loaded training views
+    (same set as ``MeshDataset`` / ``views_per_step`` sampling pool).
+    Otherwise use ShapeNet v46 canonical (6) + holdout split.
+    """
+    if match_training and gt_source == "gobjaverse":
+        return {"train": list(range(num_loaded_views))}
+
+    canonical = [i for i in CANONICAL_VIEW_INDICES_V46 if i < num_loaded_views]
+    if gt_source == "gobjaverse":
+        holdout = [i for i in range(6, num_loaded_views)]
+    else:
+        holdout = [i for i in holdout_view_indices_v46() if i < num_loaded_views]
+    return {"canonical": canonical, "holdout": holdout}
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +513,7 @@ def _evaluate_views_subset(
     gt_depths: List[torch.Tensor],
     c2ws: List[torch.Tensor],
     lpips_net=None,
+    view_params: Optional[List[Dict]] = None,
 ) -> Tuple[Dict[str, float], List[Image.Image]]:
     """Render and score one list of GT views (shared Gaussian prediction)."""
     gt_depth_vals: List[float] = []
@@ -460,13 +536,20 @@ def _evaluate_views_subset(
     alpha_bg_list, alpha_fg_list = [], []
     row_images: List[Image.Image] = []
 
-    for gt_rgb, gt_depth, c2w in zip(gt_rgbs, gt_depths, c2ws):
+    for vi, (gt_rgb, gt_depth, c2w) in enumerate(zip(gt_rgbs, gt_depths, c2ws)):
         valid_mask = gt_depth > 0
         valid_ratio = float(valid_mask.float().mean().item())
         if valid_ratio < 0.02:
             continue
 
-        out = renderer(means, scales, rotations, opacities, sh_coeffs, c2w.to(device))
+        vp = view_params[vi] if view_params is not None else None
+        out = renderer(
+            means, scales, rotations, opacities, sh_coeffs, c2w.to(device),
+            fx=vp.get("fx") if vp else None,
+            fy=vp.get("fy") if vp else None,
+            cx=vp.get("cx") if vp else None,
+            cy=vp.get("cy") if vp else None,
+        )
         pred_rgb = out["rgb"].cpu()
         pred_depth = out["depth"].cpu()
         pred_alpha = out["alpha"].cpu()
@@ -527,27 +610,21 @@ def evaluate_sample(
     renderer: GaussianRenderer,
     sample: Dict,
     device: torch.device,
-    gt_renderer: GTRGBDRenderer,
-    canonical_view_indices: List[int],
-    holdout_view_indices: List[int],
+    view_splits: Dict[str, List[int]],
     lpips_net=None,
     drift_threshold: float = 0.1,
 ) -> Tuple[Dict[str, float], Dict[str, List[Image.Image]], Dict[str, torch.Tensor]]:
-    """Evaluate canonical (6) + holdout (16) view sets.
+    """Evaluate one or more view index groups from a dataloader sample.
 
-    Returns (flat_metrics_dict, {"canonical": rows, "holdout": rows}, export_tensors).
+    ``view_splits`` maps a split name (e.g. ``train``, ``canonical``, ``holdout``)
+    to global view indices into ``sample['rgbs']``.
+
+    Returns (flat_metrics_dict, {split: row_images}, export_tensors).
     """
-    mesh_path = sample["mesh_path"]
-    rgbs_full, depths_full, c2ws_full, _ = gt_renderer.get_or_render(
-        mesh_path, allow_render=False,
-    )
-
-    canon_rgbs, canon_depths, canon_c2ws = _slice_views_by_indices(
-        rgbs_full, depths_full, c2ws_full, canonical_view_indices,
-    )
-    hold_rgbs, hold_depths, hold_c2ws = _slice_views_by_indices(
-        rgbs_full, depths_full, c2ws_full, holdout_view_indices,
-    )
+    rgbs_full = sample["rgbs"]
+    depths_full = sample["depths"]
+    c2ws_full = sample["c2ws"]
+    view_params_full = sample.get("view_params")
 
     surface = sample["surface"].unsqueeze(0).to(device)
     latents, query_positions = model.encode(surface)
@@ -562,27 +639,28 @@ def evaluate_sample(
     sh_coeffs = sh_coeffs[0]
     features = features[0]
 
-    metrics_canon, rows_canon = _evaluate_views_subset(
-        means, scales, rotations, opacities, sh_coeffs,
-        renderer, device, canon_rgbs, canon_depths, canon_c2ws, lpips_net,
-    )
-    metrics_holdout, rows_holdout = _evaluate_views_subset(
-        means, scales, rotations, opacities, sh_coeffs,
-        renderer, device, hold_rgbs, hold_depths, hold_c2ws, lpips_net,
-    )
+    flat_metrics: Dict[str, float] = {}
+    row_images: Dict[str, List[Image.Image]] = {}
+
+    for split_name, view_indices in view_splits.items():
+        if not view_indices:
+            continue
+        split_rgbs, split_depths, split_c2ws, split_vp = _slice_views_by_indices(
+            rgbs_full, depths_full, c2ws_full, view_indices, view_params_full,
+        )
+        split_metrics, split_rows = _evaluate_views_subset(
+            means, scales, rotations, opacities, sh_coeffs,
+            renderer, device, split_rgbs, split_depths, split_c2ws, lpips_net,
+            view_params=split_vp,
+        )
+        flat_metrics.update(_prefix_metrics(split_metrics, split_name))
+        row_images[split_name] = split_rows
 
     anchors = expand_anchor_positions(query_positions, model.num_gs_per_anchor)
     drift_metrics = compute_anchor_drift_metrics(
         means, anchors, drift_threshold=drift_threshold,
     )
-
-    flat_metrics = {
-        **_prefix_metrics(metrics_canon, "canonical"),
-        **_prefix_metrics(metrics_holdout, "holdout"),
-        **drift_metrics,
-    }
-
-    row_images = {"canonical": rows_canon, "holdout": rows_holdout}
+    flat_metrics.update(drift_metrics)
 
     export_tensors = {
         "surface": sample["surface"].detach().cpu(),
@@ -619,13 +697,22 @@ def evaluate_checkpoint(
 
     ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
     train_args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
-    canonical_view_indices = list(CANONICAL_VIEW_INDICES_V46)
-    holdout_view_indices = holdout_view_indices_v46()
-    logger.info(
-        "Eval canonical=%s | holdout=%s",
-        canonical_view_indices,
-        holdout_view_indices,
+    gt_source = getattr(dataset, "gt_source", "shapenet")
+    num_loaded = dataset.num_gt_views
+    match_training = bool(getattr(args, "match_training", True))
+    view_splits = _eval_view_splits(
+        gt_source, num_loaded, match_training=match_training,
     )
+    split_desc = ", ".join(
+        f"{name}={len(idxs)} views" for name, idxs in view_splits.items() if idxs
+    )
+    logger.info(
+        "Eval gt_source=%s | match_training=%s | splits: %s",
+        gt_source,
+        match_training,
+        split_desc or "(none)",
+    )
+    include_sharp_label = resolve_include_sharp_label(args)
 
     model = load_model(checkpoint, args, device)
     det_enc = bool(
@@ -692,12 +779,19 @@ def evaluate_checkpoint(
             renderer,
             sample,
             device,
-            dataset.gt_renderer,
-            canonical_view_indices,
-            holdout_view_indices,
+            view_splits,
             lpips_net=lpips_net,
             drift_threshold=args.drift_threshold,
         )
+
+        gobjaverse_meta = None
+        if dataset.gt_source == "gobjaverse" and dataset.gobjaverse_gt is not None:
+            mesh_path = sample.get("mesh_path")
+            if mesh_path:
+                try:
+                    gobjaverse_meta = dataset.gobjaverse_gt.load_meta(mesh_path)
+                except Exception as e:
+                    logger.warning("G-Objaverse meta load failed for %s: %s", mesh_stem, e)
 
         if not getattr(args, "no_export_3d", False):
             # File naming: {type_prefix}_{rank:03d}_{mesh_stem}.{ext}
@@ -706,6 +800,7 @@ def evaluate_checkpoint(
             export_input_surface_ply(
                 export_tensors["surface"],
                 input_ply_dir / f"points_{stem}.ply",
+                include_sharp_label=include_sharp_label,
             )
             export_xyz_pointcloud_ply(
                 export_tensors["query_positions"],
@@ -728,6 +823,7 @@ def evaluate_checkpoint(
                     export_normalized_mesh_obj(
                         mesh_path,
                         normalized_mesh_dir / f"mesh_{stem}.obj",
+                        gobjaverse_meta=gobjaverse_meta,
                     )
                 except Exception as e:
                     logger.warning("Normalized mesh export failed for %s: %s", mesh_stem, e)
@@ -751,8 +847,7 @@ def evaluate_checkpoint(
                 sh_degree=model.sh_degree,
             )
 
-        for split_name in ("canonical", "holdout"):
-            rows = row_images_by_split.get(split_name) or []
+        for split_name, rows in row_images_by_split.items():
             if not rows:
                 continue
             m_psnr_fg = metrics.get(f"psnr_fg_{split_name}", float("nan"))
@@ -777,28 +872,21 @@ def evaluate_checkpoint(
             **metrics,
         }
         results.append(result)
-        logger.info(
-            "  canonical:    PSNR_fg=%.2f PSNR=%.2f SSIM=%.4f LPIPS=%.4f "
-            "α_bg=%.4f L1depth=%.4f (n=%s)",
-            metrics.get("psnr_fg_canonical", float("nan")),
-            metrics.get("psnr_full_canonical", float("nan")),
-            metrics.get("ssim_full_canonical", float("nan")),
-            metrics.get("lpips_fg_canonical", float("nan")),
-            metrics.get("mean_alpha_bg_canonical", float("nan")),
-            metrics.get("mean_depth_l1_canonical", float("nan")),
-            metrics.get("n_views_canonical", "?"),
-        )
-        logger.info(
-            "  holdout:      PSNR_fg=%.2f PSNR=%.2f SSIM=%.4f LPIPS=%.4f "
-            "α_bg=%.4f L1depth=%.4f (n=%s)",
-            metrics.get("psnr_fg_holdout", float("nan")),
-            metrics.get("psnr_full_holdout", float("nan")),
-            metrics.get("ssim_full_holdout", float("nan")),
-            metrics.get("lpips_fg_holdout", float("nan")),
-            metrics.get("mean_alpha_bg_holdout", float("nan")),
-            metrics.get("mean_depth_l1_holdout", float("nan")),
-            metrics.get("n_views_holdout", "?"),
-        )
+        for split_name in view_splits:
+            if not view_splits[split_name]:
+                continue
+            logger.info(
+                "  %-12s PSNR_fg=%.2f PSNR=%.2f SSIM=%.4f LPIPS=%.4f "
+                "α_bg=%.4f L1depth=%.4f (n=%s)",
+                f"{split_name}:",
+                metrics.get(f"psnr_fg_{split_name}", float("nan")),
+                metrics.get(f"psnr_full_{split_name}", float("nan")),
+                metrics.get(f"ssim_full_{split_name}", float("nan")),
+                metrics.get(f"lpips_fg_{split_name}", float("nan")),
+                metrics.get(f"mean_alpha_bg_{split_name}", float("nan")),
+                metrics.get(f"mean_depth_l1_{split_name}", float("nan")),
+                metrics.get(f"n_views_{split_name}", "?"),
+            )
         logger.info(
             "  drift: mean_l2=%.4f max_l2=%.4f p95_l2=%.4f frac_gt_%.2f=%.4f",
             metrics.get("mean_drift_l2", float("nan")),
@@ -847,9 +935,13 @@ def _summarize_checkpoint_results(
     results: List[Dict],
 ) -> Optional[Dict]:
     """Aggregate per-sample rows into one compact summary dict."""
+    primary_split = "train" if any("psnr_full_train" in r for r in results) else "canonical"
+    secondary_split = None if primary_split == "train" else "holdout"
+    primary_key = f"psnr_full_{primary_split}"
+
     valid = [
         r for r in results
-        if not math.isnan(r.get("psnr_full_canonical", float("nan")))
+        if not math.isnan(r.get(primary_key, float("nan")))
     ]
     if not valid:
         return None
@@ -858,23 +950,35 @@ def _summarize_checkpoint_results(
         vals = [r[key] for r in valid if not math.isnan(r.get(key, float("nan")))]
         return sum(vals) / len(vals) if vals else float("nan")
 
-    psnr_c = _mean_key("psnr_full_canonical")
-    psnr_h = _mean_key("psnr_full_holdout")
-    ssim_c = _mean_key("ssim_full_canonical")
-    ssim_h = _mean_key("ssim_full_holdout")
-    lpips_c = _mean_key("lpips_fg_canonical")
-    lpips_h = _mean_key("lpips_fg_holdout")
-    depth_c = _mean_key("mean_depth_l1_canonical")
-    depth_h = _mean_key("mean_depth_l1_holdout")
+    psnr_p = _mean_key(f"psnr_full_{primary_split}")
+    ssim_p = _mean_key(f"ssim_full_{primary_split}")
+    lpips_p = _mean_key(f"lpips_fg_{primary_split}")
+    depth_p = _mean_key(f"mean_depth_l1_{primary_split}")
+
+    if secondary_split is not None:
+        psnr_s = _mean_key(f"psnr_full_{secondary_split}")
+        ssim_s = _mean_key(f"ssim_full_{secondary_split}")
+        lpips_s = _mean_key(f"lpips_fg_{secondary_split}")
+        depth_s = _mean_key(f"mean_depth_l1_{secondary_split}")
+        psnr_fmt = _fmt_metric_pair(psnr_p, psnr_s, 2)
+        ssim_fmt = _fmt_metric_pair(ssim_p, ssim_s, 3)
+        lpips_fmt = _fmt_metric_pair(lpips_p, lpips_s, 3)
+        depth_fmt = _fmt_metric_pair(depth_p, depth_s, 3)
+    else:
+        psnr_fmt = f"{psnr_p:.2f}"
+        ssim_fmt = f"{ssim_p:.3f}"
+        lpips_fmt = f"{lpips_p:.3f}"
+        depth_fmt = f"{depth_p:.3f}"
 
     return {
         "checkpoint": checkpoint,
         "tag": ckpt_tag,
         "n_samples": len(valid),
-        "psnr": _fmt_metric_pair(psnr_c, psnr_h, 2),
-        "ssim": _fmt_metric_pair(ssim_c, ssim_h, 3),
-        "lpips": _fmt_metric_pair(lpips_c, lpips_h, 3),
-        "l1_depth": _fmt_metric_pair(depth_c, depth_h, 3),
+        "eval_split": primary_split if secondary_split is None else f"{primary_split}/{secondary_split}",
+        "psnr": psnr_fmt,
+        "ssim": ssim_fmt,
+        "lpips": lpips_fmt,
+        "l1_depth": depth_fmt,
     }
 
 
@@ -955,6 +1059,39 @@ def parse_args():
         help="L2 drift threshold for frac_drift_gt_thresh metric (normalised coords).",
     )
 
+    p.add_argument(
+        "--gt_source",
+        type=str,
+        default=None,
+        choices=("shapenet", "gobjaverse"),
+        help="GT source (default: manifest.json or checkpoint args).",
+    )
+    p.add_argument(
+        "--gobjaverse_render_root",
+        type=str,
+        default=None,
+        help="G-Objaverse render root (default: manifest render_root).",
+    )
+    p.add_argument(
+        "--gobjaverse_num_views",
+        type=int,
+        default=None,
+        help="G-Objaverse views to load (default: checkpoint num_views or all 40).",
+    )
+    p.add_argument(
+        "--num_views",
+        type=int,
+        default=None,
+        help="Views to load (restored from checkpoint when present).",
+    )
+    p.add_argument(
+        "--match_training",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="G-Objaverse: evaluate all loaded training views (same pool as "
+             "views_per_step). ShapeNet: use canonical+holdout split when disabled.",
+    )
+
     # Rendering
     p.add_argument("--render_height", type=int, default=512)
     p.add_argument("--render_width", type=int, default=512)
@@ -1022,6 +1159,7 @@ def main():
 
     surface_seed = args.seed
     include_sharp_label = resolve_include_sharp_label(args)
+    train_args0: dict = {}
     if args.checkpoints:
         ckpt0 = torch.load(args.checkpoints[0], map_location="cpu", weights_only=False)
         train_args0 = ckpt0.get("args", {}) if isinstance(ckpt0, dict) else {}
@@ -1041,29 +1179,82 @@ def main():
                 surface_seed,
             )
 
-    # Surface loader only; GT RGBD is read from full v46 cache inside evaluate_sample.
+    gt_source_arg = getattr(args, "gt_source", None)
+    manifest = load_experiment_manifest(args.data_dir)
+    effective_gt = (
+        gt_source_arg
+        or (manifest or {}).get("gt_source")
+        or "shapenet"
+    ).lower()
+
+    if effective_gt == "gobjaverse":
+        train_num_views = getattr(args, "num_views", None)
+        if args.gobjaverse_num_views is None and train_num_views is not None:
+            args.gobjaverse_num_views = int(train_num_views)
+        eval_num_views = (
+            args.gobjaverse_num_views
+            if args.gobjaverse_num_views is not None
+            else GOBJAVERSE_NUM_VIEWS
+        )
+        precache_full_views = False
+        if getattr(args, "match_training", True):
+            logger.info(
+                "G-Objaverse eval: match_training=True, loading %d views "
+                "(training used views_per_step=%s)",
+                eval_num_views,
+                getattr(args, "views_per_step", None),
+            )
+    else:
+        eval_num_views = args.num_views if args.num_views is not None else 14
+        precache_full_views = True
+        if getattr(args, "match_training", True):
+            args.match_training = False
+
     dataset = MeshDataset(
         data_dir=args.data_dir,
         pc_size=args.pc_size,
         pc_sharpedge_size=args.pc_sharpedge_size,
         render_height=args.render_height,
         render_width=args.render_width,
-        num_views=14,
+        num_views=eval_num_views,
         camera_distance=args.camera_distance,
         elevation_deg=args.elevation_deg,
         max_items=args.max_items,
         mesh_blacklist=args.mesh_blacklist,
         categories=categories,
-        precache_full_views=True,
+        precache_full_views=precache_full_views,
         require_cached_gt=args.only_cached_gt,
         seed=surface_seed,
         include_sharp_label=include_sharp_label,
+        gt_source=gt_source_arg,
+        gobjaverse_render_root=args.gobjaverse_render_root,
+        gobjaverse_num_views=args.gobjaverse_num_views,
     )
-    logger.info(f"Dataset: {len(dataset)} meshes in {args.data_dir}")
+    logger.info(
+        "Dataset: %d meshes in %s (gt_source=%s, loaded_views=%d)",
+        len(dataset),
+        args.data_dir,
+        dataset.gt_source,
+        dataset.num_gt_views,
+    )
 
     mesh_paths = list(dataset.mesh_paths)
-    tag = dataset.gt_renderer._tag
-    if args.only_cached_gt:
+    if dataset.gt_source == "gobjaverse":
+        assert dataset.gobjaverse_gt is not None
+        if args.only_cached_gt:
+            before = len(mesh_paths)
+            mesh_paths = [
+                p for p in mesh_paths
+                if dataset.gobjaverse_gt.has_gt(p)
+            ]
+            logger.info(
+                "Filtered to %d / %d meshes with G-Objaverse renders (tag '%s')",
+                len(mesh_paths),
+                before,
+                GOBJAVERSE_GT_TAG,
+            )
+    elif args.only_cached_gt:
+        tag = dataset.gt_renderer._tag
         mesh_paths = [
             p for p in mesh_paths
             if mesh_path_has_usable_gt_cache(p, tag)
@@ -1107,17 +1298,19 @@ def main():
 
     if summary_rows:
         print("\n" + "=" * 72)
-        print("EVALUATION SUMMARY  (canonical / holdout)")
+        print("EVALUATION SUMMARY")
         print("=" * 72)
-        hdr = f"{'Checkpoint':<32} {'psnr':>14} {'ssim':>14} {'lpips':>14} {'l1_depth':>14}"
+        hdr = f"{'Checkpoint':<32} {'split':>12} {'psnr':>14} {'ssim':>14} {'lpips':>14} {'l1_depth':>14}"
         print(hdr)
         print("-" * len(hdr))
         for row in summary_rows:
             name = Path(row["checkpoint"]).parent.name + "/" + Path(row["checkpoint"]).stem
             if len(name) > 30:
                 name = ".." + name[-28:]
+            split_label = row.get("eval_split", "canonical/holdout")
             print(
                 f"  {name:<32} "
+                f"{split_label:>12} "
                 f"{row['psnr']:>14} "
                 f"{row['ssim']:>14} "
                 f"{row['lpips']:>14} "

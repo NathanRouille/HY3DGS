@@ -15,7 +15,7 @@
 
 import math
 import os
-from typing import Union, List, Optional
+from typing import Union, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -772,6 +772,60 @@ class ShapeGSAE(nn.Module):
         if transformer:
             for param in self.transformer.parameters():
                 param.requires_grad = False
+
+    def encoder_rgb_input_proj_bounds(
+        self,
+        shapevae_point_feats: int,
+    ) -> Tuple[int, int]:
+        """Return ``(start_col, num_cols)`` for RGB feature columns in ``input_proj.weight``."""
+        if shapevae_point_feats >= self.point_feats:
+            raise ValueError(
+                f"shapevae_point_feats ({shapevae_point_feats}) must be < point_feats "
+                f"({self.point_feats}) to define RGB input_proj columns"
+            )
+        fourier_dim = self.encoder.input_proj.weight.shape[1] - self.point_feats
+        rgb_cols = self.point_feats - shapevae_point_feats
+        rgb_start = fourier_dim + shapevae_point_feats
+        return rgb_start, rgb_cols
+
+    def setup_trainable_encoder_rgb_input_proj(
+        self,
+        shapevae_point_feats: int = 4,
+    ) -> dict:
+        """Freeze the encoder except the RGB columns of ``input_proj.weight``.
+
+        Gradients on non-RGB weight columns are zeroed so only the added RGB
+        feature path updates while the pretrained geometry projection stays fixed.
+        """
+        rgb_start, rgb_cols = self.encoder_rgb_input_proj_bounds(shapevae_point_feats)
+        enc = self.encoder
+        for param in enc.parameters():
+            param.requires_grad = False
+        enc.input_proj.weight.requires_grad = True
+
+        handle = getattr(self, "_rgb_input_proj_grad_hook_handle", None)
+        if handle is not None:
+            handle.remove()
+            self._rgb_input_proj_grad_hook_handle = None
+
+        def _mask_non_rgb_grad(grad: torch.Tensor) -> torch.Tensor:
+            masked = torch.zeros_like(grad)
+            masked[:, rgb_start : rgb_start + rgb_cols] = grad[
+                :, rgb_start : rgb_start + rgb_cols
+            ]
+            return masked
+
+        self._rgb_input_proj_grad_hook_handle = enc.input_proj.weight.register_hook(
+            _mask_non_rgb_grad
+        )
+
+        width = enc.input_proj.weight.shape[0]
+        num_rgb_params = width * rgb_cols
+        return {
+            "rgb_start_col": rgb_start,
+            "rgb_cols": rgb_cols,
+            "rgb_proj_params": num_rgb_params,
+        }
 
     def build_optimizer_param_groups(
         self,

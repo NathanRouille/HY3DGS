@@ -386,6 +386,10 @@ class GaussianRenderer(nn.Module):
         opacities: torch.Tensor,    # (N, 1)
         colors: torch.Tensor,       # (N, 3) RGB if sh_degree==0, else (N, K, 3) SH coeffs
         c2w: torch.Tensor,          # (4, 4) camera-to-world
+        fx: Optional[float] = None,
+        fy: Optional[float] = None,
+        cx: Optional[float] = None,
+        cy: Optional[float] = None,
     ) -> Dict[str, torch.Tensor]:
         """Render a single scene.
 
@@ -407,6 +411,10 @@ class GaussianRenderer(nn.Module):
             ) from e
 
         device, dtype = means.device, means.dtype
+        fx_use = self.fx if fx is None else float(fx)
+        fy_use = self.fy if fy is None else float(fy)
+        cx_use = self.cx if cx is None else float(cx)
+        cy_use = self.cy if cy is None else float(cy)
         # gsplat expects a world-to-camera matrix in OpenCV-like camera coordinates.
         # Our orbit/pyrender poses are OpenGL-style c2w, so convert GL->CV first.
         gl_to_cv = torch.tensor(
@@ -454,7 +462,7 @@ class GaussianRenderer(nn.Module):
             colors=colors_,
             viewmats=viewmat,
             Ks=torch.tensor(
-                [[self.fx, 0, self.cx], [0, self.fy, self.cy], [0, 0, 1]],
+                [[fx_use, 0, cx_use], [0, fy_use, cy_use], [0, 0, 1]],
                 device=device, dtype=dtype,
             ).unsqueeze(0),
             width=self.width,

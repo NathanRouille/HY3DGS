@@ -20,22 +20,46 @@ import numpy as np
 import torch
 import trimesh
 
+from hy3dgen.shapegen.gobjaverse_gt import (
+    gobjaverse_gt_source_from_manifest,
+    normalize_mesh_gobjaverse,
+)
 from hy3dgen.shapegen.models.autoencoders import ShapeVAE
 from hy3dgen.shapegen.pipelines import export_to_trimesh
 from hy3dgen.shapegen.pretrained_profiles import HUNYUAN_MINI_PROFILE
-from hy3dgen.shapegen.surface_loaders import _get_vertex_colors, load_surface_sharpegde, normalize_mesh
-from train_gs_ae import resolve_category_ids
+from hy3dgen.shapegen.surface_loaders import _get_vertex_colors, load_surface_sharpegde, normalize_mesh, scene_to_geometry
+from train_gs_ae import load_experiment_manifest, resolve_category_ids
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 
 def _sample_stem(mesh_path: str) -> str:
-    """Unique name for exports (handles ShapeNet .../<id>/models/model_normalized.obj)."""
+    """Unique name for exports.
+
+    Handles ShapeNet ``.../<id>/models/model_normalized.obj`` and G-Objaverse
+    ``.../glbs/000-072/<uid>.glb`` (uses the uid hash so exports stay unique).
+    """
     p = Path(mesh_path)
     if p.name == "model_normalized.obj" and p.parent.name == "models":
         return p.parent.parent.name
+    if p.suffix.lower() == ".glb":
+        return p.stem
     return p.parent.name
+
+
+def _manifest_mesh_paths(data_dir: str) -> Optional[List[str]]:
+    """Return manifest-listed mesh paths for the split, or None for ShapeNet scans."""
+    manifest = load_experiment_manifest(data_dir)
+    if manifest is None:
+        return None
+    data_path = Path(data_dir).resolve()
+    split_key = "train_mesh_paths" if data_path.name == "train" else (
+        "val_mesh_paths" if data_path.name == "val" else None
+    )
+    if split_key and manifest.get(split_key):
+        return list(manifest[split_key])
+    return None
 
 
 def discover_mesh_paths(
@@ -43,8 +67,18 @@ def discover_mesh_paths(
     categories: Optional[Set[str]] = None,
     max_items: Optional[int] = None,
 ) -> List[str]:
+    # Prefer an experiment manifest (G-Objaverse stores explicit GLB paths;
+    # ShapeNet experiments may also list pre-selected meshes there).
+    manifest_paths = _manifest_mesh_paths(data_dir)
+    if manifest_paths is not None:
+        logger.info("Loaded %d mesh path(s) from experiment manifest", len(manifest_paths))
+        mesh_paths = manifest_paths
+        if max_items is not None:
+            mesh_paths = mesh_paths[:max_items]
+        return mesh_paths
+
     data_path = Path(data_dir).resolve()
-    mesh_paths: List[str] = []
+    mesh_paths = []
     for folder in sorted(data_path.iterdir()):
         if not folder.is_dir():
             continue
@@ -61,10 +95,22 @@ def discover_mesh_paths(
 
 
 def _load_mesh(mesh_path: str) -> trimesh.Trimesh:
-    mesh = trimesh.load(mesh_path, force="mesh", merge_primitives=True)
-    if isinstance(mesh, trimesh.scene.Scene):
-        mesh = mesh.dump(concatenate=True)
-    return mesh
+    mesh = trimesh.load(mesh_path, process=False)
+    return scene_to_geometry(mesh)
+
+
+def _resolve_gobjaverse_eval(data_dir: str):
+    """Return GObjaverseGTSource when the experiment manifest requests it."""
+    manifest = load_experiment_manifest(data_dir)
+    if manifest is None or manifest.get("gt_source") != "gobjaverse":
+        return None
+    return gobjaverse_gt_source_from_manifest(manifest)
+
+
+def _normalize_mesh_for_eval(mesh: trimesh.Trimesh, gobjaverse_meta: Optional[dict]) -> trimesh.Trimesh:
+    if gobjaverse_meta is not None:
+        return normalize_mesh_gobjaverse(mesh, gobjaverse_meta)
+    return normalize_mesh(mesh)
 
 
 def _load_surface_and_gt_mesh(
@@ -72,6 +118,7 @@ def _load_surface_and_gt_mesh(
     *,
     pc_size: int,
     pc_sharpedge_size: int,
+    gobjaverse_meta: Optional[dict] = None,
 ) -> tuple[torch.Tensor, trimesh.Trimesh]:
     """Return VAE input surface and loader-normalized GT mesh (same coordinate frame)."""
     mesh = _load_mesh(mesh_path)
@@ -79,6 +126,7 @@ def _load_surface_and_gt_mesh(
         mesh,
         num_points=pc_size,
         num_sharp_points=pc_sharpedge_size,
+        gobjaverse_meta=gobjaverse_meta,
     )
     return surface, gt_mesh
 
@@ -90,7 +138,12 @@ def _export_mesh(mesh: trimesh.Trimesh, path: Path) -> str:
     return str(path)
 
 
-def _export_textured_gt_mesh(mesh_path: str, path: Path) -> Dict[str, str]:
+def _export_textured_gt_mesh(
+    mesh_path: str,
+    path: Path,
+    *,
+    gobjaverse_meta: Optional[dict] = None,
+) -> Dict[str, str]:
     """Export normalized GT OBJ with per-sample MTL + texture (CloudCompare-safe).
 
     Writes ``{stem}.obj``, ``{stem}.mtl``, and ``{stem}_texture.<ext>`` so multi-sample
@@ -100,12 +153,8 @@ def _export_textured_gt_mesh(mesh_path: str, path: Path) -> Dict[str, str]:
     out_dir = path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    mesh_full = _load_mesh(mesh_path)
-    try:
-        mesh_full = trimesh.util.concatenate(mesh_full.dump())
-    except Exception:
-        mesh_full = trimesh.util.concatenate(mesh_full)
-    mesh_full = normalize_mesh(mesh_full)
+    mesh_full = scene_to_geometry(_load_mesh(mesh_path))
+    mesh_full = _normalize_mesh_for_eval(mesh_full, gobjaverse_meta)
     try:
         mesh_full.fix_normals()
     except Exception:
@@ -175,11 +224,7 @@ def _export_textured_gt_mesh(mesh_path: str, path: Path) -> Dict[str, str]:
 
 
 def _mesh_fill_face_count(mesh_path: str) -> int:
-    mesh = _load_mesh(mesh_path)
-    try:
-        mesh_full = trimesh.util.concatenate(mesh.dump())
-    except Exception:
-        mesh_full = trimesh.util.concatenate(mesh)
+    mesh_full = scene_to_geometry(_load_mesh(mesh_path))
     origin_num = mesh_full.faces.shape[0]
     mesh_fill = trimesh.Trimesh(
         vertices=mesh_full.vertices,
@@ -272,6 +317,12 @@ def main():
     mesh_paths = discover_mesh_paths(args.data_dir, categories=categories)
     logger.info("Found %d meshes in %s", len(mesh_paths), args.data_dir)
 
+    gobjaverse_gt = _resolve_gobjaverse_eval(args.data_dir)
+    if gobjaverse_gt is not None:
+        logger.info(
+            "G-Objaverse eval: using render-normalized meshes (scale from view JSON)"
+        )
+
     all_indices = list(range(len(mesh_paths)))
     if args.shuffle:
         random.shuffle(all_indices)
@@ -314,17 +365,26 @@ def main():
         logger.info("[%d/%d] %s", rank + 1, len(sample_indices), stem)
 
         mesh_fill_faces = _mesh_fill_face_count(mesh_path)
+        gobjaverse_meta = (
+            gobjaverse_gt.load_meta(mesh_path) if gobjaverse_gt is not None else None
+        )
         surface, _ = _load_surface_and_gt_mesh(
             mesh_path,
             pc_size=args.pc_size,
             pc_sharpedge_size=args.pc_sharpedge_size,
+            gobjaverse_meta=gobjaverse_meta,
         )
         diag = _surface_diagnostics(surface)
         diag["mesh_fill_faces"] = mesh_fill_faces
         diag["mesh_path"] = mesh_path
         diag["sample_posterior"] = bool(args.sample_posterior)
+        diag["normalization"] = "gobjaverse" if gobjaverse_meta is not None else "shapenet"
 
-        gt_paths = _export_textured_gt_mesh(mesh_path, gt_dir / f"{stem}_gt.obj")
+        gt_paths = _export_textured_gt_mesh(
+            mesh_path,
+            gt_dir / f"{stem}_gt.obj",
+            gobjaverse_meta=gobjaverse_meta,
+        )
         diag.update(gt_paths)
 
         try:
@@ -351,6 +411,7 @@ def main():
         "pretrained_repo": args.pretrained_repo,
         "pretrained_subfolder": args.pretrained_subfolder,
         "sample_posterior": bool(args.sample_posterior),
+        "normalization": "gobjaverse" if gobjaverse_gt is not None else "shapenet",
         "pc_size": args.pc_size,
         "pc_sharpedge_size": args.pc_sharpedge_size,
         "num_evaluated": len(results),

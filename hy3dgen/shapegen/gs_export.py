@@ -55,52 +55,99 @@ def _to_numpy_f32(x: Union[torch.Tensor, np.ndarray]) -> np.ndarray:
     return np.asarray(x, dtype=np.float32)
 
 
+def surface_rgb_slice(
+    num_channels: int,
+    *,
+    include_sharp_label: Optional[bool] = None,
+) -> slice:
+    """Column slice for RGB in a surface tensor (matches ShapeGSAE / loader layout).
+
+    9 channels:  xyz | normals | rgb           → rgb at 6:9
+    10 channels: xyz | normals | sharp | rgb    → rgb at 7:10
+    """
+    if include_sharp_label is None:
+        include_sharp_label = num_channels >= 10
+    if include_sharp_label:
+        if num_channels < 10:
+            raise ValueError(
+                f"include_sharp_label=True requires >=10 channels, got {num_channels}"
+            )
+        return slice(7, 10)
+    if num_channels < 9:
+        raise ValueError(f"surface must have >=9 channels, got {num_channels}")
+    return slice(6, 9)
+
+
 def export_input_surface_ply(
     surface: Union[torch.Tensor, np.ndarray],
     path: Union[str, Path],
+    *,
+    include_sharp_label: Optional[bool] = None,
 ) -> None:
     """Save model input surface as a colored point cloud PLY.
 
     Args:
-        surface: [N, 9] — xyz(0:3) | normals(3:6) | rgb(6:9), values in [0, 1] for rgb.
+        surface: ``[N, C]`` training layout — 9ch (xyz|normals|rgb) or 10ch
+            (xyz|normals|sharp_label|rgb). RGB values in ``[0, 1]``.
         path: Output ``.ply`` path.
+        include_sharp_label: When ``None``, inferred from channel count (>=10).
     """
     pts = _to_numpy_f32(surface)
     if pts.ndim != 2 or pts.shape[1] < 9:
-        raise ValueError(f"surface must be [N, 9], got {pts.shape}")
+        raise ValueError(f"surface must be [N, >=9], got {pts.shape}")
+
+    if include_sharp_label is None:
+        include_sharp_label = pts.shape[1] >= 10
+    rgb_sl = surface_rgb_slice(pts.shape[1], include_sharp_label=include_sharp_label)
 
     xyz = pts[:, :3]
     normals = pts[:, 3:6]
-    rgb_u8 = (np.clip(pts[:, 6:9], 0.0, 1.0) * 255.0).round().astype(np.uint8)
+    rgb_u8 = (np.clip(pts[:, rgb_sl], 0.0, 1.0) * 255.0).round().astype(np.uint8)
+    sharp_label = pts[:, 6] if include_sharp_label else None
     n = xyz.shape[0]
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    header = (
-        "ply\n"
-        "format binary_little_endian 1.0\n"
-        f"element vertex {n}\n"
-        "property float x\n"
-        "property float y\n"
-        "property float z\n"
-        "property float nx\n"
-        "property float ny\n"
-        "property float nz\n"
-        "property uchar red\n"
-        "property uchar green\n"
-        "property uchar blue\n"
-        "end_header\n"
-    )
+    header_lines = [
+        "ply",
+        "format binary_little_endian 1.0",
+        f"element vertex {n}",
+        "property float x",
+        "property float y",
+        "property float z",
+        "property float nx",
+        "property float ny",
+        "property float nz",
+    ]
+    if include_sharp_label:
+        header_lines.append("property float sharp_label")
+    header_lines.extend([
+        "property uchar red",
+        "property uchar green",
+        "property uchar blue",
+        "end_header",
+    ])
+    header = "\n".join(header_lines) + "\n"
+
     with open(path, "wb") as f:
         f.write(header.encode("ascii"))
         for i in range(n):
-            f.write(struct.pack(
-                "<3f3f3B",
-                float(xyz[i, 0]), float(xyz[i, 1]), float(xyz[i, 2]),
-                float(normals[i, 0]), float(normals[i, 1]), float(normals[i, 2]),
-                int(rgb_u8[i, 0]), int(rgb_u8[i, 1]), int(rgb_u8[i, 2]),
-            ))
+            if include_sharp_label:
+                f.write(struct.pack(
+                    "<3f3f f 3B",
+                    float(xyz[i, 0]), float(xyz[i, 1]), float(xyz[i, 2]),
+                    float(normals[i, 0]), float(normals[i, 1]), float(normals[i, 2]),
+                    float(sharp_label[i]),
+                    int(rgb_u8[i, 0]), int(rgb_u8[i, 1]), int(rgb_u8[i, 2]),
+                ))
+            else:
+                f.write(struct.pack(
+                    "<3f3f3B",
+                    float(xyz[i, 0]), float(xyz[i, 1]), float(xyz[i, 2]),
+                    float(normals[i, 0]), float(normals[i, 1]), float(normals[i, 2]),
+                    int(rgb_u8[i, 0]), int(rgb_u8[i, 1]), int(rgb_u8[i, 2]),
+                ))
 
 
 def export_xyz_pointcloud_ply(

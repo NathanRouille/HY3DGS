@@ -45,6 +45,12 @@ from hy3dgen.shapegen.gt_cache_util import (
     gt_cache_file_path,
     is_usable_gt_cache_file,
 )
+from hy3dgen.shapegen.gobjaverse_gt import (
+    GOBJAVERSE_GT_TAG,
+    GOBJAVERSE_NUM_VIEWS,
+    GOBJAVERSE_VIEW_LAYOUT,
+    GObjaverseGTSource,
+)
 from hy3dgen.shapegen.gs_renderer import (
     GT_CACHE_TAG_V46,
     GaussianRenderer,
@@ -227,17 +233,27 @@ def run_canonical_eval(
         gt_rgbs = sample['rgbs'][:CANONICAL_EVAL_NUM_VIEWS]
         gt_depths = sample['depths'][:CANONICAL_EVAL_NUM_VIEWS]
         c2ws = sample['c2ws'][:CANONICAL_EVAL_NUM_VIEWS]
+        view_params = sample.get('view_params')
+        if view_params is not None:
+            view_params = view_params[:CANONICAL_EVAL_NUM_VIEWS]
         means = means[0]
         scales = scales[0]
         rotations = rotations[0]
         opacities = opacities[0]
         sh_coeffs = sh_coeffs[0]
 
-        for gt_rgb, gt_depth, c2w in zip(gt_rgbs, gt_depths, c2ws):
+        for vi, (gt_rgb, gt_depth, c2w) in enumerate(zip(gt_rgbs, gt_depths, c2ws)):
             valid_mask = gt_depth > 0
             if float(valid_mask.float().mean().item()) < 0.02:
                 continue
-            out = renderer(means, scales, rotations, opacities, sh_coeffs, c2w.to(device))
+            vp = view_params[vi] if view_params is not None else None
+            out = renderer(
+                means, scales, rotations, opacities, sh_coeffs, c2w.to(device),
+                fx=vp.get('fx') if vp else None,
+                fy=vp.get('fy') if vp else None,
+                cx=vp.get('cx') if vp else None,
+                cy=vp.get('cy') if vp else None,
+            )
             pred_rgb = out['rgb'].cpu()
             pred_depth = out['depth'].cpu()
 
@@ -530,24 +546,10 @@ class GTRGBDRenderer:
 
     @staticmethod
     def _load_mesh(path: str) -> trimesh.Trimesh:
+        from hy3dgen.shapegen.surface_loaders import scene_to_geometry
+
         scene_or_mesh = trimesh.load(path, process=False)
-        if isinstance(scene_or_mesh, trimesh.scene.Scene):
-            # `Scene.dump(concatenate=True)` is deprecated; use `to_geometry()`.
-            geom = scene_or_mesh.to_geometry()
-            if isinstance(geom, trimesh.Trimesh):
-                return geom
-            if isinstance(geom, dict):
-                meshes = [g for g in geom.values() if isinstance(g, trimesh.Trimesh)]
-            elif isinstance(geom, (list, tuple)):
-                meshes = [g for g in geom if isinstance(g, trimesh.Trimesh)]
-            else:
-                meshes = []
-            if len(meshes) == 0:
-                raise ValueError(f"No mesh geometry found in scene: {path}")
-            if len(meshes) == 1:
-                return meshes[0]
-            return trimesh.util.concatenate(meshes)
-        return scene_or_mesh
+        return scene_to_geometry(scene_or_mesh)
 
     def _render_views(self, mesh, c2ws):
         """Dispatch to pyrender or vertex-color fallback."""
@@ -739,6 +741,9 @@ class MeshDataset(Dataset):
         train_view_indices: Optional[List[int]] = None,
         seed: Optional[int] = None,
         include_sharp_label: bool = False,
+        gt_source: Optional[str] = None,
+        gobjaverse_render_root: Optional[str] = None,
+        gobjaverse_num_views: Optional[int] = None,
     ):
         self.require_cached_gt = require_cached_gt
         self.seed = seed
@@ -749,32 +754,70 @@ class MeshDataset(Dataset):
             include_sharp_label=include_sharp_label,
         )
 
-        if train_view_indices is not None:
-            train_idx: Optional[List[int]] = list(train_view_indices)
-            logger.info(
-                "GT view layout v46: using %d explicit train view indices "
-                "(full %d views cached on disk).",
-                len(train_idx),
-                TOTAL_V46_STAGGER,
+        data_path = Path(data_dir).resolve()
+        manifest = load_experiment_manifest(str(data_path)) if use_experiment_manifest else None
+
+        resolved_gt_source = (gt_source or (manifest or {}).get("gt_source") or "shapenet").lower()
+        self.gt_source = resolved_gt_source
+        self.gobjaverse_gt: Optional[GObjaverseGTSource] = None
+        self.gt_renderer: Optional[GTRGBDRenderer] = None
+
+        if self.gt_source == "gobjaverse":
+            if manifest is None:
+                raise ValueError("G-Objaverse GT requires experiment manifest.json with mesh_to_gobjaverse_id.")
+            render_root = (
+                gobjaverse_render_root
+                or manifest.get("render_root")
+                or os.environ.get("GOBJAVERSE_RENDER_ROOT")
             )
-        elif precache_full_views:
-            train_idx = None
+            if not render_root:
+                raise ValueError(
+                    "G-Objaverse render_root not set. Pass --gobjaverse_render_root or set "
+                    "render_root in manifest / GOBJAVERSE_RENDER_ROOT."
+                )
+            mesh_map = manifest.get("mesh_to_gobjaverse_id") or {}
+            n_views = gobjaverse_num_views if gobjaverse_num_views is not None else num_views
+            self.gobjaverse_gt = GObjaverseGTSource(
+                render_root=str(render_root),
+                mesh_to_gobjaverse_id=mesh_map,
+                height=render_height,
+                width=render_width,
+                num_views=n_views,
+            )
+            logger.info(
+                "GT source: G-Objaverse (%d views, render_root=%s, tag=%s)",
+                self.gobjaverse_gt.num_views,
+                render_root,
+                GOBJAVERSE_GT_TAG,
+            )
         else:
-            snapped = snap_train_views_v46(num_views)
-            train_idx = train_view_indices_v46(snapped)
-            logger.info(
-                f"GT view layout v46: training/preview uses {len(train_idx)} views "
-                f"(requested num_views={num_views} → snapped {snapped}); "
-                f"full {TOTAL_V46_STAGGER} views are cached on disk."
+            if train_view_indices is not None:
+                train_idx: Optional[List[int]] = list(train_view_indices)
+                logger.info(
+                    "GT view layout v46: using %d explicit train view indices "
+                    "(full %d views cached on disk).",
+                    len(train_idx),
+                    TOTAL_V46_STAGGER,
+                )
+            elif precache_full_views:
+                train_idx = None
+            else:
+                snapped = snap_train_views_v46(num_views)
+                train_idx = train_view_indices_v46(snapped)
+                logger.info(
+                    f"GT view layout v46: training/preview uses {len(train_idx)} views "
+                    f"(requested num_views={num_views} → snapped {snapped}); "
+                    f"full {TOTAL_V46_STAGGER} views are cached on disk."
+                )
+            self.gt_renderer = GTRGBDRenderer(
+                height=render_height,
+                width=render_width,
+                camera_distance=camera_distance,
+                elevation_deg=elevation_deg,
+                debug_renders_root=debug_renders_root,
+                train_view_indices=train_idx,
             )
-        self.gt_renderer = GTRGBDRenderer(
-            height=render_height,
-            width=render_width,
-            camera_distance=camera_distance,
-            elevation_deg=elevation_deg,
-            debug_renders_root=debug_renders_root,
-            train_view_indices=train_idx,
-        )
+            logger.info("GT source: ShapeNet v46 caches (tag=%s)", self.gt_renderer._tag)
 
         # Load blacklist of known-bad meshes (one path per line; tab-separated label ignored)
         blacklist: Set[str] = set()
@@ -792,7 +835,6 @@ class MeshDataset(Dataset):
 
         data_path = Path(data_dir).resolve()
         self.mesh_paths: List[str] = []
-        manifest = load_experiment_manifest(str(data_path)) if use_experiment_manifest else None
 
         if manifest is not None:
             split_key = "train_mesh_paths" if data_path.name == "train" else (
@@ -840,19 +882,39 @@ class MeshDataset(Dataset):
             if skipped_blacklist:
                 logger.info(f"Blacklist filter: {skipped_blacklist} mesh(es) excluded")
 
-        if manifest is not None and manifest.get("gt_tag") != self.gt_renderer._tag:
-            logger.warning(
-                "Experiment manifest gt_tag=%r differs from renderer tag=%r",
-                manifest.get("gt_tag"),
-                self.gt_renderer._tag,
-            )
+        if manifest is not None and self.gt_source == "shapenet":
+            if manifest.get("gt_tag") != self.gt_renderer._tag:
+                logger.warning(
+                    "Experiment manifest gt_tag=%r differs from renderer tag=%r",
+                    manifest.get("gt_tag"),
+                    self.gt_renderer._tag,
+                )
+        elif manifest is not None and self.gt_source == "gobjaverse":
+            expected_tag = manifest.get("gt_tag")
+            if expected_tag and expected_tag != GOBJAVERSE_GT_TAG:
+                logger.warning(
+                    "Experiment manifest gt_tag=%r differs from G-Objaverse tag=%r",
+                    expected_tag,
+                    GOBJAVERSE_GT_TAG,
+                )
 
         if max_items is not None:
             self.mesh_paths = self.mesh_paths[:max_items]
 
         if require_cached_gt:
             cached_paths = manifest.get("cached_canonical_objs") if manifest else None
-            if cached_paths is not None:
+            if self.gt_source == "gobjaverse":
+                before = len(self.mesh_paths)
+                self.mesh_paths = [
+                    p for p in self.mesh_paths
+                    if self.gobjaverse_gt is not None and self.gobjaverse_gt.has_gt(p)
+                ]
+                logger.info(
+                    "G-Objaverse GT filter: %d / %d meshes have pre-rendered views",
+                    len(self.mesh_paths),
+                    before,
+                )
+            elif cached_paths is not None:
                 cached_set = set(cached_paths)
                 before = len(self.mesh_paths)
                 self.mesh_paths = [
@@ -879,6 +941,14 @@ class MeshDataset(Dataset):
         logger.info(f"Dataset: {len(self.mesh_paths)} meshes in {data_dir}")
         self._ram_cache: Dict[int, Dict] = {}
 
+    @property
+    def num_gt_views(self) -> int:
+        if self.gt_source == "gobjaverse":
+            assert self.gobjaverse_gt is not None
+            return self.gobjaverse_gt.num_views
+        assert self.gt_renderer is not None
+        return self.gt_renderer.num_views
+
     def __len__(self) -> int:
         return len(self.mesh_paths)
 
@@ -904,11 +974,21 @@ class MeshDataset(Dataset):
         for attempt in range(len(self.mesh_paths)):
             path = self.mesh_paths[(idx + attempt) % len(self.mesh_paths)]
             try:
-                surface = self.loader(path)                         # (1, N, 9)
-                if self.require_cached_gt:
-                    rgbs, depths, c2ws, view_params = self.gt_renderer.load_cached(path)
+                if self.gt_source == "gobjaverse":
+                    assert self.gobjaverse_gt is not None
+                    meta = self.gobjaverse_gt.load_meta(path)
+                    surface = self.loader(path, gobjaverse_meta=meta)
+                    if self.require_cached_gt and not self.gobjaverse_gt.has_gt(path):
+                        raise GtCacheNotFoundError(
+                            f"Missing G-Objaverse renders for {path}"
+                        )
+                    rgbs, depths, c2ws, view_params = self.gobjaverse_gt.load(path)
                 else:
-                    rgbs, depths, c2ws, view_params = self.gt_renderer.get_or_render(path)
+                    surface = self.loader(path)
+                    if self.require_cached_gt:
+                        rgbs, depths, c2ws, view_params = self.gt_renderer.load_cached(path)
+                    else:
+                        rgbs, depths, c2ws, view_params = self.gt_renderer.get_or_render(path)
                 out: Dict = {
                     'surface': surface.squeeze(0),   # (N, 9) — DataLoader adds batch dim
                     'rgbs': rgbs,
@@ -1141,8 +1221,32 @@ def train(args):
             args.freeze_transformer,
         )
 
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info(f"ShapeGSAE: {total_params / 1e6:.1f}M trainable parameters")
+    if args.train_encoder_rgb_proj:
+        rgb_proj_info = model.setup_trainable_encoder_rgb_input_proj(
+            shapevae_point_feats=int(getattr(args, "shapevae_point_feats", 4)),
+        )
+        logger.info(
+            "Trainable encoder RGB input_proj: cols=%d (start=%d), params=%d",
+            rgb_proj_info["rgb_cols"],
+            rgb_proj_info["rgb_start_col"],
+            rgb_proj_info["rgb_proj_params"],
+        )
+
+    gs_head_params = sum(p.numel() for p in model.gs_head.parameters() if p.requires_grad)
+    enc_params = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
+    other_params = (
+        sum(p.numel() for p in model.parameters() if p.requires_grad)
+        - gs_head_params
+        - enc_params
+    )
+    total_params = gs_head_params + enc_params + other_params
+    logger.info(
+        "ShapeGSAE trainable: %.3fM total (gs_head=%.3fM encoder=%.3fM other=%.3fM)",
+        total_params / 1e6,
+        gs_head_params / 1e6,
+        enc_params / 1e6,
+        other_params / 1e6,
+    )
 
     # ---- Renderer & Loss ----
     renderer = GaussianRenderer(
@@ -1167,7 +1271,7 @@ def train(args):
     )
 
     # ---- Data ----
-    dataset = MeshDataset(
+    dataset_kwargs = dict(
         data_dir=args.data_dir,
         pc_size=args.pc_size,
         pc_sharpedge_size=args.pc_sharpedge_size,
@@ -1184,8 +1288,12 @@ def train(args):
         use_experiment_manifest=not args.no_experiment_manifest,
         seed=args.seed,
         include_sharp_label=include_sharp_label,
+        gt_source=args.gt_source,
+        gobjaverse_render_root=args.gobjaverse_render_root,
+        gobjaverse_num_views=args.gobjaverse_num_views,
     )
-    views_loaded = int(dataset.gt_renderer.num_views)
+    dataset = MeshDataset(**dataset_kwargs)
+    views_loaded = int(dataset.num_gt_views)
     views_per_step_cfg = (
         views_loaded if args.views_per_step is None else max(1, int(args.views_per_step))
     )
@@ -1218,15 +1326,24 @@ def train(args):
         precache_full_views=False,
         require_cached_gt=not args.allow_on_the_fly_gt,
         use_experiment_manifest=not args.no_experiment_manifest,
-        train_view_indices=list(range(CANONICAL_EVAL_NUM_VIEWS)),
         seed=args.seed,
         include_sharp_label=include_sharp_label,
+        gt_source=args.gt_source,
+        gobjaverse_render_root=args.gobjaverse_render_root,
+        gobjaverse_num_views=CANONICAL_EVAL_NUM_VIEWS,
     )
+    if dataset.gt_source == "shapenet":
+        canonical_eval_kwargs["train_view_indices"] = list(range(CANONICAL_EVAL_NUM_VIEWS))
+
+    eval_max_items = args.max_eval_items
+    if eval_max_items is None:
+        eval_max_items = args.max_items
 
     train_eval_dataset = None
     if args.num_train_eval_samples > 0:
         train_eval_dataset = MeshDataset(
             data_dir=args.data_dir,
+            max_items=eval_max_items,
             **canonical_eval_kwargs,
         )
         logger.info(
@@ -1239,6 +1356,7 @@ def train(args):
     if args.val_dir:
         val_dataset = MeshDataset(
             data_dir=args.val_dir,
+            max_items=eval_max_items,
             **canonical_eval_kwargs,
         )
         logger.info(
@@ -1341,6 +1459,10 @@ def train(args):
             logger.warning("Could not restore scheduler state (%s); using fresh schedule", exc)
         global_step = ckpt['step']
         logger.info(f"Resumed from step {global_step}")
+        if args.train_encoder_rgb_proj:
+            model.setup_trainable_encoder_rgb_input_proj(
+                shapevae_point_feats=int(getattr(args, "shapevae_point_feats", 4)),
+            )
 
     # ---- Optional Weights & Biases ----
     use_wandb = bool(args.use_wandb)
@@ -1379,6 +1501,7 @@ def train(args):
             gt_rgbs = batch['rgbs']     # list of (B, H, W, 3)
             gt_depths = batch['depths'] # list of (B, H, W, 1)
             c2ws = batch['c2ws']        # list of (B, 4, 4)
+            view_params_list = batch.get('view_params')
 
             # Forward pass (encode+decode so anchor deltas are available for regularisation)
             latents, query_positions = model.encode(surface)
@@ -1421,10 +1544,15 @@ def train(args):
                     gt_rgb_b = gt_rgbs[view_idx][b:b + 1].to(device)       # (1, H, W, 3)
                     gt_depth_b = gt_depths[view_idx][b:b + 1].to(device)   # (1, H, W, 1)
                     c2w_b = c2ws[view_idx][b].to(device)
+                    vp = view_params_list[view_idx] if view_params_list else None
 
                     out = renderer(
                         means[b], scales[b], rotations[b],
                         opacities[b], sh_coeffs[b], c2w_b,
+                        fx=vp.get('fx') if vp else None,
+                        fy=vp.get('fy') if vp else None,
+                        cx=vp.get('cx') if vp else None,
+                        cy=vp.get('cy') if vp else None,
                     )
                     pred_rgb = out['rgb'].unsqueeze(0)      # (1, H, W, 3)
                     pred_depth = out['depth'].unsqueeze(0)  # (1, H, W, 1)
@@ -1633,6 +1761,12 @@ def parse_args():
                         'GT RGBD must be pre-cached with same camera settings.')
     p.add_argument('--max_items', type=int, default=None,
                    help='Cap dataset size (useful for debugging)')
+    p.add_argument(
+        '--max_eval_items',
+        type=int,
+        default=None,
+        help='Cap train-eval/val dataset size. Default: same as --max_items when set.',
+    )
     p.add_argument('--mesh_blacklist', type=str, default=None,
                    help='Path to a text file listing mesh paths to exclude (one per line).')
     p.add_argument('--categories', type=str, default=None,
@@ -1641,6 +1775,27 @@ def parse_args():
                         'Folders are kept iff their name starts with "<synset_id>_". '
                         'Known names: ' + ', '.join(sorted(CATEGORY_NAME_TO_ID)) +
                         '. Default: no filtering.')
+    p.add_argument(
+        '--gt_source',
+        type=str,
+        default=None,
+        choices=('shapenet', 'gobjaverse'),
+        help='Ground-truth source. Default: read from manifest.json or "shapenet".',
+    )
+    p.add_argument(
+        '--gobjaverse_render_root',
+        type=str,
+        default=None,
+        help='Root of G-Objaverse pre-rendered views (partition/index/...). '
+             'Default: manifest render_root or GOBJAVERSE_RENDER_ROOT.',
+    )
+    p.add_argument(
+        '--gobjaverse_num_views',
+        type=int,
+        default=None,
+        help=f'Number of G-Objaverse views to load (max {GOBJAVERSE_NUM_VIEWS}). '
+             'Default: --num_views or all {GOBJAVERSE_NUM_VIEWS} views.',
+    )
 
     # Model
     p.add_argument('--num_latents', type=int, default=2048)
@@ -1701,6 +1856,15 @@ def parse_args():
                    help='Freeze bottleneck after pretrained load (Phase 1).')
     p.add_argument('--freeze_transformer', action='store_true',
                    help='Freeze transformer after pretrained load (Phase 1).')
+    p.add_argument(
+        '--train_encoder_rgb_proj',
+        action='store_true',
+        help=(
+            'Train only the RGB feature columns of encoder.input_proj (geometry encoder '
+            'stays frozen). Use with --freeze_encoder for Phase-1-style runs that also '
+            'learn the added RGB input path.'
+        ),
+    )
     p.add_argument('--encoder_lr_scale', type=float, default=1.0,
                    help='LR multiplier for encoder+bottleneck (Phase 2 finetune).')
     p.add_argument('--transformer_lr_scale', type=float, default=1.0,
@@ -1714,8 +1878,10 @@ def parse_args():
     p.add_argument(
         '--num_views', type=int, default=14,
         help=(
-            f'Number of v46-staggered training views per step. Snapped to one of '
-            f'{list(VIEW46_TRAIN_ALLOWED)}. Validation always uses 6 canonical views.'
+            f'Number of training views per object. ShapeNet: snapped to one of '
+            f'{list(VIEW46_TRAIN_ALLOWED)}. G-Objaverse: first N of '
+            f'{GOBJAVERSE_NUM_VIEWS} views (from manifest when gt_source=gobjaverse). '
+            f'Validation always uses {CANONICAL_EVAL_NUM_VIEWS} views.'
         ),
     )
     p.add_argument(
