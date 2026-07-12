@@ -30,6 +30,43 @@ GOBJAVERSE_NUM_VIEWS: int = 40
 GOBJAVERSE_GT_TAG: str = "gobjaverse_unity_rgbd"
 GOBJAVERSE_VIEW_LAYOUT: str = "gobjaverse40"
 
+
+def gobjaverse_eval_view_indices(num_loaded_views: int) -> List[int]:
+    """Spread eval views for G-Objaverse periodic / offline evaluation.
+
+    The first views in the G-Objaverse layout are nearly identical (small
+    azimuth steps), so scoring only views 0..5 overestimates quality.  This
+    picks ~10 well-separated views from a 38-view training set:
+
+    * Every 5th view in the first 25 (1-based views 1, 6, 11, 16, 21)
+    * Views 26 and 27
+    * Views 28, 34, and 38 from the tail
+
+    Indices are 0-based; view numbers above are 1-based as stored on disk.
+    """
+    if num_loaded_views <= 0:
+        return []
+
+    indices: List[int] = []
+    # First 25 views (0..24): every 5th starting at 0
+    indices.extend(range(0, min(25, num_loaded_views), 5))
+    # Views 26-27 (indices 25-26)
+    for i in (25, 26):
+        if i < num_loaded_views:
+            indices.append(i)
+    # Views 28, 34, 38 → indices 27, 33, 37
+    for i in (27, 33, 37):
+        if i < num_loaded_views:
+            indices.append(i)
+
+    seen: set[int] = set()
+    out: List[int] = []
+    for i in indices:
+        if i not in seen:
+            seen.add(i)
+            out.append(i)
+    return out
+
 # RichDreamer depth_warp_example near-plane heuristic (sqrt(3)/2 in unit cube).
 _GOBJAVERSE_NEAR_MARGIN: float = math.sqrt(3.0) * 0.5
 

@@ -50,6 +50,7 @@ from hy3dgen.shapegen.gobjaverse_gt import (
     GOBJAVERSE_NUM_VIEWS,
     GOBJAVERSE_VIEW_LAYOUT,
     GObjaverseGTSource,
+    gobjaverse_eval_view_indices,
 )
 from hy3dgen.shapegen.gs_renderer import (
     GT_CACHE_TAG_V46,
@@ -178,10 +179,32 @@ def debug_gt_cache_path(mesh_path: str, debug_root: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Periodic canonical eval (6 v46 views)
+# Periodic eval views (ShapeNet: 6 canonical v46; G-Objaverse: spread subset)
 # ---------------------------------------------------------------------------
 
-CANONICAL_EVAL_NUM_VIEWS = 6
+SHAPENET_CANONICAL_EVAL_NUM_VIEWS = 6
+
+
+def periodic_eval_view_indices(gt_source: str, num_training_views: int) -> List[int]:
+    """View indices for fast periodic train/val eval during training."""
+    if gt_source == "gobjaverse":
+        return gobjaverse_eval_view_indices(num_training_views)
+    return list(range(min(SHAPENET_CANONICAL_EVAL_NUM_VIEWS, num_training_views)))
+
+
+def _posterior_latent_stats(posterior) -> Dict[str, float]:
+    """Scalar VAE posterior diagnostics for logging / wandb."""
+    with torch.no_grad():
+        mean_mu_sq = posterior.mean.pow(2).mean()
+        mean_var = posterior.var.mean()
+        mean_logvar = posterior.logvar.mean()
+        kl_raw = posterior.kl(dims=(1, 2)).mean()
+    return {
+        "mean_mu_sq": float(mean_mu_sq.item()),
+        "mean_var": float(mean_var.item()),
+        "mean_logvar": float(mean_logvar.item()),
+        "kl_raw": float(kl_raw.item()),
+    }
 
 
 def _nan_eval_metrics(prefix: str) -> Dict[str, float]:
@@ -203,11 +226,16 @@ def run_canonical_eval(
     num_samples: int,
     prefix: str,
     lpips_net=None,
+    sample_posterior: bool = False,
 ) -> Dict[str, float]:
-    """Evaluate on a subset of meshes using the 6 canonical v46 views only.
+    """Evaluate on a subset of meshes using the dataset's loaded eval views.
+
+    For G-Objaverse this is the spread subset from
+    :func:`gobjaverse_eval_view_indices`; for ShapeNet v46 it is the first six
+    canonical views.
 
     ``{prefix}/psnr`` is full-image PSNR (``psnr_full``), matching
-    ``evaluate_gs_ae.py`` summary.csv canonical scores.
+    ``evaluate_gs_ae.py`` summary.csv scores.
     ``{prefix}/psnr_fg`` is foreground-only PSNR for diagnostics.
     """
     if num_samples <= 0 or eval_dataset is None or len(eval_dataset) == 0:
@@ -226,16 +254,16 @@ def run_canonical_eval(
             continue
 
         surface = sample['surface'].unsqueeze(0).to(device)
-        latents, query_positions = model.encode(surface)
+        latents, query_positions = model.encode(
+            surface, sample_posterior=sample_posterior,
+        )
         means, scales, rotations, opacities, sh_coeffs = model.decode(
             latents, query_positions,
         )
-        gt_rgbs = sample['rgbs'][:CANONICAL_EVAL_NUM_VIEWS]
-        gt_depths = sample['depths'][:CANONICAL_EVAL_NUM_VIEWS]
-        c2ws = sample['c2ws'][:CANONICAL_EVAL_NUM_VIEWS]
+        gt_rgbs = sample['rgbs']
+        gt_depths = sample['depths']
+        c2ws = sample['c2ws']
         view_params = sample.get('view_params')
-        if view_params is not None:
-            view_params = view_params[:CANONICAL_EVAL_NUM_VIEWS]
         means = means[0]
         scales = scales[0]
         rotations = rotations[0]
@@ -777,13 +805,25 @@ class MeshDataset(Dataset):
                 )
             mesh_map = manifest.get("mesh_to_gobjaverse_id") or {}
             n_views = gobjaverse_num_views if gobjaverse_num_views is not None else num_views
-            self.gobjaverse_gt = GObjaverseGTSource(
-                render_root=str(render_root),
-                mesh_to_gobjaverse_id=mesh_map,
-                height=render_height,
-                width=render_width,
-                num_views=n_views,
+            self._train_view_indices = (
+                None if train_view_indices is None else [int(i) for i in train_view_indices]
             )
+            if self._train_view_indices is not None:
+                self.gobjaverse_gt = GObjaverseGTSource(
+                    render_root=str(render_root),
+                    mesh_to_gobjaverse_id=mesh_map,
+                    height=render_height,
+                    width=render_width,
+                    view_indices=self._train_view_indices,
+                )
+            else:
+                self.gobjaverse_gt = GObjaverseGTSource(
+                    render_root=str(render_root),
+                    mesh_to_gobjaverse_id=mesh_map,
+                    height=render_height,
+                    width=render_width,
+                    num_views=n_views,
+                )
             logger.info(
                 "GT source: G-Objaverse (%d views, render_root=%s, tag=%s)",
                 self.gobjaverse_gt.num_views,
@@ -791,6 +831,9 @@ class MeshDataset(Dataset):
                 GOBJAVERSE_GT_TAG,
             )
         else:
+            self._train_view_indices = (
+                None if train_view_indices is None else [int(i) for i in train_view_indices]
+            )
             if train_view_indices is not None:
                 train_idx: Optional[List[int]] = list(train_view_indices)
                 logger.info(
@@ -1147,6 +1190,14 @@ def train(args):
             "Stochastic encoder (--no-deterministic_encoder): fresh point subsample "
             "and FPS random_start=True each forward pass."
         )
+    if args.sample_posterior:
+        logger.info(
+            "VAE encode: posterior sampling enabled (Hunyuan ShapeVAE default)."
+        )
+    else:
+        logger.info("VAE encode: posterior mode (mean) — deterministic latents.")
+    if args.lambda_kl > 0:
+        logger.info("KL regularizer enabled: lambda_kl=%g", args.lambda_kl)
     if args.seed is not None:
         logger.info(
             "Input surfaces: per-mesh subsample seeded from global seed=%d, "
@@ -1176,7 +1227,15 @@ def train(args):
         sh_degree=args.sh_degree,
         max_anchor_delta=args.max_anchor_delta,
         qk_norm=getattr(args, "qk_norm", False),
+        qkv_bias=getattr(args, "qkv_bias", True),
+        include_pi=getattr(args, "include_pi", True),
     ).to(device)
+
+    profile_name = getattr(args, "pretrained_profile", "none") or "none"
+    if profile_name != "none":
+        from hy3dgen.shapegen.pretrained_profiles import assert_arch_matches_profile
+        assert_arch_matches_profile(model, profile_name)
+        logger.info("Architecture check passed for profile '%s'", profile_name)
 
     pretrained_load = getattr(args, "pretrained_load", "none") or "none"
     if pretrained_load != "none" and not args.resume_ckpt:
@@ -1203,6 +1262,7 @@ def train(args):
             subfolder=args.pretrained_subfolder or "hunyuan3d-vae-v2-mini-withencoder",
             shapevae_point_feats=int(getattr(args, "shapevae_point_feats", 4)),
             use_safetensors=bool(getattr(args, "use_safetensors", False)),
+            strict_geometry=bool(getattr(args, "strict_pretrained_load", True)),
         )
     elif args.shapevae_ckpt:
         logger.info(f"Warm-starting encoder from {args.shapevae_ckpt}")
@@ -1313,13 +1373,20 @@ def train(args):
         drop_last=True,
     )
 
-    # ---- Optional eval datasets (canonical views only, for fast periodic eval) ----
+    # ---- Optional eval datasets (spread G-Objaverse views / ShapeNet canonical) ----
+    n_training_views = (
+        (args.gobjaverse_num_views or args.num_views)
+        if args.gt_source == "gobjaverse"
+        else args.num_views
+    )
+    eval_view_indices = periodic_eval_view_indices(args.gt_source, n_training_views)
+
     canonical_eval_kwargs = dict(
         pc_size=args.pc_size,
         pc_sharpedge_size=args.pc_sharpedge_size,
         render_height=args.render_height,
         render_width=args.render_width,
-        num_views=CANONICAL_EVAL_NUM_VIEWS,
+        num_views=n_training_views,
         camera_distance=args.camera_distance,
         elevation_deg=args.elevation_deg,
         categories=categories,
@@ -1330,10 +1397,11 @@ def train(args):
         include_sharp_label=include_sharp_label,
         gt_source=args.gt_source,
         gobjaverse_render_root=args.gobjaverse_render_root,
-        gobjaverse_num_views=CANONICAL_EVAL_NUM_VIEWS,
     )
-    if dataset.gt_source == "shapenet":
-        canonical_eval_kwargs["train_view_indices"] = list(range(CANONICAL_EVAL_NUM_VIEWS))
+    if args.gt_source == "gobjaverse":
+        canonical_eval_kwargs["train_view_indices"] = eval_view_indices
+    elif dataset.gt_source == "shapenet":
+        canonical_eval_kwargs["train_view_indices"] = eval_view_indices
 
     eval_max_items = args.max_eval_items
     if eval_max_items is None:
@@ -1347,9 +1415,11 @@ def train(args):
             **canonical_eval_kwargs,
         )
         logger.info(
-            "Train eval: up to %d meshes from %s (6 canonical views)",
+            "Train eval: up to %d meshes from %s (%d eval views: %s)",
             args.num_train_eval_samples,
             args.data_dir,
+            len(eval_view_indices),
+            eval_view_indices,
         )
 
     val_dataset = None
@@ -1360,9 +1430,11 @@ def train(args):
             **canonical_eval_kwargs,
         )
         logger.info(
-            "Val eval: up to %d meshes from %s (6 canonical views)",
+            "Val eval: up to %d meshes from %s (%d eval views: %s)",
             args.num_val_samples,
             args.val_dir,
+            len(eval_view_indices),
+            eval_view_indices,
         )
 
     run_periodic_eval = (
@@ -1504,7 +1576,11 @@ def train(args):
             view_params_list = batch.get('view_params')
 
             # Forward pass (encode+decode so anchor deltas are available for regularisation)
-            latents, query_positions = model.encode(surface)
+            latents, query_positions, posterior = model.encode(
+                surface,
+                sample_posterior=args.sample_posterior,
+                return_posterior=True,
+            )
             means, scales, rotations, opacities, sh_coeffs = model.decode(
                 latents, query_positions,
             )
@@ -1613,6 +1689,14 @@ def train(args):
                     if k != "total":
                         _accum_train_log(log_components, k, v)
 
+            if args.lambda_kl > 0:
+                kl = posterior.kl(dims=(1, 2))
+                kl_loss = kl.mean() * args.lambda_kl
+                total_loss = total_loss + kl_loss
+                _accum_train_log(log_components, "kl", kl_loss.detach())
+
+            latent_stats = _posterior_latent_stats(posterior)
+
             grad_norms: Optional[Dict[str, float]] = None
             if grad_components is not None:
                 grad_norms = _compute_loss_grad_norms(
@@ -1642,8 +1726,15 @@ def train(args):
 
                 elapsed = time.time() - t0
                 parts = ' | '.join(f"{k}={v:.4f}" for k, v in log_floats.items())
+                latent_str = (
+                    f"mu_sq={latent_stats['mean_mu_sq']:.4f} "
+                    f"var={latent_stats['mean_var']:.4f} "
+                    f"logvar={latent_stats['mean_logvar']:.4f} "
+                    f"kl_raw={latent_stats['kl_raw']:.4f}"
+                )
                 logger.info(
                     f"step={global_step:06d} | lr={lr:.2e} | {parts} | "
+                    f"latent {latent_str} | "
                     f"data={t_data_end - t_data_start:.2f}s | "
                     f"fwd+bwd={t_step_end - t_fwd_start:.2f}s | "
                     f"{elapsed / global_step:.2f}s/step"
@@ -1654,21 +1745,27 @@ def train(args):
                         grad_norm_preclip.detach().item()
                         if torch.is_tensor(grad_norm_preclip) else grad_norm_preclip
                     )
-                    mean_drift_l2 = float(pos_deltas.detach().norm(dim=-1).mean().item())
                     wandb_log: Dict[str, float] = {
-                        "train/grad_norm": grad_norm_val,
-                        "train/mean_drift_l2": mean_drift_l2,
+                        "optim/lr": lr,
+                        "grad_norm/total": grad_norm_val,
                     }
                     if grad_norms is not None:
                         for term_name, gn in grad_norms.items():
                             wandb_log[f"grad_norm/{term_name}"] = gn
-                    for k in ("scale_reg", "opa_reg", "delta_reg"):
+                    for k in ("scale_reg", "opa_reg", "delta_reg", "kl"):
                         if k in log_floats:
-                            wandb_log[f"train/{k}"] = log_floats[k]
+                            wandb_log[f"loss/{k}"] = log_floats[k]
+                    for stat_key, wandb_key in (
+                        ("mean_mu_sq", "latent/mean_mu_sq"),
+                        ("mean_var", "latent/mean_var"),
+                        ("mean_logvar", "latent/mean_logvar"),
+                        ("kl_raw", "latent/kl_raw"),
+                    ):
+                        wandb_log[wandb_key] = latent_stats[stat_key]
                     for k in (args.rgb_loss_type, "ssim", "lpips", "depth", "alpha_sup"):
                         if k in log_floats:
-                            wandb_log[f"train/{k}"] = log_floats[k]
-                    wandb_log["train/total_loss"] = float(total_loss.detach().item())
+                            wandb_log[f"loss/{k}"] = log_floats[k]
+                    wandb_log["loss/total"] = float(total_loss.detach().item())
                     wandb.log(wandb_log, step=global_step)
 
             # Periodic canonical eval (train + val subsets)
@@ -1683,6 +1780,7 @@ def train(args):
                         num_samples=args.num_train_eval_samples,
                         prefix='train',
                         lpips_net=lpips_eval_net,
+                        sample_posterior=args.eval_sample_posterior,
                     ))
                 if val_dataset is not None and args.num_val_samples > 0:
                     val_metrics = run_canonical_eval(
@@ -1690,6 +1788,7 @@ def train(args):
                         num_samples=args.num_val_samples,
                         prefix='val',
                         lpips_net=lpips_eval_net,
+                        sample_posterior=args.eval_sample_posterior,
                     )
                     eval_metrics.update(val_metrics)
 
@@ -1814,7 +1913,7 @@ def parse_args():
         '--sh_degree',
         type=int,
         default=1,
-        choices=(0, 1),
+        choices=(0, 1, 2),
         help='SH degree for view-dependent color (0=flat RGB, 1=SH1).',
     )
     p.add_argument('--shapevae_ckpt', type=str, default=None,
@@ -1823,8 +1922,8 @@ def parse_args():
         '--pretrained_profile',
         type=str,
         default='none',
-        choices=('none', 'hunyuan_mini'),
-        help='Apply Hunyuan-mini architecture + 10ch surface layout (scratch default: none).',
+        choices=('none', 'hunyuan_mini', 'hunyuan_full'),
+        help='Apply Hunyuan architecture + 10ch surface layout (scratch default: none).',
     )
     p.add_argument(
         '--include_sharp_label',
@@ -1870,7 +1969,36 @@ def parse_args():
     p.add_argument('--transformer_lr_scale', type=float, default=1.0,
                    help='LR multiplier for transformer (Phase 2 finetune).')
     p.add_argument('--qk_norm', action=argparse.BooleanOptionalAction, default=False,
-                   help='QK norm in encoder/transformer (auto-set by hunyuan_mini profile).')
+                   help='QK norm in encoder/transformer (auto-set by profile).')
+    p.add_argument(
+        '--qkv_bias',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            'Bias on QKV attention projections.  True = PyTorch default; '
+            'False = Hunyuan3D-2 full config.  Auto-set by --pretrained_profile.'
+        ),
+    )
+    p.add_argument(
+        '--include_pi',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            'Multiply Fourier frequencies by π in the point embedder.  '
+            'True = PyTorch default; False = Hunyuan3D-2 config.  '
+            'Auto-set by --pretrained_profile.'
+        ),
+    )
+    p.add_argument(
+        '--strict_pretrained_load',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            'Raise an error if the encoder or transformer has any missing / unexpected '
+            'keys after loading pretrained weights (default True).  '
+            'Use --no-strict_pretrained_load only for debugging legacy checkpoints.'
+        ),
+    )
 
     # Rendering
     p.add_argument('--render_height', type=int, default=512)
@@ -1881,7 +2009,7 @@ def parse_args():
             f'Number of training views per object. ShapeNet: snapped to one of '
             f'{list(VIEW46_TRAIN_ALLOWED)}. G-Objaverse: first N of '
             f'{GOBJAVERSE_NUM_VIEWS} views (from manifest when gt_source=gobjaverse). '
-            f'Validation always uses {CANONICAL_EVAL_NUM_VIEWS} views.'
+            'Validation uses a spread G-Objaverse view subset (or 6 ShapeNet canonical views).'
         ),
     )
     p.add_argument(
@@ -1904,6 +2032,31 @@ def parse_args():
         '--no_experiment_manifest',
         action='store_true',
         help='Scan data_dir for symlinks instead of reading experiment manifest.json.',
+    )
+
+    # VAE bottleneck (Hunyuan ShapeVAE pre_kl / post_kl)
+    p.add_argument(
+        '--sample_posterior',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Sample from the VAE posterior during training (matches ShapeVAE.encode). '
+             'Use --no-sample_posterior for deterministic mean latents.',
+    )
+    p.add_argument(
+        '--eval_sample_posterior',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help='Sample from the VAE posterior during periodic eval (default: posterior mode).',
+    )
+    p.add_argument(
+        '--lambda_kl',
+        type=float,
+        default=0.0,
+        help=(
+            'Weight on the VAE KL term (standard Gaussian prior). 0 disables KL loss. '
+            'Hunyuan ShapeVAE was trained with L = L_recon + gamma * L_KL (paper Eq. 1); '
+            'gamma is not published numerically — try 1e-4 to 1e-3.'
+        ),
     )
 
     # Encoder behaviour
@@ -1983,9 +2136,9 @@ def parse_args():
     p.add_argument('--val_every', type=int, default=2000,
                    help='Run canonical eval every N steps (train and/or val subsets).')
     p.add_argument('--num_val_samples', type=int, default=20,
-                   help='Max val meshes per eval pass (6 canonical views each).')
+                   help='Max val meshes per eval pass (spread eval views for G-Objaverse).')
     p.add_argument('--num_train_eval_samples', type=int, default=0,
-                   help='Max train meshes per eval pass (6 canonical views each). '
+                   help='Max train meshes per eval pass (spread eval views for G-Objaverse). '
                         '0 disables train-subset eval.')
     p.add_argument('--early_stopping', action='store_true',
                    help='Stop when --early_stopping_metric stops improving on the val subset.')

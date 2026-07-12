@@ -32,14 +32,14 @@ Usage — evaluate a single checkpoint on training data (overfit test)
         --num_samples 10 --shuffle \\
         --categories chair
 
-Per checkpoint, evaluates two view sets:
+Per checkpoint, evaluates view splits:
 
-  * **canonical** — always the first 6 views (indices 0..5)
-  * **holdout** — ShapeNet v46: elevation grid rows 1–2 (16 views); G-Objaverse:
-    all remaining loaded views (indices 6..N-1)
+  * **train** (G-Objaverse, ``--match_training``) — all loaded training views
+  * **spread** (G-Objaverse, ``--no-match_training``) — ~10 well-separated views
+  * **canonical** / **holdout** (ShapeNet v46) — first 6 views + grid holdout rows
 
-Saves separate visuals/metrics (``*_canonical`` / ``*_holdout``).
-Summary CSV uses ``canonical/holdout`` slash format per metric.
+Saves separate visuals/metrics per split name.
+Summary CSV uses ``spread`` or ``canonical/holdout`` format per metric.
 
 G-Objaverse: pass ``--data_dir`` to ``.../furniture_351/val``; ``gt_source`` is
 read from manifest / checkpoint. ShapeNet: unchanged v46 GT cache path.
@@ -82,6 +82,7 @@ from hy3dgen.shapegen.gs_export import (
 from hy3dgen.shapegen.gobjaverse_gt import (
     GOBJAVERSE_GT_TAG,
     GOBJAVERSE_NUM_VIEWS,
+    gobjaverse_eval_view_indices,
     normalize_mesh_gobjaverse,
 )
 from hy3dgen.shapegen.gs_renderer import (
@@ -125,6 +126,8 @@ CHECKPOINT_ARCH_KEYS = (
     "num_gs_per_anchor",
     "point_feats",
     "qk_norm",
+    "qkv_bias",
+    "include_pi",
     "pretrained_profile",
     "include_sharp_label",
     "gt_source",
@@ -432,16 +435,19 @@ def _eval_view_splits(
 
     When ``match_training`` and G-Objaverse, score all loaded training views
     (same set as ``MeshDataset`` / ``views_per_step`` sampling pool).
-    Otherwise use ShapeNet v46 canonical (6) + holdout split.
+    Otherwise G-Objaverse uses the spread eval subset from
+    :func:`gobjaverse_eval_view_indices`; ShapeNet uses v46 canonical (6) +
+    holdout split.
     """
     if match_training and gt_source == "gobjaverse":
         return {"train": list(range(num_loaded_views))}
 
-    canonical = [i for i in CANONICAL_VIEW_INDICES_V46 if i < num_loaded_views]
     if gt_source == "gobjaverse":
-        holdout = [i for i in range(6, num_loaded_views)]
-    else:
-        holdout = [i for i in holdout_view_indices_v46() if i < num_loaded_views]
+        spread = gobjaverse_eval_view_indices(num_loaded_views)
+        return {"spread": spread}
+
+    canonical = [i for i in CANONICAL_VIEW_INDICES_V46 if i < num_loaded_views]
+    holdout = [i for i in holdout_view_indices_v46() if i < num_loaded_views]
     return {"canonical": canonical, "holdout": holdout}
 
 
@@ -469,6 +475,10 @@ def load_model(
     )
     point_feats = int(train_args.get("point_feats", getattr(args, "point_feats", 6)))
     qk_norm = bool(train_args.get("qk_norm", getattr(args, "qk_norm", False)))
+    # qkv_bias and include_pi default to True to match old checkpoints that pre-date
+    # these explicit args (those were built with PyTorch Linear bias=True default).
+    qkv_bias = bool(train_args.get("qkv_bias", getattr(args, "qkv_bias", True)))
+    include_pi = bool(train_args.get("include_pi", getattr(args, "include_pi", True)))
     model = ShapeGSAE(
         num_latents=args.num_latents,
         embed_dim=args.embed_dim,
@@ -485,6 +495,8 @@ def load_model(
         sh_degree=sh_degree,
         max_anchor_delta=max_anchor_delta,
         qk_norm=qk_norm,
+        qkv_bias=qkv_bias,
+        include_pi=include_pi,
     ).to(device)
     state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     model.load_state_dict(state, strict=True)
@@ -613,6 +625,7 @@ def evaluate_sample(
     view_splits: Dict[str, List[int]],
     lpips_net=None,
     drift_threshold: float = 0.1,
+    sample_posterior: bool = False,
 ) -> Tuple[Dict[str, float], Dict[str, List[Image.Image]], Dict[str, torch.Tensor]]:
     """Evaluate one or more view index groups from a dataloader sample.
 
@@ -627,7 +640,9 @@ def evaluate_sample(
     view_params_full = sample.get("view_params")
 
     surface = sample["surface"].unsqueeze(0).to(device)
-    latents, query_positions = model.encode(surface)
+    latents, query_positions = model.encode(
+        surface, sample_posterior=sample_posterior,
+    )
     means, scales, rotations, opacities, sh_coeffs, features = model.decode(
         latents, query_positions, return_features=True,
     )
@@ -782,6 +797,7 @@ def evaluate_checkpoint(
             view_splits,
             lpips_net=lpips_net,
             drift_threshold=args.drift_threshold,
+            sample_posterior=bool(getattr(args, "sample_posterior", False)),
         )
 
         gobjaverse_meta = None
@@ -935,8 +951,10 @@ def _summarize_checkpoint_results(
     results: List[Dict],
 ) -> Optional[Dict]:
     """Aggregate per-sample rows into one compact summary dict."""
-    primary_split = "train" if any("psnr_full_train" in r for r in results) else "canonical"
-    secondary_split = None if primary_split == "train" else "holdout"
+    primary_split = "train" if any("psnr_full_train" in r for r in results) else (
+        "spread" if any("psnr_full_spread" in r for r in results) else "canonical"
+    )
+    secondary_split = None if primary_split in ("train", "spread") else "holdout"
     primary_key = f"psnr_full_{primary_split}"
 
     valid = [
@@ -1023,6 +1041,12 @@ def parse_args():
         help="Encoder FPS determinism (overridden by checkpoint args when present).",
     )
     p.add_argument(
+        "--sample_posterior",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Sample from VAE posterior at eval (default: posterior mode / mean).",
+    )
+    p.add_argument(
         "--max_anchor_delta",
         type=float,
         default=None,
@@ -1033,6 +1057,18 @@ def parse_args():
         action=argparse.BooleanOptionalAction,
         default=False,
         help="QK norm (overridden by checkpoint args when present).",
+    )
+    p.add_argument(
+        "--qkv_bias",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="QKV bias on attention projections (overridden by checkpoint args when present).",
+    )
+    p.add_argument(
+        "--include_pi",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fourier embedder π scaling (overridden by checkpoint args when present).",
     )
     p.add_argument(
         "--point_feats",

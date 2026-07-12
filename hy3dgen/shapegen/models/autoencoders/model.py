@@ -322,10 +322,34 @@ class ShapeVAE(VectsetVAE):
 # Point Cloud → 3D Gaussian Splatting Autoencoder
 # ---------------------------------------------------------------------------
 
-class ShapeGSAE(nn.Module):
-    """Deterministic autoencoder: colored point cloud → 3D Gaussian Splatting.
+def _remap_legacy_gsae_state_dict(state_dict: dict, embed_dim: int) -> dict:
+    """Map legacy ``bottleneck_down/up`` keys to Hunyuan ``pre_kl/post_kl``."""
+    out = dict(state_dict)
+    if "bottleneck_down.weight" in out and "pre_kl.weight" not in out:
+        w = out.pop("bottleneck_down.weight")
+        b = out.pop("bottleneck_down.bias", None)
+        pre_w = torch.zeros(embed_dim * 2, w.shape[1], dtype=w.dtype)
+        pre_b = torch.zeros(embed_dim * 2, dtype=w.dtype) if b is not None else None
+        pre_w[:embed_dim] = w
+        if b is not None:
+            pre_b[:embed_dim] = b
+        out["pre_kl.weight"] = pre_w
+        if pre_b is not None:
+            out["pre_kl.bias"] = pre_b
+    if "bottleneck_up.weight" in out and "post_kl.weight" not in out:
+        out["post_kl.weight"] = out.pop("bottleneck_up.weight")
+        if "bottleneck_up.bias" in out:
+            out["post_kl.bias"] = out.pop("bottleneck_up.bias")
+    return out
 
-    Input surface tensor layout: [B, N, 9] = xyz(0:3) | normals(3:6) | rgb(6:9).
+
+class ShapeGSAE(nn.Module):
+    """Colored point cloud → 3D Gaussian Splatting via Hunyuan ShapeVAE bottleneck.
+
+    Uses the same ``pre_kl`` / ``post_kl`` + :class:`DiagonalGaussianDistribution`
+    path as :class:`ShapeVAE` (posterior sample or mode).
+
+    Input surface tensor layout: [B, N, C] = xyz | normals | rgb [| sharp label].
     The first pc_size rows are uniform samples; the next pc_sharpedge_size rows
     are sharp-edge samples (same convention as SharpEdgeSurfaceLoader).
 
@@ -416,9 +440,9 @@ class ShapeGSAE(nn.Module):
             deterministic=deterministic_encoder,
         )
 
-        # Deterministic bottleneck (no KL, no sampling)
-        self.bottleneck_down = nn.Linear(width, embed_dim)
-        self.bottleneck_up = nn.Linear(embed_dim, width)
+        # Hunyuan ShapeVAE bottleneck (mean + logvar → sample / mode)
+        self.pre_kl = nn.Linear(width, embed_dim * 2)
+        self.post_kl = nn.Linear(embed_dim, width)
 
         self.transformer = Transformer(
             n_ctx=num_latents,
@@ -470,21 +494,39 @@ class ShapeGSAE(nn.Module):
     # Core forward methods
     # ------------------------------------------------------------------
 
-    def encode(self, surface: torch.FloatTensor):
+    def encode(
+        self,
+        surface: torch.FloatTensor,
+        sample_posterior: bool = True,
+        *,
+        return_posterior: bool = False,
+    ):
         """Encode a colored surface point cloud to compact latents.
 
+        Matches :meth:`ShapeVAE.encode`: ``pre_kl`` → posterior → sample or mode.
+
         Args:
-            surface: [B, N, 9]  xyz | normals | rgb
+            surface: [B, N, C]  xyz | point features (normals, rgb, …)
+            sample_posterior: if True, draw from the posterior; else use the mean.
+            return_posterior: if True, also return the posterior (for KL loss).
 
         Returns:
             latents        : [B, num_latents, embed_dim]
             query_positions: [B, num_latents, 3]  FPS anchor XYZ coordinates
+            posterior      : optional :class:`DiagonalGaussianDistribution`
         """
         pc = surface[:, :, :3]
-        feats = surface[:, :, 3:]           # normals(3) + rgb(3) = 6 channels
+        feats = surface[:, :, 3:]
         latents, pc_infos = self.encoder(pc, feats)
-        query_positions = pc_infos[0]       # concatenated random + sharpedge FPS queries
-        latents = self.bottleneck_down(latents)
+        query_positions = pc_infos[0]
+        moments = self.pre_kl(latents)
+        posterior = DiagonalGaussianDistribution(moments, feat_dim=-1)
+        if sample_posterior:
+            latents = posterior.sample()
+        else:
+            latents = posterior.mode()
+        if return_posterior:
+            return latents, query_positions, posterior
         return latents, query_positions
 
     def decode(
@@ -512,7 +554,7 @@ class ShapeGSAE(nn.Module):
         where K = num_gs_per_anchor.
         """
         K = self.num_gs_per_anchor
-        latents = self.bottleneck_up(latents)
+        latents = self.post_kl(latents)
         features = self.transformer(latents)         # (B, L, width)
         raw = self.gs_head(features)                 # (B, L, K * raw_dim)
 
@@ -556,18 +598,26 @@ class ShapeGSAE(nn.Module):
             sh_coeffs = pack_sh_coeffs(dc_rgb, sh_rest, sh_degree=self.sh_degree)
         return means, scales, rotations, opacities, sh_coeffs
 
-    def forward(self, surface: torch.FloatTensor):
+    def forward(
+        self,
+        surface: torch.FloatTensor,
+        sample_posterior: bool = True,
+    ):
         """Full encode → decode pass.
 
         Args:
-            surface: [B, N, 9]
+            surface: [B, N, C]
 
         Returns:
             (means, scales, rotations, opacities, sh_coeffs)
             Each has shape [B, num_latents * num_gs_per_anchor, ...].
         """
-        latents, query_positions = self.encode(surface)
+        latents, query_positions = self.encode(surface, sample_posterior=sample_posterior)
         return self.decode(latents, query_positions)
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        state_dict = _remap_legacy_gsae_state_dict(state_dict, self.embed_dim)
+        return super().load_state_dict(state_dict, strict=strict)
 
     # ------------------------------------------------------------------
     # Warm-start from a ShapeVAE geometry-only checkpoint
@@ -674,12 +724,18 @@ class ShapeGSAE(nn.Module):
         subfolder: str = "hunyuan3d-vae-v2-mini-withencoder",
         shapevae_point_feats: int = 4,
         use_safetensors: bool = False,
+        strict_geometry: bool = True,
     ) -> dict:
         """Load Hunyuan ShapeVAE weights into ShapeGSAE (geometry path).
 
         ``input_proj``: copy Fourier + normals + label columns; RGB columns are
-        initialised per ``rgb_feat_init``.  ``pre_kl`` mean half maps to
-        ``bottleneck_down``; ``post_kl`` maps to ``bottleneck_up``.
+        initialised per ``rgb_feat_init``.  ``pre_kl`` and ``post_kl`` load in full.
+
+        ``strict_geometry=True`` (default) raises ``RuntimeError`` when the encoder
+        or transformer has any missing or unexpected keys after loading, which means
+        the model architecture does not exactly match the pretrained checkpoint.
+        Mismatches are always caused by wrong ``qk_norm``, ``qkv_bias``,
+        ``include_pi``, or ``num_decoder_layers``; fix those flags and retry.
         """
         ckpt = self._load_shapevae_state_dict(
             ckpt_or_repo,
@@ -713,27 +769,51 @@ class ShapeGSAE(nn.Module):
             missing, unexpected = self.encoder.load_state_dict(enc_ckpt, strict=False)
             report["encoder_missing"] = len(missing)
             report["encoder_unexpected"] = len(unexpected)
-            logger.info(
-                "Loaded pretrained encoder — %d missing, %d unexpected keys",
-                len(missing),
-                len(unexpected),
-            )
+            if missing or unexpected:
+                msg = (
+                    f"Pretrained encoder load mismatch — "
+                    f"{len(missing)} missing: {missing}  |  "
+                    f"{len(unexpected)} unexpected: {unexpected}\n"
+                    "Common causes: wrong qk_norm / qkv_bias / include_pi flags.  "
+                    "These must exactly match the pretrained config.yaml."
+                )
+                if strict_geometry:
+                    raise RuntimeError(msg)
+                logger.warning(msg)
+            else:
+                logger.info("Loaded pretrained encoder — perfect match (0 missing, 0 unexpected)")
 
         if load_bottleneck:
-            if "pre_kl.weight" in ckpt:
-                self.bottleneck_down.weight.data.copy_(ckpt["pre_kl.weight"][: self.embed_dim])
-            if "pre_kl.bias" in ckpt:
-                self.bottleneck_down.bias.data.copy_(ckpt["pre_kl.bias"][: self.embed_dim])
+            pre_keys = {k: v for k, v in ckpt.items() if k.startswith("pre_kl.")}
+            if pre_keys:
+                pre_ckpt = {k[len("pre_kl.") :]: v for k, v in pre_keys.items()}
+                missing, unexpected = self.pre_kl.load_state_dict(pre_ckpt, strict=False)
+                if missing or unexpected:
+                    msg = (
+                        f"Pretrained pre_kl load mismatch — "
+                        f"{len(missing)} missing: {missing}  |  "
+                        f"{len(unexpected)} unexpected: {unexpected}"
+                    )
+                    if strict_geometry:
+                        raise RuntimeError(msg)
+                    logger.warning(msg)
+                else:
+                    logger.info("Loaded pretrained pre_kl — perfect match")
             post_keys = {k: v for k, v in ckpt.items() if k.startswith("post_kl.")}
             if post_keys:
                 post_ckpt = {k[len("post_kl.") :]: v for k, v in post_keys.items()}
-                missing, unexpected = self.bottleneck_up.load_state_dict(post_ckpt, strict=False)
-                logger.info(
-                    "Loaded pretrained bottleneck — down from pre_kl mean, up from post_kl "
-                    "(%d missing, %d unexpected)",
-                    len(missing),
-                    len(unexpected),
-                )
+                missing, unexpected = self.post_kl.load_state_dict(post_ckpt, strict=False)
+                if missing or unexpected:
+                    msg = (
+                        f"Pretrained post_kl load mismatch — "
+                        f"{len(missing)} missing: {missing}  |  "
+                        f"{len(unexpected)} unexpected: {unexpected}"
+                    )
+                    if strict_geometry:
+                        raise RuntimeError(msg)
+                    logger.warning(msg)
+                else:
+                    logger.info("Loaded pretrained post_kl — perfect match")
 
         if load_transformer:
             tr_ckpt = {
@@ -745,11 +825,21 @@ class ShapeGSAE(nn.Module):
                 missing, unexpected = self.transformer.load_state_dict(tr_ckpt, strict=False)
                 report["transformer_missing"] = len(missing)
                 report["transformer_unexpected"] = len(unexpected)
-                logger.info(
-                    "Loaded pretrained transformer — %d missing, %d unexpected keys",
-                    len(missing),
-                    len(unexpected),
-                )
+                if missing or unexpected:
+                    msg = (
+                        f"Pretrained transformer load mismatch — "
+                        f"{len(missing)} missing: {missing}  |  "
+                        f"{len(unexpected)} unexpected: {unexpected}\n"
+                        "Common causes: wrong num_decoder_layers / qk_norm / qkv_bias.  "
+                        "These must exactly match the pretrained config.yaml."
+                    )
+                    if strict_geometry:
+                        raise RuntimeError(msg)
+                    logger.warning(msg)
+                else:
+                    logger.info(
+                        "Loaded pretrained transformer — perfect match (0 missing, 0 unexpected)"
+                    )
 
         return report
 
@@ -765,9 +855,9 @@ class ShapeGSAE(nn.Module):
             for param in self.encoder.parameters():
                 param.requires_grad = False
         if bottleneck:
-            for param in self.bottleneck_down.parameters():
+            for param in self.pre_kl.parameters():
                 param.requires_grad = False
-            for param in self.bottleneck_up.parameters():
+            for param in self.post_kl.parameters():
                 param.requires_grad = False
         if transformer:
             for param in self.transformer.parameters():
@@ -847,8 +937,8 @@ class ShapeGSAE(nn.Module):
         module_specs = (
             (self.gs_head, 1.0),
             (self.encoder, encoder_lr_scale),
-            (self.bottleneck_down, bottleneck_lr_scale),
-            (self.bottleneck_up, bottleneck_lr_scale),
+            (self.pre_kl, bottleneck_lr_scale),
+            (self.post_kl, bottleneck_lr_scale),
             (self.transformer, transformer_lr_scale),
         )
         for module, scale in module_specs:
