@@ -251,6 +251,7 @@ def train(args: argparse.Namespace) -> None:
         lambda_d=args.lambda_d,
         lambda_alpha=args.lambda_alpha,
         lambda_scale=args.lambda_scale,
+        lambda_scale_max=getattr(args, "lambda_scale_max", 0.0),
         lambda_opa=args.lambda_opa,
         rgb_loss_type=args.rgb_loss_type,
     )

@@ -406,6 +406,7 @@ class ShapeGSAE(nn.Module):
         deterministic_encoder: bool = True,
         sh_degree: int = 1,
         max_anchor_delta: Optional[float] = None,
+        max_log_scale: float = 2.0,
         ckpt_path=None,
     ):
         super().__init__()
@@ -417,6 +418,8 @@ class ShapeGSAE(nn.Module):
         self.latent_shape = (num_latents, embed_dim)
         self.num_gs_per_anchor = num_gs_per_anchor
         self.max_anchor_delta = max_anchor_delta
+        self.max_log_scale = float(max_log_scale)
+        self.min_log_scale = -5.0
         self.sh_degree = int(sh_degree)
         if self.sh_degree < 0:
             raise ValueError(f"sh_degree must be >= 0, got {sh_degree}")
@@ -540,8 +543,9 @@ class ShapeGSAE(nn.Module):
         Args:
             latents         : [B, num_latents, embed_dim]
             query_positions : [B, num_latents, 3]
-            return_features : if True, also return the post-transformer features
-                              (B, num_latents, width) for diagnostics (PCA → RGB).
+            return_features : if True, also return a diagnostics dict with
+                              post-transformer ``features`` and pre-attention
+                              ``latents_pre_attn`` (both ``[B, L, width]``).
 
         Returns:
             means     : [B, num_latents * K, 3]
@@ -549,13 +553,13 @@ class ShapeGSAE(nn.Module):
             rotations : [B, num_latents * K, 4]  (unit quaternion, wxyz)
             opacities : [B, num_latents * K, 1]  (in [0, 1])
             sh_coeffs : [B, num_latents * K, num_sh_bases, 3]  (SH appearance)
-            (optionally) features : [B, num_latents, width] before the GS head
+            (optionally) diagnostics dict when ``return_features`` is True
 
         where K = num_gs_per_anchor.
         """
         K = self.num_gs_per_anchor
-        latents = self.post_kl(latents)
-        features = self.transformer(latents)         # (B, L, width)
+        latents_pre_attn = self.post_kl(latents)
+        features = self.transformer(latents_pre_attn)  # (B, L, width)
         raw = self.gs_head(features)                 # (B, L, K * raw_dim)
 
         B, L, _ = raw.shape
@@ -570,7 +574,10 @@ class ShapeGSAE(nn.Module):
         )
         gaussians = self._parse_gaussians(raw, anchors)
         if return_features:
-            return (*gaussians, features)
+            return (*gaussians, {
+                "features": features,
+                "latents_pre_attn": latents_pre_attn,
+            })
         return gaussians
 
     def _parse_gaussians(self, raw: torch.FloatTensor, query_positions: torch.FloatTensor):
@@ -582,8 +589,10 @@ class ShapeGSAE(nn.Module):
         else:
             pos_delta = raw_delta
         means = query_positions + pos_delta
-        # exp(clamp) keeps scales in (e^-5, e^2) ≈ (0.007, 7.4)
-        scales = torch.exp(raw[..., 3:6].clamp(-5.0, 2.0))
+        # exp(clamp) keeps scales in (e^min_log_scale, e^max_log_scale)
+        scales = torch.exp(
+            raw[..., 3:6].clamp(self.min_log_scale, self.max_log_scale)
+        )
         quat_raw = raw[..., 6:10]
         quat_norm = quat_raw.norm(dim=-1, keepdim=True)
         quat_identity = torch.zeros_like(quat_raw)

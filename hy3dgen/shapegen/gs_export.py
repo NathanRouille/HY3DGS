@@ -202,6 +202,43 @@ def export_xyz_pointcloud_ply(
             ))
 
 
+def export_latent_tokens_pt(
+    path: Union[str, Path],
+    *,
+    query_positions: Union[torch.Tensor, np.ndarray],
+    latents_z: Union[torch.Tensor, np.ndarray],
+    latents_pre_attn: Union[torch.Tensor, np.ndarray],
+    features_post_attn: Union[torch.Tensor, np.ndarray],
+    dc_rgb: Optional[Union[torch.Tensor, np.ndarray]] = None,
+) -> None:
+    """Save per-anchor latent tensors + positions for offline analysis.
+
+    Keys (all float32 CPU):
+      - ``query_positions``: (L, 3) FPS anchors
+      - ``latents_z``: (L, embed_dim) compact VAE latents (diffusion tokens)
+      - ``latents_pre_attn``: (L, width) after ``post_kl``, before transformer
+      - ``features_post_attn``: (L, width) after transformer / before ``gs_head``
+      - ``dc_rgb``: optional (L, 3) mean predicted DC colour per anchor
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _t(x: Union[torch.Tensor, np.ndarray]) -> torch.Tensor:
+        if isinstance(x, torch.Tensor):
+            return x.detach().float().cpu()
+        return torch.from_numpy(np.asarray(x, dtype=np.float32))
+
+    payload = {
+        "query_positions": _t(query_positions),
+        "latents_z": _t(latents_z),
+        "latents_pre_attn": _t(latents_pre_attn),
+        "features_post_attn": _t(features_post_attn),
+    }
+    if dc_rgb is not None:
+        payload["dc_rgb"] = _t(dc_rgb)
+    torch.save(payload, path)
+
+
 def _rgb_to_f_dc(rgb: np.ndarray) -> np.ndarray:
     """Map linear RGB in [0, 1] to 3DGS SH DC coefficients."""
     return ((rgb - 0.5) / SH_C0).astype(np.float32)

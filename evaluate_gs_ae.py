@@ -9,6 +9,8 @@ Evaluates one or more checkpoints on a validation set and produces:
   - Visual comparison grids (GT RGB | Pred RGB | GT depth | Pred depth)
   - Input surface point clouds (``.ply``)
   - FPS encoder anchors / ``query_positions`` (``.ply``)
+  - Anchors coloured by predicted DC RGB and by PCA of latents/features
+  - Per-anchor latent tensors (``.pt``: z, pre-attn, post-attn)
   - Normalized meshes aligned with the dataloader (``.obj``)
   - Predicted 3D Gaussians (standard 3DGS ``.ply`` + ``.splat`` for web viewers)
   - Per-checkpoint ``results.json`` and ``summary.csv`` under ``<output_dir>/<ckpt_tag>/``
@@ -77,6 +79,7 @@ from hy3dgen.shapegen.gs_export import (
     export_gaussian_splat_file,
     export_gaussian_splats_gsplat,
     export_input_surface_ply,
+    export_latent_tokens_pt,
     export_xyz_pointcloud_ply,
 )
 from hy3dgen.shapegen.gobjaverse_gt import (
@@ -91,6 +94,7 @@ from hy3dgen.shapegen.gs_renderer import (
     compute_anchor_drift_metrics,
     expand_anchor_positions,
     holdout_view_indices_v46,
+    sh_dc_to_rgb,
 )
 from hy3dgen.shapegen.eval_metrics import (
     compute_mean_alpha_bg,
@@ -128,6 +132,7 @@ CHECKPOINT_ARCH_KEYS = (
     "qk_norm",
     "qkv_bias",
     "include_pi",
+    "max_log_scale",
     "pretrained_profile",
     "include_sharp_label",
     "gt_source",
@@ -473,6 +478,9 @@ def load_model(
         "max_anchor_delta",
         getattr(args, "max_anchor_delta", None),
     )
+    max_log_scale = float(
+        train_args.get("max_log_scale", getattr(args, "max_log_scale", 2.0))
+    )
     point_feats = int(train_args.get("point_feats", getattr(args, "point_feats", 6)))
     qk_norm = bool(train_args.get("qk_norm", getattr(args, "qk_norm", False)))
     # qkv_bias and include_pi default to True to match old checkpoints that pre-date
@@ -494,6 +502,7 @@ def load_model(
         deterministic_encoder=deterministic_encoder,
         sh_degree=sh_degree,
         max_anchor_delta=max_anchor_delta,
+        max_log_scale=max_log_scale,
         qk_norm=qk_norm,
         qkv_bias=qkv_bias,
         include_pi=include_pi,
@@ -640,11 +649,11 @@ def evaluate_sample(
     view_params_full = sample.get("view_params")
 
     surface = sample["surface"].unsqueeze(0).to(device)
-    latents, query_positions = model.encode(
+    latents_z, query_positions = model.encode(
         surface, sample_posterior=sample_posterior,
     )
-    means, scales, rotations, opacities, sh_coeffs, features = model.decode(
-        latents, query_positions, return_features=True,
+    means, scales, rotations, opacities, sh_coeffs, decode_diag = model.decode(
+        latents_z, query_positions, return_features=True,
     )
     query_positions = query_positions[0]
     means = means[0]
@@ -652,7 +661,14 @@ def evaluate_sample(
     rotations = rotations[0]
     opacities = opacities[0]
     sh_coeffs = sh_coeffs[0]
-    features = features[0]
+    features = decode_diag["features"][0]
+    latents_pre_attn = decode_diag["latents_pre_attn"][0]
+    latents_z = latents_z[0]
+
+    # Mean predicted DC RGB over the K Gaussians sharing each FPS anchor.
+    k = model.num_gs_per_anchor
+    dc_rgb_gs = sh_dc_to_rgb(sh_coeffs[:, 0, :])  # (L*K, 3)
+    dc_rgb_anchors = dc_rgb_gs.view(-1, k, 3).mean(dim=1)  # (L, 3)
 
     flat_metrics: Dict[str, float] = {}
     row_images: Dict[str, List[Image.Image]] = {}
@@ -686,6 +702,9 @@ def evaluate_sample(
         "opacities": opacities.detach().cpu(),
         "sh_coeffs": sh_coeffs.detach().cpu(),
         "features": features.detach().cpu(),
+        "latents_z": latents_z.detach().cpu(),
+        "latents_pre_attn": latents_pre_attn.detach().cpu(),
+        "dc_rgb_anchors": dc_rgb_anchors.detach().cpu(),
     }
     return flat_metrics, row_images, export_tensors
 
@@ -767,6 +786,8 @@ def evaluate_checkpoint(
     input_ply_dir = export_dir / "input_clouds"
     fps_anchors_dir = export_dir / "fps_anchors"
     pca_anchors_dir = export_dir / "fps_anchors_pca"
+    dc_anchors_dir = export_dir / "fps_anchors_dc"
+    latent_tokens_dir = export_dir / "latent_tokens"
     normalized_mesh_dir = export_dir / "normalized_meshes"
     gs_ply_dir = export_dir / "gaussians_ply"
     gs_splat_dir = export_dir / "gaussians_splat"
@@ -774,6 +795,8 @@ def evaluate_checkpoint(
         input_ply_dir.mkdir(parents=True, exist_ok=True)
         fps_anchors_dir.mkdir(parents=True, exist_ok=True)
         pca_anchors_dir.mkdir(parents=True, exist_ok=True)
+        dc_anchors_dir.mkdir(parents=True, exist_ok=True)
+        latent_tokens_dir.mkdir(parents=True, exist_ok=True)
         normalized_mesh_dir.mkdir(parents=True, exist_ok=True)
         gs_ply_dir.mkdir(parents=True, exist_ok=True)
         gs_splat_dir.mkdir(parents=True, exist_ok=True)
@@ -822,17 +845,51 @@ def evaluate_checkpoint(
                 export_tensors["query_positions"],
                 fps_anchors_dir / f"anchor_{stem}.ply",
             )
-            # PCA-coloured anchors: open in CloudCompare to inspect whether the
-            # encoder produces semantically clustered features (good) or noise.
+            # Predicted DC colour at each FPS anchor (mean over K Gaussians).
             try:
-                pca_rgb = pca_features_to_rgb(export_tensors["features"])
                 export_xyz_pointcloud_ply(
                     export_tensors["query_positions"],
-                    pca_anchors_dir / f"anchor_pca_{stem}.ply",
-                    colors=pca_rgb,
+                    dc_anchors_dir / f"anchor_dc_{stem}.ply",
+                    colors=export_tensors["dc_rgb_anchors"],
                 )
             except Exception as e:
-                logger.warning("PCA anchor export failed for %s: %s", mesh_stem, e)
+                logger.warning("DC-RGB anchor export failed for %s: %s", mesh_stem, e)
+            # PCA-coloured anchors at three latent stages for CloudCompare.
+            for tag, feats in (
+                ("z", export_tensors["latents_z"]),
+                ("pre_attn", export_tensors["latents_pre_attn"]),
+                ("post_attn", export_tensors["features"]),
+            ):
+                try:
+                    pca_rgb = pca_features_to_rgb(feats)
+                    export_xyz_pointcloud_ply(
+                        export_tensors["query_positions"],
+                        pca_anchors_dir / f"anchor_pca_{tag}_{stem}.ply",
+                        colors=pca_rgb,
+                    )
+                    # Keep legacy filename for post-transformer PCA.
+                    if tag == "post_attn":
+                        export_xyz_pointcloud_ply(
+                            export_tensors["query_positions"],
+                            pca_anchors_dir / f"anchor_pca_{stem}.ply",
+                            colors=pca_rgb,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "PCA anchor export (%s) failed for %s: %s", tag, mesh_stem, e,
+                    )
+            # Full latent tensors for stats / notebooks.
+            try:
+                export_latent_tokens_pt(
+                    latent_tokens_dir / f"latents_{stem}.pt",
+                    query_positions=export_tensors["query_positions"],
+                    latents_z=export_tensors["latents_z"],
+                    latents_pre_attn=export_tensors["latents_pre_attn"],
+                    features_post_attn=export_tensors["features"],
+                    dc_rgb=export_tensors["dc_rgb_anchors"],
+                )
+            except Exception as e:
+                logger.warning("Latent token export failed for %s: %s", mesh_stem, e)
             mesh_path = sample.get("mesh_path")
             if mesh_path:
                 try:
@@ -1051,6 +1108,12 @@ def parse_args():
         type=float,
         default=None,
         help="Override checkpoint max_anchor_delta (AnchorSplat uses 10/128 ≈ 0.078).",
+    )
+    p.add_argument(
+        "--max_log_scale",
+        type=float,
+        default=2.0,
+        help="Override checkpoint max_log_scale (hard clamp on Gaussian log-scales).",
     )
     p.add_argument(
         "--qk_norm",

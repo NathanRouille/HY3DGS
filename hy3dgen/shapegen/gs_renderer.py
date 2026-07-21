@@ -599,7 +599,9 @@ class RGBDLoss(nn.Module):
         lambda_d          : weight for foreground depth L1 (default 1.0).
         lambda_alpha      : weight for alpha supervision fg+bg (default 0.05).
         alpha_bg_weight   : extra multiplier on background alpha L1 (default 5.0).
-        lambda_scale      : weight for AnchorSplat volume penalty mean(s0*s1*s2) (default 0.01).
+        lambda_scale      : weight for volume penalty mean(s0*s1*s2) (default 0.01).
+        lambda_scale_max  : weight for max-axis scale penalty mean(max(s)) (default 0.0).
+                            Hits elongated "needle" Gaussians that keep small volume.
         lambda_opa        : weight for AnchorSplat opacity penalty mean(1 - opacity) (default 0.01).
         lambda_delta      : weight for mean squared anchor offset ||means - anchor||^2 (default 0).
         rgb_loss_type     : ``'l1'`` or ``'mse'`` for the photometric RGB term.
@@ -617,6 +619,7 @@ class RGBDLoss(nn.Module):
         lambda_d: float = 1.0,
         lambda_alpha: float = 0.05,
         lambda_scale: float = 0.01,
+        lambda_scale_max: float = 0.0,
         lambda_opa: float = 0.01,
         lambda_delta: float = 0.0,
         rgb_loss_type: str = "mse",
@@ -634,6 +637,7 @@ class RGBDLoss(nn.Module):
         self._lpips_net = None
         self.lambda_alpha = lambda_alpha
         self.lambda_scale = lambda_scale
+        self.lambda_scale_max = lambda_scale_max
         self.lambda_opa = lambda_opa
         self.lambda_delta = lambda_delta
         self.rgb_loss_type = rgb_loss_type
@@ -789,32 +793,57 @@ class RGBDLoss(nn.Module):
         scales: torch.Tensor,
         opacities: torch.Tensor,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Volume and opacity penalties applied once per step (not per view).
+        """Volume, max-axis scale, and opacity penalties (once per step).
+
+        Volume ``mean(s0*s1*s2)`` alone allows long thin "needles" with tiny
+        product but huge extent. ``scale_max = mean(max(s))`` and an
+        opacity-weighted variant suppress those background bleeders.
 
         Args:
             scales: physical axis scales (post-``exp``), shape ``(N, 3)`` or ``(B, N, 3)``.
             opacities: sigmoid opacities in ``[0, 1]``, shape ``(N, 1)`` or ``(B, N, 1)``.
 
         Returns:
-            Weighted sum and unweighted component dict (``scale_reg``, ``opa_reg``).
+            Weighted sum and unweighted component dict
+            (``scale_vol``, ``scale_max``, ``scale_max_opa``, ``scale_reg``, ``opa_reg``).
+            ``scale_reg`` is the volume term (backward-compatible log key).
         """
         if scales.dim() == 2:
             scales = scales.unsqueeze(0)
             opacities = opacities.unsqueeze(0)
 
         max_volume = math.exp(10.0)
-        scale_losses: List[torch.Tensor] = []
+        vol_losses: List[torch.Tensor] = []
+        max_losses: List[torch.Tensor] = []
+        max_opa_losses: List[torch.Tensor] = []
         opa_losses: List[torch.Tensor] = []
         for b in range(scales.shape[0]):
-            scale_losses.append(scales[b].prod(dim=-1).clamp(max=max_volume).mean())
-            opa_losses.append((1.0 - opacities[b].reshape(-1)).abs().mean())
+            s = scales[b]
+            opa = opacities[b].reshape(-1)
+            s_max = s.max(dim=-1).values
+            vol_losses.append(s.prod(dim=-1).clamp(max=max_volume).mean())
+            max_losses.append(s_max.mean())
+            max_opa_losses.append((opa * s_max).mean())
+            opa_losses.append((1.0 - opa).abs().mean())
 
-        loss_scale = torch.stack(scale_losses).mean()
+        loss_vol = torch.stack(vol_losses).mean()
+        loss_max = torch.stack(max_losses).mean()
+        loss_max_opa = torch.stack(max_opa_losses).mean()
         loss_opa = torch.stack(opa_losses).mean()
-        weighted = self.lambda_scale * loss_scale + self.lambda_opa * loss_opa
+        # Prefer opacity-weighted max when lambda_scale_max > 0 so fully
+        # transparent needles are not over-penalised relative to visible fog.
+        scale_max_term = loss_max_opa if self.lambda_scale_max > 0 else loss_max
+        weighted = (
+            self.lambda_scale * loss_vol
+            + self.lambda_scale_max * scale_max_term
+            + self.lambda_opa * loss_opa
+        )
         return weighted, {
-            'scale_reg': loss_scale,
-            'opa_reg': loss_opa,
+            "scale_vol": loss_vol,
+            "scale_max": loss_max,
+            "scale_max_opa": loss_max_opa,
+            "scale_reg": loss_vol,  # alias for existing wandb / log keys
+            "opa_reg": loss_opa,
         }
 
     def weighted_terms_for_grad_norm(
@@ -837,10 +866,15 @@ class RGBDLoss(nn.Module):
         gaussian_components: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
         """Weighted scale/opacity terms for grad-norm logging."""
-        return {
+        terms: Dict[str, torch.Tensor] = {
             "scale_reg": self.lambda_scale * gaussian_components["scale_reg"],
             "opa_reg": self.lambda_opa * gaussian_components["opa_reg"],
         }
+        if self.lambda_scale_max > 0 and "scale_max_opa" in gaussian_components:
+            terms["scale_max"] = (
+                self.lambda_scale_max * gaussian_components["scale_max_opa"]
+            )
+        return terms
 
     def anchor_delta_regularizer(
         self,

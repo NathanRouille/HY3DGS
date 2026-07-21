@@ -1226,6 +1226,7 @@ def train(args):
         deterministic_encoder=args.deterministic_encoder,
         sh_degree=args.sh_degree,
         max_anchor_delta=args.max_anchor_delta,
+        max_log_scale=getattr(args, "max_log_scale", 2.0),
         qk_norm=getattr(args, "qk_norm", False),
         qkv_bias=getattr(args, "qkv_bias", True),
         include_pi=getattr(args, "include_pi", True),
@@ -1323,6 +1324,7 @@ def train(args):
         lambda_alpha=args.lambda_alpha,
         alpha_bg_weight=args.alpha_bg_weight,
         lambda_scale=args.lambda_scale,
+        lambda_scale_max=getattr(args, "lambda_scale_max", 0.0),
         lambda_opa=args.lambda_opa,
         lambda_delta=args.lambda_delta,
         rgb_loss_type=args.rgb_loss_type,
@@ -1672,7 +1674,11 @@ def train(args):
             log_components["n_views_sampled"] = torch.tensor(float(views_per_step), device=device)
 
             gaussian_components: Optional[Dict[str, torch.Tensor]] = None
-            if args.lambda_scale > 0 or args.lambda_opa > 0:
+            if (
+                args.lambda_scale > 0
+                or getattr(args, "lambda_scale_max", 0.0) > 0
+                or args.lambda_opa > 0
+            ):
                 gaussian_loss, gaussian_components = criterion.gaussian_regularizer(
                     scales,
                     opacities,
@@ -1752,7 +1758,10 @@ def train(args):
                     if grad_norms is not None:
                         for term_name, gn in grad_norms.items():
                             wandb_log[f"grad_norm/{term_name}"] = gn
-                    for k in ("scale_reg", "opa_reg", "delta_reg", "kl"):
+                    for k in (
+                        "scale_reg", "scale_vol", "scale_max", "scale_max_opa",
+                        "opa_reg", "delta_reg", "kl",
+                    ):
                         if k in log_floats:
                             wandb_log[f"loss/{k}"] = log_floats[k]
                     for stat_key, wandb_key in (
@@ -2095,7 +2104,15 @@ def parse_args():
                    help='Extra multiplier on the background alpha L1 term (pred_alpha→0 on bg '
                         'pixels). Higher values push harder against background Gaussians.')
     p.add_argument('--lambda_scale', type=float, default=0.01,
-                   help='AnchorSplat volume penalty: penalises mean(s0*s1*s2) per Gaussian.')
+                   help='Volume penalty weight: mean(s0*s1*s2) per Gaussian.')
+    p.add_argument(
+        '--lambda_scale_max',
+        type=float,
+        default=0.0,
+        help='Max-axis scale penalty weight: mean(opacity * max(s)). '
+             'Suppresses elongated needle Gaussians that keep small volume. '
+             '0 disables (volume-only, legacy behaviour).',
+    )
     p.add_argument('--lambda_opa', type=float, default=0.05,
                    help='Binary opacity entropy weight: pushes each Gaussian to fully opaque '
                         '(carves thin features) or fully transparent (carves holes). Replaces '
@@ -2107,7 +2124,14 @@ def parse_args():
     p.add_argument('--max_anchor_delta', type=float, default=None,
                    help='Hard cap on anchor offsets via tanh(raw)*(max). AnchorSplat uses 10/128 '
                         '≈ 0.078 in normalised space. Default None = unbounded raw offsets.')
-
+    p.add_argument(
+        '--max_log_scale',
+        type=float,
+        default=2.0,
+        help='Hard upper clamp on Gaussian log-scales before exp. '
+             'Default 2.0 → max scale e^2≈7.4. Use 0.0 → max scale 1.0 to '
+             'block huge background bleeders.',
+    )
     # Optimiser
     p.add_argument('--lr', type=float, default=1e-4)
     p.add_argument('--weight_decay', type=float, default=1e-2)
