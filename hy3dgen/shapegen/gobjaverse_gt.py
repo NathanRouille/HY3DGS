@@ -224,6 +224,66 @@ def gobjaverse_view_paths(render_dir: Path, view_idx: int) -> Tuple[Path, Path, 
     )
 
 
+def list_available_gobjaverse_views(
+    render_dir: Union[str, Path],
+    *,
+    max_views: int = GOBJAVERSE_NUM_VIEWS,
+) -> List[int]:
+    """Return 0-based view indices that have RGB+JSON on disk under ``render_dir``."""
+    root = Path(render_dir)
+    out: List[int] = []
+    for i in range(int(max_views)):
+        rgb, _, js = gobjaverse_view_paths(root, i)
+        if rgb.is_file() and js.is_file():
+            out.append(i)
+    return out
+
+
+def parse_view_indices(
+    *,
+    view_idx: Optional[int] = None,
+    num_views: Optional[int] = None,
+    view_indices: Optional[str] = None,
+) -> List[int]:
+    """Resolve train/cache view set from CLI-style knobs.
+
+    Priority: ``view_indices`` (comma / range string) > ``num_views`` (``0..N-1``)
+    > single ``view_idx`` (default 0).
+
+    Examples for ``view_indices``: ``\"0,5,10\"``, ``\"0-39\"``, ``\"0-5,20,30-39\"``.
+    """
+    if view_indices is not None and str(view_indices).strip():
+        seen: set[int] = set()
+        out: List[int] = []
+        for part in str(view_indices).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                a_s, b_s = part.split("-", 1)
+                a, b = int(a_s), int(b_s)
+                if b < a:
+                    a, b = b, a
+                for i in range(a, b + 1):
+                    if i not in seen:
+                        seen.add(i)
+                        out.append(i)
+            else:
+                i = int(part)
+                if i not in seen:
+                    seen.add(i)
+                    out.append(i)
+        if not out:
+            raise ValueError(f"Empty view_indices after parse: {view_indices!r}")
+        return out
+    if num_views is not None:
+        n = int(num_views)
+        if n <= 0:
+            raise ValueError(f"num_views must be > 0, got {n}")
+        return list(range(min(n, GOBJAVERSE_NUM_VIEWS)))
+    return [int(0 if view_idx is None else view_idx)]
+
+
 def gobjaverse_render_dir(render_root: Union[str, Path], gobjaverse_id: str) -> Path:
     return Path(render_root) / gobjaverse_id
 

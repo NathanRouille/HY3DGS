@@ -146,13 +146,25 @@ def rgb_l1_on_nn(
 
 
 class PointCloudAELoss(nn.Module):
-    """L = L_cd + λ_rgb * L_rgb + λ_anc * L_anc (Sinkhorn OT on anchors)."""
+    """Recon CD + RGB + optional centre–FPS coupling (Sinkhorn and/or CD).
+
+    Total::
+
+        L = L_cd + λ_rgb L_rgb
+          + λ_anc L_sinkhorn(centers, fps)
+          + λ_anc_cd L_cd(centers, fps)
+
+    Sinkhorn provides soft nearly-bijective matching; centre–FPS Chamfer adds
+    an independent hard NN geometric penalty so outlier centres far from every
+    FPS (and uncovered FPS) still pay a full squared distance cost.
+    """
 
     def __init__(
         self,
         *,
         lambda_rgb: float = 1.0,
         lambda_anc: float = 0.1,
+        lambda_anc_cd: float = 0.0,
         bidirectional_rgb: bool = True,
         sinkhorn_eps: float = 0.02,
         sinkhorn_iters: int = 50,
@@ -160,6 +172,7 @@ class PointCloudAELoss(nn.Module):
         super().__init__()
         self.lambda_rgb = float(lambda_rgb)
         self.lambda_anc = float(lambda_anc)
+        self.lambda_anc_cd = float(lambda_anc_cd)
         self.bidirectional_rgb = bool(bidirectional_rgb)
         self.sinkhorn_eps = float(sinkhorn_eps)
         self.sinkhorn_iters = int(sinkhorn_iters)
@@ -182,11 +195,20 @@ class PointCloudAELoss(nn.Module):
             idx_tgt_to_pred=idx_t2p if self.bidirectional_rgb else None,
         )
         total = cd + self.lambda_rgb * rgb
+        zero = pred_xyz.new_zeros(())
         extras: Dict[str, torch.Tensor] = {
             "loss_cd": cd.detach(),
             "loss_rgb": rgb.detach(),
+            "_cd": cd,
+            "_rgb": rgb,
+            "loss_anc": zero.detach(),
+            "_anc": zero,
+            "loss_anc_cd": zero.detach(),
+            "_anc_cd": zero,
         }
-        if centers is not None and fps_xyz is not None and self.lambda_anc > 0:
+
+        have_anchors = centers is not None and fps_xyz is not None
+        if have_anchors and self.lambda_anc > 0:
             anc = sinkhorn_matching_loss(
                 centers,
                 fps_xyz,
@@ -195,7 +217,29 @@ class PointCloudAELoss(nn.Module):
             )
             total = total + self.lambda_anc * anc
             extras["loss_anc"] = anc.detach()
-        else:
-            extras["loss_anc"] = torch.zeros((), device=pred_xyz.device, dtype=pred_xyz.dtype)
+            extras["_anc"] = anc
+
+        if have_anchors and self.lambda_anc_cd > 0:
+            # Bidirectional squared Chamfer: hard NN pin centres↔FPS.
+            # fps is typically already detached by the trainer.
+            anc_cd, _, _ = chamfer_distance(centers, fps_xyz, bidirectional=True)
+            total = total + self.lambda_anc_cd * anc_cd
+            extras["loss_anc_cd"] = anc_cd.detach()
+            extras["_anc_cd"] = anc_cd
+
         extras["loss_total"] = total.detach()
         return total, extras
+
+    def weighted_terms_for_grad_norm(
+        self,
+        extras: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """Weighted scalar loss terms for per-term grad-norm logging."""
+        terms: Dict[str, torch.Tensor] = {"cd": extras["loss_cd"]}
+        if self.lambda_rgb > 0:
+            terms["rgb"] = self.lambda_rgb * extras["_rgb"]
+        if self.lambda_anc > 0 and "_anc" in extras:
+            terms["anc"] = self.lambda_anc * extras["_anc"]
+        if self.lambda_anc_cd > 0 and "_anc_cd" in extras:
+            terms["anc_cd"] = self.lambda_anc_cd * extras["_anc_cd"]
+        return terms

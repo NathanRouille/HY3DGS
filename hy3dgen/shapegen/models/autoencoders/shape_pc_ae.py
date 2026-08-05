@@ -260,6 +260,17 @@ class ShapePCAE(nn.Module):
         new_point_feats: int,
         rgb_feat_init: str,
     ) -> torch.Tensor:
+        """Map Hunyuan ShapeVAE ``input_proj`` into PCAE ``input_proj``.
+
+        Hunyuan ``point_feats=4`` is ``normals(3) + sharp_label(1)``.
+        With PCAE ``point_feats=7`` (``include_sharp_label``): surface feats are
+        ``normals | sharp | rgb(3)`` — copy the first 4 columns from Hunyuan,
+        then init the **3 RGB** columns via ``rgb_feat_init`` (default kaiming).
+
+        With ``point_feats=6`` (no sharp channel): the Hunyuan sharp column is
+        incorrectly aligned onto the first RGB weight and only 2 RGB cols are
+        freshly inited — prefer ``include_sharp_label`` + ``point_feats=7``.
+        """
         fourier_dim = old_w.shape[1] - old_point_feats
         if new_w.shape[1] - new_point_feats != fourier_dim:
             raise ValueError(

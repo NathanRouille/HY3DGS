@@ -31,6 +31,15 @@ except ImportError:
 from hy3dgen.shapegen.gs_export import export_xyz_pointcloud_ply
 from hy3dgen.shapegen.models.autoencoders.shape_pc_ae import ShapePCAE
 from hy3dgen.shapegen.pc_losses import PointCloudAELoss
+from hy3dgen.shapegen.pc_training_utils import (
+    anchor_diagnostics,
+    compute_pc_loss_grad_norms,
+    evaluate_fixed_meshes,
+    global_grad_norm,
+    latent_statistics,
+    loss_balance_ratios,
+    pick_fixed_mesh_paths,
+)
 from hy3dgen.shapegen.pretrained_profiles import (
     apply_pretrained_profile,
     get_pretrained_profile,
@@ -265,6 +274,7 @@ def train(args):
     criterion = PointCloudAELoss(
         lambda_rgb=args.lambda_rgb,
         lambda_anc=args.lambda_anc,
+        lambda_anc_cd=float(getattr(args, "lambda_anc_cd", 0.0)),
         bidirectional_rgb=True,
         sinkhorn_eps=args.sinkhorn_eps,
         sinkhorn_iters=args.sinkhorn_iters,
@@ -326,8 +336,37 @@ def train(args):
         start_step = int(ckpt.get("step", 0))
         logger.info("Resumed from %s at step %d", args.resume_ckpt, start_step)
 
+    if args.additional_steps is not None:
+        total_steps = start_step + int(args.additional_steps)
+        logger.info("Training until step %d (%d additional steps)", total_steps, args.additional_steps)
+
     if args.wandb and wandb is not None:
         wandb.init(project=args.wandb_project, name=args.wandb_name or output_dir.name, config=vars(args))
+
+    fixed_train_paths: List[str] = []
+    fixed_val_paths: List[str] = []
+    if args.fixed_eval_meshes > 0:
+        fixed_train_paths = pick_fixed_mesh_paths(
+            dataset, args.fixed_eval_meshes, seed=args.seed
+        )
+        val_dir = getattr(args, "val_dir", None)
+        if val_dir:
+            try:
+                val_ds = SurfaceOnlyDataset(
+                    data_dir=val_dir,
+                    pc_size=args.pc_size,
+                    pc_sharpedge_size=args.pc_sharpedge_size,
+                    max_items=args.max_items,
+                    categories=categories,
+                    seed=args.seed,
+                    include_sharp_label=include_sharp_label,
+                    use_experiment_manifest=not args.no_experiment_manifest,
+                )
+                fixed_val_paths = pick_fixed_mesh_paths(
+                    val_ds, args.fixed_eval_meshes, seed=args.seed + 1
+                )
+            except FileNotFoundError:
+                logger.warning("val_dir %s has no meshes; skipping fixed val eval", val_dir)
 
     model.train()
     step = start_step
@@ -341,7 +380,7 @@ def train(args):
             batch = next(data_iter)
 
         surface = batch["surface"].to(device, non_blocking=True)
-        xyz, rgb, centers, fps_xyz, _latents = model(surface)
+        xyz, rgb, centers, fps_xyz, latents = model(surface)
         gt_xyz, gt_rgb = ShapePCAE.surface_gt_points(
             surface, include_sharp_label=include_sharp_label
         )
@@ -349,15 +388,24 @@ def train(args):
             xyz, rgb, gt_xyz, gt_rgb, centers=centers, fps_xyz=fps_xyz.detach()
         )
 
+        will_log = (step + 1) % args.log_interval == 0 or step == 0
+        grad_norms = None
+        if will_log and args.wandb and wandb is not None and args.log_grad_norms:
+            grad_norms = compute_pc_loss_grad_norms(model, criterion, extras=extras)
+
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         if args.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            grad_norm_preclip = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), args.max_grad_norm
+            )
+        else:
+            grad_norm_preclip = global_grad_norm(model)
         optimizer.step()
         scheduler.step()
         step += 1
 
-        if step % args.log_interval == 0 or step == 1:
+        if will_log:
             lr = optimizer.param_groups[0]["lr"]
             logger.info(
                 "step %d/%d loss=%.4f cd=%.4f rgb=%.4f anc=%.4f lr=%.2e (%.1fs)",
@@ -371,17 +419,34 @@ def train(args):
                 time.time() - t0,
             )
             if args.wandb and wandb is not None:
-                wandb.log(
-                    {
-                        "train/loss": float(loss),
-                        "train/cd": float(extras["loss_cd"]),
-                        "train/rgb": float(extras["loss_rgb"]),
-                        "train/anc": float(extras["loss_anc"]),
-                        "train/lr": lr,
-                        "step": step,
-                    },
-                    step=step,
+                wandb_log: Dict = {
+                    "train/loss": float(loss),
+                    "train/cd": float(extras["loss_cd"]),
+                    "train/rgb": float(extras["loss_rgb"]),
+                    "train/anc": float(extras["loss_anc"]),
+                    "train/lr": lr,
+                    "step": step,
+                }
+                wandb_log.update(
+                    loss_balance_ratios(
+                        loss_cd=float(extras["loss_cd"]),
+                        loss_rgb=float(extras["loss_rgb"]),
+                        loss_anc=float(extras["loss_anc"]),
+                        lambda_rgb=args.lambda_rgb,
+                        lambda_anc=args.lambda_anc,
+                    )
                 )
+                wandb_log.update(latent_statistics(latents))
+                if grad_norms is not None:
+                    grad_norm_val = float(
+                        grad_norm_preclip.detach().item()
+                        if torch.is_tensor(grad_norm_preclip)
+                        else grad_norm_preclip
+                    )
+                    wandb_log["grad_norm/total"] = grad_norm_val
+                    for k, v in grad_norms.items():
+                        wandb_log[f"grad_norm/{k}"] = v
+                wandb.log(wandb_log, step=step)
 
         if args.vis_interval > 0 and step % args.vis_interval == 0:
             vis_dir = output_dir / "vis" / f"step_{step:07d}"
@@ -405,6 +470,42 @@ def train(args):
                     fps_xyz[0].detach().cpu(),
                     vis_dir / "fps.ply",
                 )
+                if args.wandb and wandb is not None:
+                    wandb.log(
+                        anchor_diagnostics(centers, fps_xyz),
+                        step=step,
+                    )
+
+        if (
+            args.fixed_eval_interval > 0
+            and fixed_train_paths
+            and step % args.fixed_eval_interval == 0
+        ):
+            with torch.no_grad():
+                fe = evaluate_fixed_meshes(
+                    model,
+                    fixed_train_paths,
+                    device=device,
+                    criterion=criterion,
+                    surface_loader=dataset.loader,
+                    include_sharp_label=include_sharp_label,
+                    prefix="train",
+                )
+                if fixed_val_paths:
+                    fe.update(
+                        evaluate_fixed_meshes(
+                            model,
+                            fixed_val_paths,
+                            device=device,
+                            criterion=criterion,
+                            surface_loader=dataset.loader,
+                            include_sharp_label=include_sharp_label,
+                            prefix="val",
+                        )
+                    )
+            if args.wandb and wandb is not None:
+                wandb.log(fe, step=step)
+            logger.info("fixed_eval step %d: %s", step, fe)
 
         if args.ckpt_interval > 0 and step % args.ckpt_interval == 0:
             ckpt_path = output_dir / f"ckpt_{step:07d}.pt"
@@ -505,12 +606,24 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--num_steps", type=int, default=5000)
+    p.add_argument(
+        "--additional_steps",
+        type=int,
+        default=None,
+        help="When resuming, train this many steps beyond the checkpoint step (overrides --num_steps).",
+    )
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--warmup_steps", type=int, default=200)
     p.add_argument("--max_grad_norm", type=float, default=1.0)
     p.add_argument("--lambda_rgb", type=float, default=1.0)
     p.add_argument("--lambda_anc", type=float, default=0.1)
+    p.add_argument(
+        "--lambda_anc_cd",
+        type=float,
+        default=0.0,
+        help="Weight for bidirectional Chamfer between anchors and FPS.",
+    )
     p.add_argument(
         "--sinkhorn_eps",
         type=float,
@@ -526,6 +639,25 @@ def parse_args():
     p.add_argument("--log_interval", type=int, default=50)
     p.add_argument("--ckpt_interval", type=int, default=1000)
     p.add_argument("--vis_interval", type=int, default=500)
+    p.add_argument(
+        "--log_grad_norms",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Log per-loss-term gradient L2 norms to wandb (grad_norm/*).",
+    )
+    p.add_argument(
+        "--fixed_eval_meshes",
+        type=int,
+        default=3,
+        help="Number of fixed train/val meshes for periodic mini-eval (0=off).",
+    )
+    p.add_argument(
+        "--fixed_eval_interval",
+        type=int,
+        default=5000,
+        help="Run fixed-mesh eval every N steps (0=off).",
+    )
+    p.add_argument("--val_dir", type=str, default=None, help="Optional val mesh dir for fixed eval.")
     p.add_argument("--resume_ckpt", type=str, default=None)
 
     p.add_argument("--wandb", action="store_true")

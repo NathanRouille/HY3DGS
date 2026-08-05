@@ -126,6 +126,7 @@ def export_input_surface_ply(
         "property uchar red",
         "property uchar green",
         "property uchar blue",
+        "property uchar alpha",  # pad to 4-byte-aligned vertex (CloudCompare-safe)
         "end_header",
     ])
     header = "\n".join(header_lines) + "\n"
@@ -135,18 +136,18 @@ def export_input_surface_ply(
         for i in range(n):
             if include_sharp_label:
                 f.write(struct.pack(
-                    "<3f3f f 3B",
+                    "<3f3f f 4B",
                     float(xyz[i, 0]), float(xyz[i, 1]), float(xyz[i, 2]),
                     float(normals[i, 0]), float(normals[i, 1]), float(normals[i, 2]),
                     float(sharp_label[i]),
-                    int(rgb_u8[i, 0]), int(rgb_u8[i, 1]), int(rgb_u8[i, 2]),
+                    int(rgb_u8[i, 0]), int(rgb_u8[i, 1]), int(rgb_u8[i, 2]), 255,
                 ))
             else:
                 f.write(struct.pack(
-                    "<3f3f3B",
+                    "<3f3f4B",
                     float(xyz[i, 0]), float(xyz[i, 1]), float(xyz[i, 2]),
                     float(normals[i, 0]), float(normals[i, 1]), float(normals[i, 2]),
-                    int(rgb_u8[i, 0]), int(rgb_u8[i, 1]), int(rgb_u8[i, 2]),
+                    int(rgb_u8[i, 0]), int(rgb_u8[i, 1]), int(rgb_u8[i, 2]), 255,
                 ))
 
 
@@ -158,31 +159,47 @@ def export_xyz_pointcloud_ply(
 ) -> None:
     """Save ``[N, 3]`` positions as a colored point cloud PLY (e.g. FPS anchors).
 
+    Binary little-endian, 16-byte vertices (``xyz`` float32 + ``rgba`` uchar).
+    Non-finite points are dropped **before** the header ``element vertex`` count
+    is written. Writes atomically (temp file + replace) so CloudCompare never
+    sees a truncated header/payload.
+
     Args:
         xyz    : ``(N, 3)`` positions.
         path   : output ``.ply`` file path.
         rgb    : uniform colour used when ``colors`` is ``None``.
-        colors : optional ``(N, 3)`` per-point colour in ``[0, 1]`` (e.g. PCA→RGB).
+        colors : optional ``(N, 3)`` per-point colour in ``[0, 1]``.
     """
-    pts = _to_numpy_f32(xyz).reshape(-1, 3)
-    n = pts.shape[0]
+    pts = np.ascontiguousarray(_to_numpy_f32(xyz).reshape(-1, 3))
+    n_in = int(pts.shape[0])
 
+    cols_u8: Optional[np.ndarray] = None
     if colors is not None:
-        rgb_arr = _to_numpy_f32(colors).reshape(-1, 3)
-        if rgb_arr.shape[0] != n:
+        cols = np.ascontiguousarray(_to_numpy_f32(colors).reshape(-1, 3))
+        if cols.shape[0] != n_in:
             raise ValueError(
-                f"colors has {rgb_arr.shape[0]} entries but xyz has {n}"
+                f"colors has {cols.shape[0]} entries but xyz has {n_in}"
             )
-        rgb_u8 = np.clip(rgb_arr * 255.0, 0, 255).astype(np.uint8)
-    else:
-        r, g, b = (int(np.clip(c, 0, 255)) for c in rgb)
-        rgb_u8 = np.broadcast_to(np.array([r, g, b], dtype=np.uint8), (n, 3))
+        cols_u8 = np.clip(np.nan_to_num(cols, nan=0.0) * 255.0, 0, 255).astype(
+            np.uint8
+        )
 
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    finite = np.isfinite(pts).all(axis=1)
+    if n_in > 0 and not bool(finite.all()):
+        pts = np.ascontiguousarray(pts[finite])
+        if cols_u8 is not None:
+            cols_u8 = np.ascontiguousarray(cols_u8[finite])
+    n = int(pts.shape[0])
+
+    if cols_u8 is None:
+        r, g, b = (int(np.clip(c, 0, 255)) for c in rgb)
+        cols_u8 = np.empty((n, 3), dtype=np.uint8)
+        if n > 0:
+            cols_u8[:, 0], cols_u8[:, 1], cols_u8[:, 2] = r, g, b
+
     header = (
         "ply\n"
-        "format binary_little_endian 1.0\n"
+        "format ascii 1.0\n"
         f"element vertex {n}\n"
         "property float x\n"
         "property float y\n"
@@ -192,14 +209,39 @@ def export_xyz_pointcloud_ply(
         "property uchar blue\n"
         "end_header\n"
     )
-    with open(path, "wb") as f:
-        f.write(header.encode("ascii"))
-        for i in range(n):
-            f.write(struct.pack(
-                "<3f3B",
-                float(pts[i, 0]), float(pts[i, 1]), float(pts[i, 2]),
-                int(rgb_u8[i, 0]), int(rgb_u8[i, 1]), int(rgb_u8[i, 2]),
-            ))
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        with open(tmp, "w", encoding="ascii", newline="\n") as f:
+            f.write(header)
+            if n > 0:
+                # One vertex per line: x y z r g b
+                body = np.column_stack(
+                    [
+                        pts[:, 0],
+                        pts[:, 1],
+                        pts[:, 2],
+                        cols_u8[:, 0],
+                        cols_u8[:, 1],
+                        cols_u8[:, 2],
+                    ]
+                )
+                np.savetxt(
+                    f,
+                    body,
+                    fmt=["%.9g", "%.9g", "%.9g", "%d", "%d", "%d"],
+                )
+            f.flush()
+        tmp.replace(path)
+    except Exception:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise
 
 
 def export_latent_tokens_pt(
