@@ -1,6 +1,6 @@
 <mxfile host="app.diagrams.net">
   <diagram name="Page-1" id="E7H5hK9IkIrokjgV0mVK">
-    <mxGraphModel dx="1134" dy="782" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="827" pageHeight="1169" math="0" shadow="0">
+    <mxGraphModel dx="964" dy="665" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="827" pageHeight="1169" math="0" shadow="0">
       <root>
         <mxCell id="0" />
         <mxCell id="1" parent="0" />
@@ -236,41 +236,36 @@
         <mxCell id="htvC32E5O3WbgeVSo0Wf-92" parent="1" style="text;html=1;whiteSpace=wrap;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;rounded=0;" value="z_t" vertex="1">
           <mxGeometry height="30" width="60" x="590" y="239.52" as="geometry" />
         </mxCell>
-        <mxCell id="htvC32E5O3WbgeVSo0Wf-97" edge="1" parent="1" source="htvC32E5O3WbgeVSo0Wf-95" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#00CC00;" target="htvC32E5O3WbgeVSo0Wf-96" value="">
-          <mxGeometry relative="1" as="geometry" />
-        </mxCell>
         <mxCell id="htvC32E5O3WbgeVSo0Wf-95" parent="1" style="rounded=1;whiteSpace=wrap;html=1;" value="Self-Attention" vertex="1">
           <mxGeometry height="40" width="80" x="699" y="409.52" as="geometry" />
         </mxCell>
         <mxCell id="htvC32E5O3WbgeVSo0Wf-96" parent="1" style="whiteSpace=wrap;html=1;rounded=1;" value="Point Decoder" vertex="1">
-          <mxGeometry height="40" width="111" x="839" y="409.52" as="geometry" />
+          <mxGeometry height="40" width="111" x="820" y="389.52" as="geometry" />
         </mxCell>
         <mxCell id="htvC32E5O3WbgeVSo0Wf-98" parent="1" style="whiteSpace=wrap;html=1;rounded=1;" value="Anchor Decoder" vertex="1">
-          <mxGeometry height="40" width="111" x="839" y="469.52" as="geometry" />
+          <mxGeometry height="40" width="111" x="820" y="445" as="geometry" />
         </mxCell>
         <mxCell id="htvC32E5O3WbgeVSo0Wf-99" edge="1" parent="1" style="endArrow=classic;html=1;rounded=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;strokeColor=#00CC00;" target="htvC32E5O3WbgeVSo0Wf-98" value="">
           <mxGeometry height="50" relative="1" width="50" as="geometry">
             <Array as="points">
-              <mxPoint x="800" y="489.52" />
+              <mxPoint x="800" y="465" />
             </Array>
             <mxPoint x="800" y="430" as="sourcePoint" />
             <mxPoint x="820" y="380" as="targetPoint" />
           </mxGeometry>
         </mxCell>
-        <mxCell id="htvC32E5O3WbgeVSo0Wf-100" edge="1" parent="1" source="htvC32E5O3WbgeVSo0Wf-98" style="endArrow=classic;html=1;rounded=0;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;strokeColor=#00CC00;" target="htvC32E5O3WbgeVSo0Wf-96" value="">
+        <mxCell id="htvC32E5O3WbgeVSo0Wf-101" edge="1" parent="1" source="htvC32E5O3WbgeVSo0Wf-96" style="endArrow=classic;html=1;rounded=0;exitX=1;exitY=0.5;exitDx=0;exitDy=0;strokeColor=#00CC00;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" target="htvC32E5O3WbgeVSo0Wf-102" value="">
           <mxGeometry height="50" relative="1" width="50" as="geometry">
-            <mxPoint x="920" y="354.52" as="sourcePoint" />
-            <mxPoint x="970" y="304.52" as="targetPoint" />
-          </mxGeometry>
-        </mxCell>
-        <mxCell id="htvC32E5O3WbgeVSo0Wf-101" edge="1" parent="1" source="htvC32E5O3WbgeVSo0Wf-96" style="endArrow=classic;html=1;rounded=0;exitX=1;exitY=0.5;exitDx=0;exitDy=0;strokeColor=#00CC00;" target="htvC32E5O3WbgeVSo0Wf-102" value="">
-          <mxGeometry height="50" relative="1" width="50" as="geometry">
+            <Array as="points">
+              <mxPoint x="960" y="409.52" />
+              <mxPoint x="960" y="430" />
+            </Array>
             <mxPoint x="920" y="440" as="sourcePoint" />
-            <mxPoint x="990" y="429.52" as="targetPoint" />
+            <mxPoint x="960" y="390" as="targetPoint" />
           </mxGeometry>
         </mxCell>
         <mxCell id="htvC32E5O3WbgeVSo0Wf-102" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="Output P.C." vertex="1">
-          <mxGeometry height="60" width="80" x="990" y="400" as="geometry" />
+          <mxGeometry height="60" width="80" x="980" y="400" as="geometry" />
         </mxCell>
         <mxCell id="htvC32E5O3WbgeVSo0Wf-105" edge="1" parent="1" source="htvC32E5O3WbgeVSo0Wf-102" style="endArrow=classic;html=1;rounded=0;exitX=-0.032;exitY=0.902;exitDx=0;exitDy=0;exitPerimeter=0;strokeColor=#FF8000;dashed=1;" value="">
           <mxGeometry height="50" relative="1" width="50" as="geometry">
@@ -295,6 +290,34 @@
         </mxCell>
         <mxCell id="htvC32E5O3WbgeVSo0Wf-109" parent="1" style="text;html=1;whiteSpace=wrap;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;rounded=0;" value="sampling" vertex="1">
           <mxGeometry height="30" width="60" x="110" y="265" as="geometry" />
+        </mxCell>
+        <mxCell id="O8p-RM88SgXJBZ4i2xie-1" parent="1" style="text;html=1;whiteSpace=wrap;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;rounded=0;" value="which level of details ? Do I talk about VGGT process more in details ? Do I talk about PE ? Do I talk about P.C. alignment ? Do I say the numbers of tokens and dimensions ? Do I say it&#39;s Hunyuna3D 2.0 weights ? Do I put the AdaLN and camera token ? Should I keep the cross in output of GE ? Should I keep this logo to show shared weights ? Should I keep color paths ? Should I keep the gradient path ? Should I had arrows for the loss path ? Should I add the noise before decoding ?" vertex="1">
+          <mxGeometry height="30" width="530" x="390" y="50" as="geometry" />
+        </mxCell>
+        <mxCell id="O8p-RM88SgXJBZ4i2xie-2" parent="1" style="sketch=0;pointerEvents=1;shadow=0;dashed=0;html=1;strokeColor=none;labelPosition=center;verticalLabelPosition=bottom;verticalAlign=top;outlineConnect=0;align=center;shape=mxgraph.office.concepts.node_generic;fillColor=#7FBA42;" value="" vertex="1">
+          <mxGeometry height="20" width="20" x="749" y="330" as="geometry" />
+        </mxCell>
+        <mxCell id="O8p-RM88SgXJBZ4i2xie-3" parent="1" style="sketch=0;pointerEvents=1;shadow=0;dashed=0;html=1;strokeColor=none;labelPosition=center;verticalLabelPosition=bottom;verticalAlign=top;outlineConnect=0;align=center;shape=mxgraph.office.concepts.node_generic;fillColor=#7FBA42;rotation=-90;" value="" vertex="1">
+          <mxGeometry height="20" width="20" x="435" y="280" as="geometry" />
+        </mxCell>
+        <mxCell id="O8p-RM88SgXJBZ4i2xie-6" edge="1" parent="1" style="endArrow=classic;html=1;rounded=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;strokeColor=#00CC00;" target="htvC32E5O3WbgeVSo0Wf-96" value="">
+          <mxGeometry height="50" relative="1" width="50" as="geometry">
+            <Array as="points">
+              <mxPoint x="800" y="430" />
+              <mxPoint x="800" y="409.52" />
+            </Array>
+            <mxPoint x="780" y="430" as="sourcePoint" />
+            <mxPoint x="800" y="380" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="O8p-RM88SgXJBZ4i2xie-8" edge="1" parent="1" source="htvC32E5O3WbgeVSo0Wf-98" style="endArrow=none;html=1;rounded=0;exitX=1;exitY=0.5;exitDx=0;exitDy=0;strokeColor=#00CC00;" value="">
+          <mxGeometry height="50" relative="1" width="50" as="geometry">
+            <Array as="points">
+              <mxPoint x="960" y="465" />
+            </Array>
+            <mxPoint x="820" y="430" as="sourcePoint" />
+            <mxPoint x="960" y="430" as="targetPoint" />
+          </mxGeometry>
         </mxCell>
       </root>
     </mxGraphModel>
