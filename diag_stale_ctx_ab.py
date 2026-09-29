@@ -34,7 +34,7 @@ def _cd(pred: torch.Tensor, gt: torch.Tensor) -> float:
     return float(chamfer_distance(pred, gt)[0])
 
 
-def _sample(model, ctx, keep, noise, *, steps, gs, device, dtype):
+def _sample(model, ctx, keep, noise, *, steps, gs, device, dtype, cam_cond=None):
     z = model.sample_latents(
         ctx,
         batch_size=1,
@@ -42,6 +42,7 @@ def _sample(model, ctx, keep, noise, *, steps, gs, device, dtype):
         guidance_scale=gs,
         noise=noise,
         context_keep=keep,
+        cam_cond=cam_cond,
         device=device,
         dtype=dtype,
     )
@@ -127,8 +128,9 @@ def main() -> None:
         gt_xyz, gt_rgb = ShapePCAE.surface_gt_points(
             surface, include_sharp_label=include_sharp
         )
-        weak0, keep0 = _build_weak_context(
-            batch, builder, device, align_mode=align_mode
+        weak0, keep0, cam0 = _build_weak_context(
+            batch, builder, device, align_mode=align_mode,
+            include_camera_in_sequence=not bool(getattr(model, "adaln_camera_cond", False)),
         )
         z0, _ = model.encode(surface)
         xyz_r0, rgb_r0, _ = model.decode(z0, representation_phase=False)
@@ -146,6 +148,7 @@ def main() -> None:
             gs=args.guidance_scale,
             device=device,
             dtype=z0.dtype,
+            cam_cond=cam0,
         )
         null0 = model.null_context(1, weak0.shape[1], dtype=z0.dtype, device=device)
         xyz_n0, rgb_n0 = _sample(
@@ -196,8 +199,9 @@ def main() -> None:
         weight_decay=float(train_args.get("weight_decay", 0.01)),
     )
 
-    weak_pre, keep_pre = _build_weak_context(
-        batch, builder, device, align_mode=align_mode
+    weak_pre, keep_pre, cam_pre = _build_weak_context(
+        batch, builder, device, align_mode=align_mode,
+        include_camera_in_sequence=not bool(getattr(model, "adaln_camera_cond", False)),
     )
     # Keep a detached copy of pre-step context values for comparison stats.
     weak_pre_values = weak_pre.detach().clone()
@@ -209,7 +213,7 @@ def main() -> None:
     recon_loss, extras = criterion(
         xyz, rgb, gt_xyz_t, gt_rgb_t, centers=centers, fps_xyz=fps_xyz.detach()
     )
-    flow_out = model.forward_denoising(z, weak_pre, context_keep=keep_pre)
+    flow_out = model.forward_denoising(z, weak_pre, context_keep=keep_pre, cam_cond=cam_pre)
     flow_loss = flow_out["flow/flow_loss"]
     loss = float(train_args.get("lambda_recon", 1.0)) * recon_loss + float(
         train_args.get("lambda_flow", 1.0)
@@ -241,8 +245,9 @@ def main() -> None:
     builder.eval()
     with torch.no_grad():
         # Rebuild context with POST-step builder weights (eval behavior).
-        weak_post, keep_post = _build_weak_context(
-            batch, builder, device, align_mode=align_mode
+        weak_post, keep_post, cam_post = _build_weak_context(
+            batch, builder, device, align_mode=align_mode,
+            include_camera_in_sequence=not bool(getattr(model, "adaln_camera_cond", False)),
         )
         ctx_l1 = float((weak_post - stale_ctx).abs().mean())
         ctx_rel = ctx_l1 / max(float(stale_ctx.abs().mean()), 1e-8)
@@ -267,6 +272,7 @@ def main() -> None:
             gs=args.guidance_scale,
             device=device,
             dtype=z_post.dtype,
+            cam_cond=cam_pre,
         )
         xyz_fresh, rgb_fresh = _sample(
             model,
@@ -277,6 +283,7 @@ def main() -> None:
             gs=args.guidance_scale,
             device=device,
             dtype=z_post.dtype,
+            cam_cond=cam_post,
         )
         null = model.null_context(
             1, weak_post.shape[1], dtype=z_post.dtype, device=device
@@ -345,6 +352,7 @@ def main() -> None:
                 gs=args.guidance_scale,
                 device=device,
                 dtype=z_post.dtype,
+                cam_cond=cam_pre,
             )
             g_f, _ = _sample(
                 model,
@@ -355,6 +363,7 @@ def main() -> None:
                 gs=args.guidance_scale,
                 device=device,
                 dtype=z_post.dtype,
+                cam_cond=cam_post,
             )
         seed_rows.append(
             {

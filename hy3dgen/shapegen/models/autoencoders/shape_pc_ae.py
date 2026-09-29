@@ -26,6 +26,10 @@ from ...gs_export import surface_rgb_slice
 from ...utils import logger
 
 
+REGISTER_NOISE_MODES = ("random", "fixed", "zeros")
+_REGISTER_NOISE_SEED = 1234
+
+
 class ShapePCAE(nn.Module):
     """Colored point cloud → register latents → anchor-aligned colored PC.
 
@@ -60,7 +64,9 @@ class ShapePCAE(nn.Module):
         use_ln_post: bool = True,
         num_points_per_anchor: int = 8,
         deterministic_encoder: bool = True,
-        max_anchor_delta: float = 0.1,
+        register_noise_mode: str = "random",
+        geometry_only: bool = False,
+        max_anchor_delta: Optional[float] = None,
         ckpt_path=None,
     ):
         super().__init__()
@@ -70,7 +76,21 @@ class ShapePCAE(nn.Module):
         self.width = int(width)
         self.point_feats = int(point_feats)
         self.num_points_per_anchor = int(num_points_per_anchor)
-        self.max_anchor_delta = float(max_anchor_delta)
+        self.geometry_only = bool(geometry_only)
+        # Channels the decoder emits per point: xyz, plus rgb unless geometry-only.
+        self.point_out_channels = 3 if self.geometry_only else 6
+        if register_noise_mode not in REGISTER_NOISE_MODES:
+            raise ValueError(
+                f"register_noise_mode must be one of {REGISTER_NOISE_MODES}, "
+                f"got {register_noise_mode!r}"
+            )
+        self.register_noise_mode = str(register_noise_mode)
+        # Hard local radius clamp (legacy). Prefer soft λ_delta on ||x-center||^2.
+        # None / <=0 → unbounded deltas (soft reg in PointCloudAELoss).
+        if max_anchor_delta is None or float(max_anchor_delta) <= 0:
+            self.max_anchor_delta = None
+        else:
+            self.max_anchor_delta = float(max_anchor_delta)
         self.latent_shape = (self.num_registers, self.embed_dim)
 
         self.fourier_embedder = FourierEmbedder(num_freqs=num_freqs, include_pi=include_pi)
@@ -98,6 +118,20 @@ class ShapePCAE(nn.Module):
             torch.zeros(1, self.num_registers, width), requires_grad=True
         )
         init_sincos_pos_embed(self.register_pos_embed, self.num_registers)
+
+        # ``fixed`` mode: one frozen noise draw shared by every tokenizer call, so
+        # the latent becomes a deterministic function of the surface. Persistent so
+        # eval/resume reuse the exact draw the flow was trained against (same
+        # failure mode as a re-sampled GaussianFourierEmbedding.W). Drawn from an
+        # isolated generator: consuming the global RNG here would shift every
+        # subsequent init, which legacy checkpoints without a serialized
+        # ``t_embedder.W`` depend on reproducing.
+        gen = torch.Generator().manual_seed(_REGISTER_NOISE_SEED)
+        self.register_buffer(
+            "register_noise_const",
+            torch.randn(1, self.num_registers, self.embed_dim, generator=gen),
+            persistent=True,
+        )
 
         self.ge = GenerativeEncoder(
             n_ctx=ge_ctx,
@@ -132,8 +166,10 @@ class ShapePCAE(nn.Module):
             nn.GELU(),
             nn.Linear(width, 3),
         )
-        # Per anchor: K * (xyz_delta 3 + rgb 3)
-        self.point_head = nn.Linear(width, self.num_points_per_anchor * 6)
+        # Per anchor: K * (xyz_delta 3 [+ rgb 3 unless geometry-only])
+        self.point_head = nn.Linear(
+            width, self.num_points_per_anchor * self.point_out_channels
+        )
         nn.init.zeros_(self.point_head.weight)
         nn.init.zeros_(self.point_head.bias)
 
@@ -158,6 +194,44 @@ class ShapePCAE(nn.Module):
     # Encode / decode
     # ------------------------------------------------------------------
 
+    def encoder_inputs(
+        self, surface: torch.FloatTensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Split a surface tensor into ``(xyz, feats)`` for the point encoder.
+
+        Feature columns are truncated to ``point_feats``, which is what makes
+        ``geometry_only`` work without a separate dataset layout: a 10-channel
+        ``xyz | normals | sharp | rgb`` surface is consumed as ``normals | sharp``
+        when ``point_feats == 4``, so the RGB columns are simply never read and
+        the encoder input matches Hunyuan3D's exactly.
+        """
+        return surface[:, :, :3], surface[:, :, 3 : 3 + self.point_feats]
+
+    def resolve_register_noise(
+        self,
+        batch_size: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        register_noise: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Register slots fed to the tokenizer, per ``register_noise_mode``.
+
+        ``random`` (UNITE) redraws every call, which makes the latent — and hence
+        the flow's regression target — a random variable. ``fixed`` / ``zeros``
+        make it a deterministic function of the surface.
+        """
+        if register_noise is not None:
+            return register_noise
+        shape = (batch_size, self.num_registers, self.embed_dim)
+        if self.register_noise_mode == "zeros":
+            return torch.zeros(shape, device=device, dtype=dtype)
+        if self.register_noise_mode == "fixed":
+            return self.register_noise_const.expand(batch_size, -1, -1).to(
+                device=device, dtype=dtype
+            )
+        return torch.randn(shape, device=device, dtype=dtype)
+
     def encode(
         self,
         surface: torch.FloatTensor,
@@ -170,20 +244,16 @@ class ShapePCAE(nn.Module):
             latents: [B, R, embed_dim]
             fps_xyz: [B, L, 3] FPS query positions (for anchor aux loss)
         """
-        pc = surface[:, :, :3]
-        feats = surface[:, :, 3:]
+        pc, feats = self.encoder_inputs(surface)
         locals_tok, pc_infos = self.encoder(pc, feats)
         fps_xyz = pc_infos[0]
 
-        B = surface.shape[0]
-        if register_noise is None:
-            register_noise = torch.randn(
-                B,
-                self.num_registers,
-                self.embed_dim,
-                device=surface.device,
-                dtype=surface.dtype,
-            )
+        register_noise = self.resolve_register_noise(
+            surface.shape[0],
+            device=surface.device,
+            dtype=surface.dtype,
+            register_noise=register_noise,
+        )
         h_reg = self.register_up(register_noise)
         h_reg = h_reg + self.register_pos_embed.to(dtype=h_reg.dtype)
 
@@ -199,11 +269,11 @@ class ShapePCAE(nn.Module):
         *,
         return_features: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Decode latents to colored points + anchors.
+        """Decode latents to points + anchors.
 
         Returns:
             xyz: [B, R*K, 3]
-            rgb: [B, R*K, 3] in [0, 1]
+            rgb: [B, R*K, 3] in [0, 1], or ``None`` when ``geometry_only``
             centers: [B, R, 3]
         """
         K = self.num_points_per_anchor
@@ -212,13 +282,21 @@ class ShapePCAE(nn.Module):
         h = self.decoder(h)
 
         centers = self.anchor_mlp(h)
-        raw = self.point_head(h).view(h.shape[0], h.shape[1], K, 6)
-        delta = self.max_anchor_delta * torch.tanh(raw[..., :3])
+        raw = self.point_head(h).view(
+            h.shape[0], h.shape[1], K, self.point_out_channels
+        )
+        # Unbound offset by default; optional legacy hard ball via tanh clamp.
+        if self.max_anchor_delta is not None:
+            delta = self.max_anchor_delta * torch.tanh(raw[..., :3])
+        else:
+            delta = raw[..., :3]
         xyz = centers.unsqueeze(2) + delta
-        rgb = torch.sigmoid(raw[..., 3:6])
-
         xyz = xyz.reshape(h.shape[0], h.shape[1] * K, 3)
-        rgb = rgb.reshape(h.shape[0], h.shape[1] * K, 3)
+
+        if self.geometry_only:
+            rgb = None
+        else:
+            rgb = torch.sigmoid(raw[..., 3:6]).reshape(h.shape[0], h.shape[1] * K, 3)
         if return_features:
             return xyz, rgb, centers, {"features": h}
         return xyz, rgb, centers
@@ -238,9 +316,12 @@ class ShapePCAE(nn.Module):
         surface: torch.FloatTensor,
         *,
         include_sharp_label: Optional[bool] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Extract GT xyz + rgb from surface tensor layout."""
+        include_rgb: bool = True,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Extract GT xyz (+ rgb) from surface tensor layout."""
         xyz = surface[:, :, :3]
+        if not include_rgb:
+            return xyz, None
         rgb_sl = surface_rgb_slice(
             surface.shape[-1], include_sharp_label=include_sharp_label
         )
@@ -270,6 +351,9 @@ class ShapePCAE(nn.Module):
         With ``point_feats=6`` (no sharp channel): the Hunyuan sharp column is
         incorrectly aligned onto the first RGB weight and only 2 RGB cols are
         freshly inited — prefer ``include_sharp_label`` + ``point_feats=7``.
+
+        With ``point_feats=4`` (``geometry_only``) the layouts match exactly and
+        the whole projection is copied verbatim.
         """
         fourier_dim = old_w.shape[1] - old_point_feats
         if new_w.shape[1] - new_point_feats != fourier_dim:
@@ -279,6 +363,8 @@ class ShapePCAE(nn.Module):
         out = new_w.clone()
         out[:, : fourier_dim + old_point_feats] = old_w
         rgb_cols = new_point_feats - old_point_feats
+        if rgb_cols <= 0:
+            return out
         rgb_start = fourier_dim + old_point_feats
         rgb_weight = out[:, rgb_start : rgb_start + rgb_cols]
         if rgb_feat_init == "zero":

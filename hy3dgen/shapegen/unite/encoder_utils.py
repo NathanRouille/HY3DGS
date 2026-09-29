@@ -35,7 +35,17 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 
 
 class VisionRotaryEmbeddingFast(nn.Module):
-    def __init__(self, dim, pt_seq_len=16, num_cls_token=0):
+    """1D rotary embedding over token index.
+
+    ``num_cls_token`` prepends identity rotations (UNITE, whose in-context tokens
+    are prepended). ``identity_after`` is the mirror image for a sequence laid out
+    as ``[ordered tokens | unordered context]``: positions at or beyond it get
+    cos=1 / sin=0, so appended context tokens are not given a spurious 1D order.
+    Rotating an unordered set (e.g. VGGT patches, which carry their own 3D
+    positional encoding) would otherwise make attention index-dependent.
+    """
+
+    def __init__(self, dim, pt_seq_len=16, num_cls_token=0, identity_after=None):
         super().__init__()
         freqs = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
         t = torch.arange(pt_seq_len) / pt_seq_len * pt_seq_len
@@ -48,6 +58,10 @@ class VisionRotaryEmbeddingFast(nn.Module):
             sin_pad = torch.zeros(num_cls_token, freqs_sin.shape[-1])
             freqs_cos = torch.cat([cos_pad, freqs_cos], dim=0)
             freqs_sin = torch.cat([sin_pad, freqs_sin], dim=0)
+        if identity_after is not None:
+            n = int(identity_after)
+            freqs_cos[n:] = 1.0
+            freqs_sin[n:] = 0.0
         self.register_buffer("freqs_cos", freqs_cos)
         self.register_buffer("freqs_sin", freqs_sin)
 

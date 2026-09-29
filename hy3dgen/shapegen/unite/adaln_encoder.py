@@ -131,8 +131,14 @@ class AdaLNGenerativeEncoder(nn.Module):
         self.t_embedder = GaussianFourierEmbedding(hidden_size)
         if use_rope:
             half = hidden_size // num_heads // 2
+            # Registers occupy positions [0, num_output_tokens) and are an ordered
+            # sequence with a fixed 1D positional embedding, so rotation is
+            # meaningful for them. Context tokens are appended after and must not
+            # be rotated (see ``identity_after``).
             self.feat_rope = VisionRotaryEmbeddingFast(
-                dim=half * 2, pt_seq_len=max_tokens
+                dim=half * 2,
+                pt_seq_len=max_tokens,
+                identity_after=num_output_tokens,
             )
         else:
             self.feat_rope = None
@@ -170,6 +176,7 @@ class AdaLNGenerativeEncoder(nn.Module):
         pos_embed: Optional[torch.Tensor] = None,
         context_embed: Optional[torch.Tensor] = None,
         context_keep: Optional[torch.Tensor] = None,
+        cond_embed: Optional[torch.Tensor] = None,
         checkpoint_blocks: bool = False,
     ) -> torch.Tensor:
         """
@@ -181,6 +188,8 @@ class AdaLNGenerativeEncoder(nn.Module):
             context_keep: optional [B, C] bool — False marks discarded/padded
                 weak-context tokens (background patches). Register tokens are
                 always kept.
+            cond_embed: optional [B, hidden] global AdaLN condition (e.g. camera).
+                Combined with timestep as ``c = t_emb + cond`` (DiT / UNITE style).
         """
         x = self.up_sample(x)
         if pos_embed is not None:
@@ -198,6 +207,8 @@ class AdaLNGenerativeEncoder(nn.Module):
                 )
 
         c = self.t_embedder(t)
+        if cond_embed is not None:
+            c = c + cond_embed.to(dtype=c.dtype)
         rope = self.feat_rope
         for block in self.blocks:
             if checkpoint_blocks and self.training:

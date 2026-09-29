@@ -4,16 +4,26 @@ Surfaces are returned in the **camera frame** of the chosen G-Objaverse view so
 they share coordinates with VGGT depth-unprojected patch centres (OpenCV-like:
 x right, y down, z forward).
 
-Training can expand to ``(mesh, view)`` pairs (Design A): each sample uses that
-view's RGB / cache / ``c2w`` camera-frame surface. Eval typically keeps a single
-fixed ``view_idx`` for comparability.
+Sampling modes:
+  - ``views_per_sample=1`` (Design A): expand to ``(mesh, view)`` pairs; each
+    sample uses that view's RGB / cache / ``c2w`` camera-frame surface.
+  - ``views_per_sample>1``: one sample per mesh; at load time randomly (or
+    stably) pick N views from the train pool. View 0 of the pick is the
+    reference camera for GT mesh + multi-view VGGT.
+  - ``use_joint_vggt_cache``: load precomputed joint VGGT. If
+    ``len(view_indices) == views_per_sample``, the ordered tuple is fixed
+    (legacy). If the pool is larger, train randomly samples an ordered
+    ``views_per_sample``-tuple (``random.sample``); eval should pass a fixed
+    pair with ``view_sample_mode='first'``.
 """
 
 from __future__ import annotations
 
 import logging
+import random
 from typing import Dict, List, Optional, Set, Tuple
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 
@@ -30,7 +40,11 @@ from .gobjaverse_gt import (
     _read_rgb_image,
 )
 from .surface_loaders import RGBSharpEdgeSurfaceLoader
-from .vggt_context import CachedVGGTContextStore, world_to_camera_torch
+from .vggt_context import (
+    CachedVGGTContextStore,
+    ordered_view_tuples,
+    world_to_camera_torch,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -76,9 +90,11 @@ class RenderViewLoader:
 class SurfaceRenderDataset(Dataset):
     """Mesh surface (camera frame) + render view (+ optional VGGT cache).
 
-    When ``view_indices`` has more than one entry, the dataset expands to one
-    sample per ``(mesh_path, view_idx)`` pair (shuffled independently by the
-    DataLoader).
+    When ``views_per_sample==1`` and ``view_indices`` has more than one entry,
+    the dataset expands to one sample per ``(mesh_path, view_idx)`` pair.
+
+    When ``views_per_sample>1``, one sample per mesh; N views are chosen from
+    the pool at ``__getitem__`` time (random or first-N).
     """
 
     def __init__(
@@ -93,11 +109,15 @@ class SurfaceRenderDataset(Dataset):
         gt_source: Optional[GObjaverseGTSource] = None,
         view_idx: int = 0,
         view_indices: Optional[List[int]] = None,
+        views_per_sample: int = 1,
+        view_sample_mode: str = "random",
         vggt_cache: Optional[CachedVGGTContextStore] = None,
+        use_joint_vggt_cache: bool = False,
         gobjaverse_normalization: bool = True,
         surface_in_camera_frame: bool = True,
         align_mode: str = "cross",
         filter_missing_views: bool = True,
+        strict_load: bool = False,
     ):
         self.mesh_paths = mesh_paths
         self.include_sharp_label = include_sharp_label
@@ -108,9 +128,37 @@ class SurfaceRenderDataset(Dataset):
         )
         if not self.view_indices:
             raise ValueError("view_indices must be non-empty")
+        self.views_per_sample = max(int(views_per_sample), 1)
+        if self.views_per_sample > len(self.view_indices):
+            raise ValueError(
+                f"views_per_sample={self.views_per_sample} > "
+                f"len(view_indices)={len(self.view_indices)}"
+            )
+        if view_sample_mode not in ("random", "first"):
+            raise ValueError(
+                f"view_sample_mode must be 'random' or 'first', got {view_sample_mode!r}"
+            )
+        self.view_sample_mode = str(view_sample_mode)
+        self.seed = None if seed is None else int(seed)
+        # When True, load failures raise instead of silently substituting another mesh.
+        self.strict_load = bool(strict_load)
         # Backward-compat: single default view used when callers ignore samples.
         self.view_idx = int(self.view_indices[0])
         self.vggt_cache = vggt_cache
+        self.use_joint_vggt_cache = bool(use_joint_vggt_cache)
+        if self.use_joint_vggt_cache:
+            if self.vggt_cache is None:
+                raise ValueError("use_joint_vggt_cache requires vggt_cache_root")
+            if self.views_per_sample < 2:
+                raise ValueError(
+                    "use_joint_vggt_cache requires views_per_sample >= 2"
+                )
+            if len(self.view_indices) < self.views_per_sample:
+                raise ValueError(
+                    "use_joint_vggt_cache requires len(view_indices) >= "
+                    f"views_per_sample (got {len(self.view_indices)} vs "
+                    f"{self.views_per_sample})"
+                )
         self.gobjaverse_normalization = bool(gobjaverse_normalization)
         # Default True: put GT xyz into the same camera frame as VGGT PE.
         self.surface_in_camera_frame = bool(surface_in_camera_frame)
@@ -125,25 +173,58 @@ class SurfaceRenderDataset(Dataset):
         if not self.mesh_paths:
             raise FileNotFoundError(f"No meshes under {data_dir}")
 
+        # Per-mesh available views from the pool (after filter).
+        self._mesh_available: Dict[str, List[int]] = {}
         self.samples: List[Tuple[str, int]] = self._build_samples(
             filter_missing=filter_missing_views
         )
         logger.info(
-            "SurfaceRenderDataset: %d meshes × %d view(s) → %d samples, "
-            "render=%s, vggt_cache=%s, gobjaverse_norm=%s, surface_frame=%s",
+            "SurfaceRenderDataset: %d meshes, pool=%d view(s), views_per_sample=%d "
+            "(%s) → %d samples, align_mode=%s, render=%s, vggt_cache=%s, "
+            "joint_vggt_cache=%s, "
+            "gobjaverse_norm=%s, surface_frame=%s, seed=%s, strict_load=%s",
             len(self.mesh_paths),
             len(self.view_indices),
+            self.views_per_sample,
+            self.view_sample_mode,
             len(self.samples),
+            self.align_mode,
             gt_source is not None,
             vggt_cache is not None,
+            self.use_joint_vggt_cache,
             self.gobjaverse_normalization and gt_source is not None,
             "camera" if self.surface_in_camera_frame else "object",
+            self.seed,
+            self.strict_load,
         )
+
+    def _available_pool_views(self, path: str, available: Optional[Set[int]]) -> List[int]:
+        """Pool views that exist on disk for this mesh (order = view_indices)."""
+        out: List[int] = []
+        for vid in self.view_indices:
+            if available is not None and vid not in available:
+                continue
+            out.append(int(vid))
+        return out
 
     def _build_samples(self, *, filter_missing: bool) -> List[Tuple[str, int]]:
         samples: List[Tuple[str, int]] = []
         skipped_render = 0
         skipped_cache = 0
+        skipped_too_few = 0
+        multi = self.views_per_sample > 1
+        # Multi-view PE is online unless joint cache is enabled.
+        require_cache = (
+            (not multi) and self.vggt_cache is not None
+        ) or (
+            multi and self.use_joint_vggt_cache and self.vggt_cache is not None
+        )
+        joint_fixed = (
+            self.use_joint_vggt_cache
+            and len(self.view_indices) == self.views_per_sample
+        )
+        joint_pool = self.use_joint_vggt_cache and not joint_fixed
+
         for path in self.mesh_paths:
             available: Optional[Set[int]] = None
             if filter_missing and self.render_loader is not None:
@@ -153,35 +234,95 @@ class SurfaceRenderDataset(Dataset):
                 except Exception as e:
                     logger.warning("No render dir for %s: %s", path, e)
                     available = set()
-            for vid in self.view_indices:
-                if available is not None and vid not in available:
-                    skipped_render += 1
+            pool = self._available_pool_views(path, available)
+            self._mesh_available[path] = pool
+
+            if multi:
+                if len(pool) < self.views_per_sample:
+                    skipped_too_few += 1
                     continue
-                # When a cache root is configured, only keep pairs that are cached
-                # so multi-view batches never mix present/missing weak context.
-                if self.vggt_cache is not None and not self.vggt_cache.has(path, vid):
+                if self.use_joint_vggt_cache:
+                    if joint_fixed:
+                        if not all(v in pool for v in self.view_indices):
+                            skipped_too_few += 1
+                            continue
+                        needed = [list(self.view_indices)]
+                    else:
+                        # All ordered k-tuples among available pool views.
+                        needed = ordered_view_tuples(
+                            pool, tuple_size=self.views_per_sample
+                        )
+                    missing = [
+                        t for t in needed if not self.vggt_cache.has_joint(path, t)
+                    ]
+                    if missing:
+                        skipped_cache += 1
+                        continue
+                # Sentinel view_idx=-1 → choose N views in __getitem__.
+                samples.append((path, -1))
+                continue
+
+            for vid in pool:
+                if require_cache and not self.vggt_cache.has(path, vid):
                     skipped_cache += 1
                     continue
                 samples.append((path, int(vid)))
+            skipped_render += max(0, len(self.view_indices) - len(pool))
+
         if skipped_render:
             logger.info("Skipped %d (mesh, view) pairs with missing renders", skipped_render)
         if skipped_cache:
             logger.info(
                 "Skipped %d (mesh, view) pairs missing from VGGT cache "
-                "(cache all views before multi-view train)",
+                + (
+                    "(cache all ordered joint pairs with "
+                    "cache_vggt_features.py --joint_pairs)"
+                    if joint_pool
+                    else (
+                        "(cache joint views before multi-view train)"
+                        if self.use_joint_vggt_cache
+                        else "(cache all views before multi-view train)"
+                    )
+                ),
                 skipped_cache,
+            )
+        if skipped_too_few:
+            logger.info(
+                "Skipped %d meshes with fewer than %d available pool views",
+                skipped_too_few,
+                self.views_per_sample,
             )
         if not samples:
             raise FileNotFoundError(
-                f"No (mesh, view) samples from {len(self.mesh_paths)} meshes "
+                f"No samples from {len(self.mesh_paths)} meshes "
                 f"and views {self.view_indices}"
                 + (
                     " — cache is empty for these views; run cache_vggt_features.py first"
-                    if self.vggt_cache is not None
+                    if require_cache
                     else ""
                 )
             )
         return samples
+
+    def _choose_views(self, path: str, idx: int) -> List[int]:
+        pool = list(self._mesh_available.get(path) or self.view_indices)
+        k = self.views_per_sample
+        if len(pool) < k:
+            raise RuntimeError(
+                f"{path}: only {len(pool)} pool views, need views_per_sample={k}"
+            )
+        # Fixed ordered tuple: exact view_indices (eval / legacy joint), or
+        # view_sample_mode=first → first-k of the available pool.
+        if self.view_sample_mode == "first":
+            if (
+                self.use_joint_vggt_cache
+                and len(self.view_indices) == self.views_per_sample
+            ):
+                return list(self.view_indices)
+            return pool[:k]
+        # Fresh random ordered k-tuple each __getitem__ (covers all P(n,k)).
+        del idx  # unused; keeps signature stable for callers
+        return random.sample(pool, k)
 
     def _surface_meta(self, path: str) -> Optional[Dict]:
         if not self.gobjaverse_normalization or self.render_loader is None:
@@ -192,70 +333,210 @@ class SurfaceRenderDataset(Dataset):
             logger.warning("No G-Objaverse meta for %s: %s", path, e)
             return None
 
+    def _surface_to_camera(
+        self, surface: torch.Tensor, c2w: torch.Tensor
+    ) -> torch.Tensor:
+        xyz = surface[:, :3]
+        xyz_cam = world_to_camera_torch(xyz, c2w)
+        out = surface.clone()
+        out[:, :3] = xyz_cam
+        if out.shape[-1] >= 6:
+            nrm = out[:, 3:6]
+            R = c2w[:3, :3]
+            out[:, 3:6] = nrm @ R
+        return out
+
+    def _apply_gt_align(
+        self,
+        surface: torch.Tensor,
+        *,
+        views: List[Dict],
+        c2w_ref: torch.Tensor,
+        vggt_cache: Optional[Dict] = None,
+    ) -> Tuple[torch.Tensor, Optional[float]]:
+        """Normalize GT xyz for ``align_mode``. Returns (surface, mean_z_or_None)."""
+        if not self.surface_in_camera_frame:
+            return surface, None
+
+        if self.align_mode == "c_meanrms":
+            from hy3dgen.shapegen.cam_align import (
+                align_gt_xyz,
+                compute_c_meanrms_gt_stats,
+            )
+
+            depths = []
+            rgbs = []
+            Ks = []
+            c2ws = []
+            for v in views:
+                d = v["depth"]
+                depths.append(d.numpy() if torch.is_tensor(d) else np.asarray(d))
+                rgb = v["rgb"]
+                if torch.is_tensor(rgb):
+                    rgbs.append(rgb.permute(1, 2, 0).numpy())
+                else:
+                    rgbs.append(np.asarray(rgb))
+                Ks.append(v["intrinsics"].numpy() if torch.is_tensor(v["intrinsics"]) else v["intrinsics"])
+                c2ws.append(
+                    v["c2w"].numpy() if torch.is_tensor(v["c2w"]) else np.asarray(v["c2w"])
+                )
+            stats = compute_c_meanrms_gt_stats(
+                depths,
+                rgbs,
+                Ks,
+                c2ws,
+                c2w_ref.numpy() if torch.is_tensor(c2w_ref) else np.asarray(c2w_ref),
+                erode_iters=1,
+            )
+            surf = surface.clone()
+            surf[:, :3] = align_gt_xyz(
+                surf[:, :3],
+                mean_z_gt_depth=1.0,
+                align_stats={"c_meanrms": stats},
+                mode="c_meanrms",
+            )
+            return surf, None
+
+        # cross / fair_gobK: need cache align_stats + GT-depth mean_z
+        if (
+            vggt_cache is None
+            or not isinstance(vggt_cache, dict)
+            or "align_stats" not in vggt_cache
+        ):
+            return surface, None
+
+        from hy3dgen.shapegen.cam_align import align_gt_xyz, gt_depth_mean_z
+
+        ref = views[0]
+        mz = gt_depth_mean_z(ref["depth"], ref["intrinsics"], ref.get("rgb"))
+        surf = surface.clone()
+        surf[:, :3] = align_gt_xyz(
+            surf[:, :3],
+            mean_z_gt_depth=mz,
+            align_stats=vggt_cache["align_stats"],
+            mode=self.align_mode,
+        )
+        return surf, float(mz)
+
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Dict:
         n = len(self.samples)
+        if self.strict_load:
+            path, view_idx = self.samples[idx % n]
+            try:
+                if self.views_per_sample > 1:
+                    chosen = self._choose_views(path, idx)
+                    return self._load_multi_view_sample(path, chosen)
+                return self._load_single_view_sample(path, int(view_idx))
+            except Exception as e:
+                raise RuntimeError(
+                    f"strict_load: failed to load sample idx={idx} "
+                    f"path={path} view={view_idx}: {e}"
+                ) from e
         for attempt in range(n):
             path, view_idx = self.samples[(idx + attempt) % n]
             try:
-                surface = self.surface_loader(
-                    path, gobjaverse_meta=self._surface_meta(path)
-                ).squeeze(0)
-                out: Dict = {
-                    "surface": surface,
-                    "mesh_path": path,
-                    "surface_frame": "object",
-                    "view_idx": torch.tensor(view_idx, dtype=torch.long),
-                }
-                if self.render_loader is not None and self.render_loader.gt_source.has_gt(path):
-                    view = self.render_loader.load_view(path, view_idx=view_idx)
-                    out.update(view)
-                    if self.surface_in_camera_frame:
-                        # Transform xyz only; normals/rgb stay as stored channels.
-                        xyz = surface[:, :3]
-                        xyz_cam = world_to_camera_torch(xyz, view["c2w"])
-                        surface = surface.clone()
-                        surface[:, :3] = xyz_cam
-                        # Rotate normals into camera frame too (same R).
-                        if surface.shape[-1] >= 6:
-                            nrm = surface[:, 3:6]
-                            R = view["c2w"][:3, :3]
-                            surface[:, 3:6] = nrm @ R
-                        out["surface"] = surface
-                        out["surface_frame"] = "camera"
-                if self.vggt_cache is not None:
-                    cached = self.vggt_cache.load(path, view_idx)
-                    if cached is not None:
-                        out["vggt_cache"] = cached
-                # Cross / fair_gobK: /mean(GT depth) + Hunyuan bbox from cache stats
-                if (
-                    self.surface_in_camera_frame
-                    and "depth" in out
-                    and "vggt_cache" in out
-                    and isinstance(out["vggt_cache"], dict)
-                    and "align_stats" in out["vggt_cache"]
-                ):
-                    from hy3dgen.shapegen.cam_align import align_gt_xyz, gt_depth_mean_z
-
-                    mz = gt_depth_mean_z(
-                        out["depth"], out["intrinsics"], out.get("rgb")
-                    )
-                    surf = out["surface"].clone()
-                    surf[:, :3] = align_gt_xyz(
-                        surf[:, :3],
-                        mean_z_gt_depth=mz,
-                        align_stats=out["vggt_cache"]["align_stats"],
-                        mode=self.align_mode,
-                    )
-                    out["surface"] = surf
-                    out["align_mode"] = self.align_mode
-                    out["gt_depth_mean_z"] = torch.tensor(mz, dtype=torch.float32)
-                return out
+                if self.views_per_sample > 1:
+                    chosen = self._choose_views(path, idx + attempt)
+                    return self._load_multi_view_sample(path, chosen)
+                return self._load_single_view_sample(path, int(view_idx))
             except Exception as e:
-                logger.warning("Skipping %s view %d: %s", path, view_idx, e)
-        raise RuntimeError(f"All {n} (mesh, view) samples failed to load")
+                logger.warning("Skipping %s view %s: %s", path, view_idx, e)
+        raise RuntimeError(f"All {n} samples failed to load")
+
+    def _load_single_view_sample(self, path: str, view_idx: int) -> Dict:
+        surface = self.surface_loader(
+            path, gobjaverse_meta=self._surface_meta(path)
+        ).squeeze(0)
+        out: Dict = {
+            "surface": surface,
+            "mesh_path": path,
+            "surface_frame": "object",
+            "view_idx": torch.tensor(view_idx, dtype=torch.long),
+        }
+        if self.render_loader is not None and self.render_loader.gt_source.has_gt(path):
+            view = self.render_loader.load_view(path, view_idx=view_idx)
+            out.update(view)
+            if self.surface_in_camera_frame:
+                surface = self._surface_to_camera(surface, view["c2w"])
+                out["surface"] = surface
+                out["surface_frame"] = "camera"
+            cached = None
+            if self.vggt_cache is not None:
+                cached = self.vggt_cache.load(path, view_idx)
+                if cached is not None:
+                    out["vggt_cache"] = cached
+            surf, mz = self._apply_gt_align(
+                out["surface"],
+                views=[view] if "depth" in out else [],
+                c2w_ref=view["c2w"],
+                vggt_cache=cached if isinstance(cached, dict) else None,
+            )
+            out["surface"] = surf
+            out["align_mode"] = self.align_mode
+            if mz is not None:
+                out["gt_depth_mean_z"] = torch.tensor(mz, dtype=torch.float32)
+        return out
+
+    def _load_multi_view_sample(self, path: str, view_ids: List[int]) -> Dict:
+        """One object + N views; ref = view_ids[0] (VGGT + GT camera frame)."""
+        if self.render_loader is None:
+            raise RuntimeError("Multi-view samples require a G-Objaverse render source")
+        surface = self.surface_loader(
+            path, gobjaverse_meta=self._surface_meta(path)
+        ).squeeze(0)
+        views = [self.render_loader.load_view(path, view_idx=int(v)) for v in view_ids]
+        ref = views[0]
+        if self.surface_in_camera_frame:
+            surface = self._surface_to_camera(surface, ref["c2w"])
+            surface_frame = "camera"
+        else:
+            surface_frame = "object"
+
+        surface, mz = self._apply_gt_align(
+            surface,
+            views=views,
+            c2w_ref=ref["c2w"],
+            vggt_cache=None,
+        )
+        joint_cached = None
+        if self.use_joint_vggt_cache and self.vggt_cache is not None:
+            joint_cached = self.vggt_cache.load_joint(path, view_ids)
+            if joint_cached is None:
+                raise FileNotFoundError(
+                    f"Missing joint VGGT cache for {path} views {view_ids}"
+                )
+
+        rgb_views = torch.stack([v["rgb"] for v in views], dim=0)  # [S,3,H,W]
+        depth_views = torch.stack([v["depth"] for v in views], dim=0)
+        intrinsics_views = torch.stack([v["intrinsics"] for v in views], dim=0)
+        c2w_views = torch.stack([v["c2w"] for v in views], dim=0)
+        view_idx_t = torch.tensor([int(v) for v in view_ids], dtype=torch.long)
+
+        out: Dict = {
+            "surface": surface,
+            "mesh_path": path,
+            "surface_frame": surface_frame,
+            # Ref view fields (compat with single-view collate / debug).
+            "rgb": ref["rgb"],
+            "depth": ref["depth"],
+            "intrinsics": ref["intrinsics"],
+            "c2w": ref["c2w"],
+            "view_idx": view_idx_t[0],
+            "rgb_views": rgb_views,
+            "depth_views": depth_views,
+            "intrinsics_views": intrinsics_views,
+            "c2w_views": c2w_views,
+            "view_indices": view_idx_t,
+            "align_mode": self.align_mode,
+        }
+        if joint_cached is not None:
+            out["vggt_cache"] = joint_cached
+        if mz is not None:
+            out["gt_depth_mean_z"] = torch.tensor(mz, dtype=torch.float32)
+        return out
 
 
 def collate_surface_render(batch: List[Dict]) -> Dict:
@@ -278,8 +559,19 @@ def collate_surface_render(batch: List[Dict]) -> Dict:
         out["depth"] = torch.stack([b["depth"] for b in batch], dim=0)
         out["intrinsics"] = torch.stack([b["intrinsics"] for b in batch], dim=0)
         out["c2w"] = torch.stack([b["c2w"] for b in batch], dim=0)
+    if all("rgb_views" in b for b in batch):
+        # [B,S,3,H,W] — S must match across the batch (same views_per_sample).
+        out["rgb_views"] = torch.stack([b["rgb_views"] for b in batch], dim=0)
+        out["depth_views"] = torch.stack([b["depth_views"] for b in batch], dim=0)
+        out["intrinsics_views"] = torch.stack(
+            [b["intrinsics_views"] for b in batch], dim=0
+        )
+        out["c2w_views"] = torch.stack([b["c2w_views"] for b in batch], dim=0)
+        out["view_indices"] = torch.stack([b["view_indices"] for b in batch], dim=0)
     if all("vggt_cache" in b for b in batch):
         out["vggt_cache"] = [b["vggt_cache"] for b in batch]
+    elif any("vggt_cache" in b for b in batch):
+        raise RuntimeError("Inconsistent vggt_cache across batch items")
     return out
 
 
@@ -295,7 +587,10 @@ def build_surface_render_dataset(
     view_idx: int = 0,
     view_indices: Optional[List[int]] = None,
     num_views: Optional[int] = None,
+    views_per_sample: int = 1,
+    view_sample_mode: str = "random",
     vggt_cache_root: Optional[str] = None,
+    use_joint_vggt_cache: bool = False,
     pc_size: int = 5120,
     pc_sharpedge_size: int = 5120,
     seed: Optional[int] = None,
@@ -304,6 +599,7 @@ def build_surface_render_dataset(
     world_scale: float = 1.0,  # deprecated — ignored (kept for CLI compat)
     align_mode: str = "cross",
     filter_missing_views: bool = True,
+    strict_load: bool = False,
 ) -> SurfaceRenderDataset:
     from train_pc_ae import discover_mesh_paths
 
@@ -313,8 +609,10 @@ def build_surface_render_dataset(
             "frame without an extra rescale.",
             world_scale,
         )
-    if align_mode not in ("cross", "fair_gobK"):
-        raise ValueError(f"align_mode must be 'cross' or 'fair_gobK', got {align_mode!r}")
+    if align_mode not in ("cross", "fair_gobK", "c_meanrms"):
+        raise ValueError(
+            f"align_mode must be 'cross', 'fair_gobK', or 'c_meanrms', got {align_mode!r}"
+        )
 
     resolved_views = (
         [int(v) for v in view_indices]
@@ -342,9 +640,13 @@ def build_surface_render_dataset(
         gt_source=gt_source,
         view_idx=resolved_views[0],
         view_indices=resolved_views,
+        views_per_sample=views_per_sample,
+        view_sample_mode=view_sample_mode,
         vggt_cache=cache,
+        use_joint_vggt_cache=use_joint_vggt_cache,
         gobjaverse_normalization=gobjaverse_normalization,
         surface_in_camera_frame=surface_in_camera_frame,
         align_mode=align_mode,
         filter_missing_views=filter_missing_views,
+        strict_load=strict_load,
     )

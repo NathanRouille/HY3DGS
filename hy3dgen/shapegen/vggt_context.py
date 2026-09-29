@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -279,6 +279,32 @@ class CachedVGGTContextStore:
             return None
         return torch.load(p, map_location="cpu", weights_only=False)
 
+    def joint_tag(self, view_indices: Sequence[int]) -> str:
+        """Filename tag for a fixed ordered view tuple (view 0 = VGGT reference)."""
+        return "_".join(f"{int(v):05d}" for v in view_indices)
+
+    def joint_path_for(self, mesh_path: str, view_indices: Sequence[int]) -> Path:
+        stem = Path(mesh_path).stem
+        return self.cache_root / f"{stem}_joint_{self.joint_tag(view_indices)}.pt"
+
+    def has_joint(self, mesh_path: str, view_indices: Sequence[int]) -> bool:
+        return self.joint_path_for(mesh_path, view_indices).exists()
+
+    def save_joint(
+        self, mesh_path: str, view_indices: Sequence[int], payload: Dict
+    ) -> Path:
+        p = self.joint_path_for(mesh_path, view_indices)
+        torch.save(payload, p)
+        return p
+
+    def load_joint(
+        self, mesh_path: str, view_indices: Sequence[int]
+    ) -> Optional[Dict]:
+        p = self.joint_path_for(mesh_path, view_indices)
+        if not p.exists():
+            return None
+        return torch.load(p, map_location="cpu", weights_only=False)
+
 
 class VGGTContextBuilder(nn.Module):
     """Weak context from frozen VGGT (features + camera-frame PE from VGGT depth).
@@ -383,6 +409,23 @@ class VGGTContextBuilder(nn.Module):
             )
             valid = valid & ~white
         return valid
+
+    def _camera_tokens_from_aggregator(
+        self,
+        aggregated_tokens_list: List[torch.Tensor],
+        *,
+        num_views: int,
+    ) -> torch.Tensor:
+        """Camera tokens from the **last** VGGT layer, one per view.
+
+        Returns ``[B, S, C]`` with ``S=num_views`` (view 0 = reference / cam0).
+        """
+        layer_idx = self.layers[-1]
+        cams: List[torch.Tensor] = []
+        for s in range(int(num_views)):
+            tok = aggregated_tokens_list[layer_idx][:, s].float()
+            cams.append(tok[:, :1, :])
+        return torch.cat(cams, dim=1)
 
     def _fallback_raw(self, rgb: torch.Tensor) -> Dict[str, torch.Tensor]:
         b = rgb.shape[0]
@@ -559,6 +602,281 @@ class VGGTContextBuilder(nn.Module):
             out["vggt_intrinsics"] = K.to(device=device)
         return out
 
+    @torch.no_grad()
+    def extract_vggt_sequence_dense(
+        self,
+        rgb_views: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Multi-view VGGT dense geometry in the **first-camera / world** frame.
+
+        Args:
+            rgb_views: ``[S,3,H,W]`` or ``[1,S,3,H,W]`` RGBs (view 0 = reference).
+
+        Returns (no batch dim on sequence unless noted):
+            depth ``[S,H,W]``, depth_conf ``[S,H,W]``,
+            extrinsics ``[S,3,4]`` (cam←world), intrinsics ``[S,3,3]``,
+            world_points_from_depth ``[S,H,W,3]`` (via VGGT unproject),
+            plus view-0 ``vggt_cam_points`` / tokens fields matching
+            :meth:`extract_vggt_raw` when ``S==1``.
+        """
+        if rgb_views.dim() == 5:
+            assert rgb_views.shape[0] == 1, "batch>1 not supported in sequence helper"
+            rgb_views = rgb_views[0]
+        assert rgb_views.dim() == 4 and rgb_views.shape[1] == 3, rgb_views.shape
+        S = int(rgb_views.shape[0])
+        device = rgb_views.device
+
+        # S==1: reuse the exact single-view path (bit-identical dense fields).
+        if S == 1:
+            raw = self.extract_vggt_raw(rgb_views, return_dense=True)
+            d = raw["vggt_depth"][0]
+            c = raw["vggt_depth_conf"][0]
+            E = raw["vggt_extrinsics"][0]
+            K = raw["vggt_intrinsics"][0]
+            cam0 = raw["vggt_cam_points"][0]
+            # Full-grid centres → kept / discarded (same recipe as multi-view).
+            fx0 = float(K[0, 0])
+            fy0 = float(K[1, 1])
+            cx0 = float(K[0, 2])
+            cy0 = float(K[1, 2])
+            rgb0 = (
+                preprocess_rgb_for_vggt(
+                    rgb_views[0:1].float().clamp(0, 1), target_size=self.img_size
+                )[0][0]
+                .permute(1, 2, 0)
+                .float()
+                .cpu()
+                .numpy()
+            )
+            pix0 = self._pixel_valid_mask(
+                d.cpu().numpy(), c.cpu().numpy(), rgb_np=rgb0
+            )
+            full_c, full_keep = patch_centers_from_depth(
+                cam0.cpu().numpy(),
+                pix0,
+                patch_size=self.patch_size,
+                fx=fx0,
+                fy=fy0,
+                cx=cx0,
+                cy=cy0,
+            )
+            keep_b = full_keep.astype(bool)
+            disc = full_c[~keep_b] if (~keep_b).any() else np.zeros((0, 3), np.float32)
+            dense_fg = (
+                cam0.cpu().numpy()[pix0].astype(np.float32)
+                if pix0.any()
+                else np.zeros((0, 3), np.float32)
+            )
+            return {
+                **{k: v for k, v in raw.items()},
+                "patch_centers_discarded": torch.from_numpy(disc.astype(np.float32))
+                .unsqueeze(0)
+                .to(device=device, dtype=rgb_views.dtype),
+                "vggt_points_cam0": torch.from_numpy(dense_fg).to(
+                    device=device, dtype=rgb_views.dtype
+                ),
+                "num_views": torch.tensor(1),
+                "vggt_depth_seq": d.unsqueeze(0),
+                "vggt_depth_conf_seq": c.unsqueeze(0),
+                "vggt_extrinsics_seq": E.unsqueeze(0),
+                "vggt_intrinsics_seq": K.unsqueeze(0),
+                "vggt_world_points_from_depth": cam0.unsqueeze(0),
+            }
+
+        vggt = self._load_vggt()
+        if vggt is None:
+            raise RuntimeError("VGGT not available for multi-view extract")
+
+        from vggt.utils.geometry import unproject_depth_map_to_point_map  # type: ignore
+        from vggt.utils.pose_enc import pose_encoding_to_extri_intri  # type: ignore
+
+        vggt = vggt.to(device)
+        # Preprocess each view to the same padded size as single-view.
+        imgs = []
+        for s in range(S):
+            im, _, _, _, _ = preprocess_rgb_for_vggt(
+                rgb_views[s : s + 1].float().clamp(0, 1), target_size=self.img_size
+            )
+            imgs.append(im.to(device=device))
+        images_s = torch.stack(imgs, dim=1)  # [1,S,3,H,W]
+        _, _, _, H, W = images_s.shape
+
+        amp_dtype = torch.bfloat16
+        amp_enabled = device.type == "cuda"
+        if amp_enabled:
+            major = torch.cuda.get_device_capability(device)[0]
+            if major < 8:
+                amp_dtype = torch.float16
+
+        with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=amp_dtype):
+            aggregated_tokens_list, patch_start_idx = vggt.aggregator(images_s)
+            depth_pred, depth_conf = vggt.depth_head(
+                aggregated_tokens_list, images=images_s, patch_start_idx=patch_start_idx
+            )
+            pose_enc = vggt.camera_head(aggregated_tokens_list)[-1]
+
+        depth_b = depth_pred[0, :, ..., 0].float()  # [S,H,W]
+        conf_b = depth_conf[0].float()
+        extrinsics, intrins = pose_encoding_to_extri_intri(
+            pose_enc, image_size_hw=(H, W)
+        )
+        E = extrinsics[0].float()  # [S,3,4]
+        K = intrins[0].float()  # [S,3,3]
+
+        world = unproject_depth_map_to_point_map(
+            depth_b[..., None].cpu().numpy(),
+            E.cpu().numpy(),
+            K.cpu().numpy(),
+        )  # [S,H,W,3]
+        world_t = torch.from_numpy(world.astype(np.float32)).to(device=device)
+
+        # View-0 camera-frame points (same as single-view unproject with K0).
+        fx = float(K[0, 0, 0])
+        fy = float(K[0, 1, 1])
+        cx = float(K[0, 0, 2])
+        cy = float(K[0, 1, 2])
+        cam0 = depth_map_to_cam_points(
+            depth_b[0].cpu().numpy(), fx=fx, fy=fy, cx=cx, cy=cy
+        )
+        cam0_t = torch.from_numpy(cam0.astype(np.float32)).to(device=device)
+
+        # Tokens / centres from **all** views; centres live in VGGT cam0.
+        # View 0 uses local depth unproject (bit-match single-view). Other views
+        # map VGGT world_from_depth → cam0 via E0.
+        from hy3dgen.shapegen.cam_align import vggt_world_to_cam0
+
+        E0_np = E[0].cpu().numpy()
+        kept_toks: List[torch.Tensor] = []
+        kept_cens: List[torch.Tensor] = []
+        disc_cens: List[torch.Tensor] = []
+        dense_cam0_fg: List[np.ndarray] = []
+        keep0_full = None
+        for s in range(S):
+            patch_layers_s: List[torch.Tensor] = []
+            for layer_idx in self.layers:
+                tok = aggregated_tokens_list[layer_idx][:, s].float()
+                patch_layers_s.append(tok[:, patch_start_idx:, :])
+            patch_full_s = torch.cat(patch_layers_s, dim=-1)[0]  # [Np, C]
+            fx_s = float(K[s, 0, 0])
+            fy_s = float(K[s, 1, 1])
+            cx_s = float(K[s, 0, 2])
+            cy_s = float(K[s, 1, 2])
+            rgb_s = images_s[0, s].permute(1, 2, 0).float().cpu().numpy()
+            depth_s = depth_b[s].cpu().numpy()
+            conf_s = conf_b[s].cpu().numpy()
+            pix_s = self._pixel_valid_mask(depth_s, conf_s, rgb_np=rgb_s)
+            if s == 0:
+                cen_grid = cam0
+            else:
+                cen_grid = vggt_world_to_cam0(
+                    world[s].reshape(-1, 3), E0_np
+                ).reshape(world[s].shape)
+            centers_s, keep_s = patch_centers_from_depth(
+                cen_grid,
+                pix_s,
+                patch_size=self.patch_size,
+                fx=fx_s,
+                fy=fy_s,
+                cx=cx_s,
+                cy=cy_s,
+            )
+            n_full = patch_full_s.shape[0]
+            if centers_s.shape[0] != n_full:
+                if centers_s.shape[0] > n_full:
+                    centers_s, keep_s = centers_s[:n_full], keep_s[:n_full]
+                else:
+                    pad = n_full - centers_s.shape[0]
+                    centers_s = np.pad(centers_s, ((0, pad), (0, 0)))
+                    keep_s = np.pad(keep_s, (0, pad), constant_values=False)
+            keep_t = torch.from_numpy(keep_s.astype(bool))
+            cen_t = torch.from_numpy(centers_s.astype(np.float32))
+            if s == 0:
+                keep0_full = keep_t
+            if keep_t.any():
+                kept_toks.append(patch_full_s[keep_t])
+                kept_cens.append(cen_t[keep_t])
+            else:
+                kept_toks.append(patch_full_s[:1] * 0)
+                kept_cens.append(torch.zeros(1, 3))
+            if (~keep_t).any():
+                disc_cens.append(cen_t[~keep_t])
+            # Dense FG cloud in cam0 (same frame as PE centres).
+            if pix_s.any():
+                dense_cam0_fg.append(cen_grid[pix_s].astype(np.float32))
+
+        tok_k = torch.cat(kept_toks, dim=0)
+        cen_k = torch.cat(kept_cens, dim=0)
+        if disc_cens:
+            cen_disc = torch.cat(disc_cens, dim=0)
+        else:
+            cen_disc = torch.zeros(0, 3, dtype=torch.float32)
+        if dense_cam0_fg:
+            dense_fg = np.concatenate(dense_cam0_fg, axis=0)
+        else:
+            dense_fg = np.zeros((0, 3), dtype=np.float32)
+        if keep0_full is None:
+            keep0_full = torch.ones(tok_k.shape[0], dtype=torch.bool)
+
+        # Last aggregator layer (23): one camera token per view, prepended in-sequence.
+        cam_token = self._camera_tokens_from_aggregator(
+            aggregated_tokens_list, num_views=S
+        ).to(dtype=rgb_views.dtype)
+
+        return {
+            "patch_tokens": tok_k.unsqueeze(0).to(dtype=rgb_views.dtype),
+            "camera_token": cam_token.to(dtype=rgb_views.dtype),
+            "patch_centers": cen_k.unsqueeze(0).to(
+                device=device, dtype=rgb_views.dtype
+            ),
+            "patch_centers_discarded": cen_disc.unsqueeze(0).to(
+                device=device, dtype=rgb_views.dtype
+            ),
+            "patch_keep": torch.ones(1, cen_k.shape[0], dtype=torch.bool, device=device),
+            "patch_keep_full": keep0_full.unsqueeze(0).to(device=device),
+            "vggt_cam_points": cam0_t.unsqueeze(0),
+            "vggt_points_cam0": torch.from_numpy(dense_fg).to(
+                device=device, dtype=rgb_views.dtype
+            ),
+            "vggt_depth": depth_b[0:1],
+            "vggt_depth_conf": conf_b[0:1],
+            "vggt_extrinsics": E[0:1],
+            "vggt_intrinsics": K[0:1],
+            "num_views": torch.tensor(S),
+            "vggt_depth_seq": depth_b,
+            "vggt_depth_conf_seq": conf_b,
+            "vggt_extrinsics_seq": E,
+            "vggt_intrinsics_seq": K,
+            "vggt_world_points_from_depth": world_t,
+        }
+
+    def build_c_meanrms_from_rgb_views(
+        self,
+        rgb_views: torch.Tensor,
+        *,
+        include_camera_in_sequence: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Online multi-view weak context for ``align_mode=c_meanrms``.
+
+        Runs VGGT on ``rgb_views`` ``[S,3,H,W]`` (view 0 = VGGT reference),
+        concatenates kept patch tokens with centres in VGGT cam0, applies own
+        mean+RMS, then the usual Fourier PE → ``feat_proj`` → sequence (same as
+        single-view ``forward_from_features``).
+        """
+        from hy3dgen.shapegen.cam_align import align_patch_centers
+
+        raw = self.extract_vggt_sequence_dense(rgb_views)
+        centers = raw["patch_centers"]
+        if centers.dim() == 3:
+            centers = centers[0]
+        centers = align_patch_centers(centers, {}, mode="c_meanrms").unsqueeze(0)
+        return self.forward_from_features(
+            raw["patch_tokens"],
+            raw["camera_token"],
+            centers.to(device=raw["patch_tokens"].device, dtype=raw["patch_tokens"].dtype),
+            patch_keep=raw.get("patch_keep"),
+            include_camera_in_sequence=include_camera_in_sequence,
+        )
+
     def build_from_cached(
         self,
         payload: Dict,
@@ -566,12 +884,18 @@ class VGGTContextBuilder(nn.Module):
         *,
         center_scale: float = 1.0,
         align_mode: str = "cross",
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Returns (weak_context [1,1+N,W], token_keep [1,1+N] bool).
+        include_camera_in_sequence: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns (weak_context, token_keep, camera_embed [1, W]).
 
-        ``align_mode``: ``cross`` (PE=vggtK own bbox) or ``fair_gobK`` (PE=gobK
-        shared bbox). Requires cache payloads from ``cache_vggt_features`` that
-        include ``align_stats`` (+ ``patch_centers_gobK`` for fair_gobK).
+        ``align_mode``: ``cross`` (PE=vggtK own bbox), ``fair_gobK`` (PE=gobK
+        shared bbox), or ``c_meanrms`` (PE=vggtK own mean+RMS). Requires cache
+        payloads from ``cache_vggt_features`` that include ``align_stats``
+        (+ ``patch_centers_gobK`` for fair_gobK). For multi-view ``c_meanrms``,
+        prefer :meth:`build_c_meanrms_from_rgb_views` instead of cache.
+
+        When ``include_camera_in_sequence`` is False, the sequence is patch tokens
+        only; ``camera_embed`` is still returned for AdaLN conditioning.
         """
         del center_scale  # no world_scale in camera-frame design
         if payload.get("pe_frame", "camera") != "camera":
@@ -609,9 +933,9 @@ class VGGTContextBuilder(nn.Module):
                 keep = keep.unsqueeze(0)
 
         align_stats = payload.get("align_stats")
-        if align_stats is not None:
+        if align_mode == "c_meanrms" or align_stats is not None:
             centers = align_patch_centers(
-                centers[0], align_stats, mode=align_mode
+                centers[0], align_stats or {}, mode=align_mode
             ).unsqueeze(0)
         else:
             logger.warning(
@@ -619,7 +943,11 @@ class VGGTContextBuilder(nn.Module):
             )
 
         return self.forward_from_features(
-            patch, cam, centers, patch_keep=keep
+            patch,
+            cam,
+            centers,
+            patch_keep=keep,
+            include_camera_in_sequence=include_camera_in_sequence,
         )
 
     def forward_from_features(
@@ -628,11 +956,14 @@ class VGGTContextBuilder(nn.Module):
         camera_token: torch.Tensor,
         patch_centers: torch.Tensor,
         patch_keep: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        *,
+        include_camera_in_sequence: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns:
-            weak_context: [B, 1+N, width]
-            token_keep: [B, 1+N] — camera token always True; pads False
+            weak_context: [B, 1+N, width] if camera in sequence, else [B, N, width]
+            token_keep: [B, 1+N] or [B, N] — pads False; camera always True if present
+            camera_embed: [B, width] projected VGGT camera token (for AdaLN)
         """
         pos = self.pos_embed(patch_centers)
         if layer_tokens.shape[-1] == self.width:
@@ -640,23 +971,43 @@ class VGGTContextBuilder(nn.Module):
         else:
             tokens = self.feat_proj(layer_tokens) + pos
 
-        if camera_token.dim() == 2:
-            camera_token = camera_token.unsqueeze(1)
-        if camera_token.shape[-1] == self.width:
-            cam = camera_token
+        batch_size = int(layer_tokens.shape[0])
+        cam_raw = camera_token
+        if cam_raw.dim() == 2:
+            if cam_raw.shape[0] == batch_size:
+                cam_raw = cam_raw.unsqueeze(1)
+            else:
+                cam_raw = cam_raw.unsqueeze(0)
+        elif cam_raw.dim() != 3:
+            raise ValueError(f"camera_token must be 2D or 3D, got {cam_raw.shape}")
+
+        if cam_raw.shape[-1] == self.width:
+            cam = cam_raw
         else:
-            cam = self.cam_proj(camera_token.squeeze(1)).unsqueeze(1)
+            b, s, c_in = cam_raw.shape
+            flat = cam_raw.reshape(b * s, c_in)
+            cam = self.cam_proj(flat).reshape(b, s, self.width)
+        camera_embed = cam[:, 0]
 
         # Zero out padded slots so they don't inject PE noise before masking.
         if patch_keep is not None:
             tokens = tokens * patch_keep.to(tokens.dtype).unsqueeze(-1)
 
-        ctx = torch.cat([cam, tokens], dim=1)
-        b, n_ctx, _ = ctx.shape
-        keep = torch.ones(b, n_ctx, dtype=torch.bool, device=ctx.device)
-        if patch_keep is not None:
-            keep[:, 1:] = patch_keep
-        return ctx, keep
+        n_cam = int(cam.shape[1])
+        if include_camera_in_sequence:
+            ctx = torch.cat([cam, tokens], dim=1)
+            b, n_ctx, _ = ctx.shape
+            keep = torch.ones(b, n_ctx, dtype=torch.bool, device=ctx.device)
+            if patch_keep is not None:
+                keep[:, n_cam:] = patch_keep
+        else:
+            ctx = tokens
+            b = ctx.shape[0]
+            if patch_keep is not None:
+                keep = patch_keep.to(dtype=torch.bool, device=ctx.device)
+            else:
+                keep = torch.ones(b, ctx.shape[1], dtype=torch.bool, device=ctx.device)
+        return ctx, keep, camera_embed
 
     def forward(
         self,
@@ -666,20 +1017,22 @@ class VGGTContextBuilder(nn.Module):
         c2w: Optional[torch.Tensor] = None,
         *,
         return_dense: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        include_camera_in_sequence: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         raw = self.extract_vggt_raw(
             rgb, depth=depth, intrinsics=intrinsics, c2w=c2w, return_dense=return_dense
         )
-        ctx, keep = self.forward_from_features(
+        ctx, keep, camera_embed = self.forward_from_features(
             raw["patch_tokens"],
             raw["camera_token"],
             raw["patch_centers"],
             patch_keep=raw.get("patch_keep"),
+            include_camera_in_sequence=include_camera_in_sequence,
         )
         if return_dense:
             # Stash dense maps on the module for the debug exporter.
             self._last_dense = {k: v for k, v in raw.items() if k.startswith("vggt_")}
-        return ctx, keep
+        return ctx, keep, camera_embed
 
 
 def cache_vggt_contexts(
@@ -847,3 +1200,205 @@ def _cache_one_vggt_context(
         n_keep,
     )
     return 1
+
+
+def _joint_view_ids(view_indices: Sequence[int]) -> List[int]:
+    views = [int(v) for v in view_indices]
+    if len(views) < 2:
+        raise ValueError(
+            f"Joint VGGT cache requires >=2 views in fixed order, got {views!r}"
+        )
+    return views
+
+
+def _cache_one_joint_vggt_context(
+    mesh_path: str,
+    view_indices: Sequence[int],
+    render_source,
+    cache_store: CachedVGGTContextStore,
+    builder: VGGTContextBuilder,
+    *,
+    device: torch.device,
+    overwrite: bool,
+    store_dtype: torch.dtype,
+) -> int:
+    """Joint multi-view VGGT forward for one mesh (view order = VGGT reference order)."""
+    views = _joint_view_ids(view_indices)
+    if not overwrite and cache_store.has_joint(mesh_path, views):
+        logger.info(
+            "Joint cache hit, skipping %s views %s", mesh_path, views
+        )
+        return 0
+
+    try:
+        loaded = [
+            render_source.load_view(mesh_path, view_idx=int(vid)) for vid in views
+        ]
+    except Exception as e:
+        logger.warning("Skip joint cache %s views %s: %s", mesh_path, views, e)
+        return 0
+
+    rgb_views = torch.stack([v["rgb"] for v in loaded], dim=0).to(device)
+    builder.eval()
+    with torch.no_grad():
+        raw = builder.extract_vggt_sequence_dense(rgb_views)
+
+    def _to_store(t: torch.Tensor) -> torch.Tensor:
+        return t.detach().to(store_dtype).cpu()
+
+    patch_tokens = raw["patch_tokens"]
+    if patch_tokens.dim() == 3:
+        patch_tokens = patch_tokens[0]
+    camera_token = raw["camera_token"]
+    if camera_token.dim() == 3:
+        camera_token = camera_token[0]
+    patch_centers = raw["patch_centers"]
+    if patch_centers.dim() == 3:
+        patch_centers = patch_centers[0]
+    patch_keep = raw.get("patch_keep")
+    if patch_keep is not None and patch_keep.dim() == 2:
+        patch_keep = patch_keep[0]
+
+    disc = raw.get("patch_centers_discarded")
+    if disc is not None and disc.dim() == 3:
+        disc = disc[0]
+
+    dense = raw.get("vggt_points_cam0")
+    if dense is not None:
+        dense_np = dense.detach().float().cpu().numpy().reshape(-1, 3)
+    else:
+        dense_np = np.zeros((0, 3), dtype=np.float32)
+
+    payload = {
+        "cache_kind": "joint",
+        "view_indices": views,
+        "num_camera_tokens": int(len(views)),
+        "patch_tokens": _to_store(patch_tokens),
+        "camera_token": _to_store(camera_token),
+        "patch_centers": _to_store(patch_centers),
+        "patch_centers_vggtK": _to_store(patch_centers),
+        "patch_keep": patch_keep.detach().cpu().bool()
+        if patch_keep is not None
+        else torch.ones(patch_centers.shape[0], dtype=torch.bool),
+        "patch_centers_discarded": _to_store(disc)
+        if disc is not None
+        else torch.zeros(0, 3, dtype=store_dtype),
+        "vggt_points_cam0": dense_np.astype(np.float32),
+        "align_mode_default": "c_meanrms",
+        "mesh_path": mesh_path,
+        "pe_frame": "camera",
+        "geometry_source": "vggt_depth",
+        "num_views": int(len(views)),
+    }
+    cache_store.save_joint(mesh_path, views, payload)
+    n_kept = int(payload["patch_keep"].sum()) if payload["patch_keep"].numel() else 0
+    logger.info(
+        "Cached joint VGGT for %s views %s (%d kept patches, %d dense pts)",
+        Path(mesh_path).stem,
+        views,
+        n_kept,
+        dense_np.shape[0],
+    )
+    return 1
+
+
+def cache_vggt_joint_contexts(
+    mesh_paths: List[str],
+    render_source,
+    cache_store: CachedVGGTContextStore,
+    builder: VGGTContextBuilder,
+    *,
+    view_indices: Sequence[int],
+    device: torch.device,
+    overwrite: bool = False,
+    store_dtype: torch.dtype = torch.float16,
+) -> int:
+    """Precompute **joint** multi-view VGGT weak context per mesh.
+
+    Runs a single ``extract_vggt_sequence_dense`` forward on all views together
+    (view ``view_indices[0]`` = VGGT cam0 reference). Order matters.
+    """
+    views = _joint_view_ids(view_indices)
+    builder.eval()
+    written = 0
+    for mesh_path in mesh_paths:
+        written += _cache_one_joint_vggt_context(
+            mesh_path,
+            views,
+            render_source,
+            cache_store,
+            builder,
+            device=device,
+            overwrite=overwrite,
+            store_dtype=store_dtype,
+        )
+    return written
+
+
+def ordered_view_tuples(
+    view_indices: Sequence[int], *, tuple_size: int = 2
+) -> List[List[int]]:
+    """All ordered tuples of ``tuple_size`` distinct views (order matters)."""
+    import itertools
+
+    views = [int(v) for v in view_indices]
+    if tuple_size < 2:
+        raise ValueError(f"tuple_size must be >= 2, got {tuple_size}")
+    if len(views) < tuple_size:
+        raise ValueError(
+            f"Need >= {tuple_size} views for ordered tuples, got {views!r}"
+        )
+    # Deduplicate while preserving first-seen order.
+    seen: set = set()
+    uniq: List[int] = []
+    for v in views:
+        if v not in seen:
+            seen.add(v)
+            uniq.append(v)
+    if len(uniq) < tuple_size:
+        raise ValueError(
+            f"Need >= {tuple_size} unique views for ordered tuples, got {uniq!r}"
+        )
+    return [list(t) for t in itertools.permutations(uniq, tuple_size)]
+
+
+def cache_vggt_joint_ordered_pair_contexts(
+    mesh_paths: List[str],
+    render_source,
+    cache_store: CachedVGGTContextStore,
+    builder: VGGTContextBuilder,
+    *,
+    view_indices: Sequence[int],
+    device: torch.device,
+    pair_size: int = 2,
+    overwrite: bool = False,
+    store_dtype: torch.dtype = torch.float16,
+) -> int:
+    """Cache joint VGGT for **every ordered pair** (or k-tuple) from a view pool.
+
+    For pool ``[4,10,16,22]`` and ``pair_size=2`` this writes P(4,2)=12 joint
+    files per mesh (``*_joint_00004_00010.pt``, ``*_joint_00010_00004.pt``, …).
+    """
+    tuples = ordered_view_tuples(view_indices, tuple_size=pair_size)
+    logger.info(
+        "Joint ordered-pair cache: %d unique ordered %d-tuples from pool %s",
+        len(tuples),
+        pair_size,
+        [int(v) for v in view_indices],
+    )
+    builder.eval()
+    written = 0
+    for pair in tuples:
+        logger.info("Caching joint ordered tuple %s", pair)
+        for mesh_path in mesh_paths:
+            written += _cache_one_joint_vggt_context(
+                mesh_path,
+                pair,
+                render_source,
+                cache_store,
+                builder,
+                device=device,
+                overwrite=overwrite,
+                store_dtype=store_dtype,
+            )
+    return written

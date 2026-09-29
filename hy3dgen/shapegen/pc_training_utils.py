@@ -57,11 +57,28 @@ def compute_pc_loss_grad_norms(
     norms["cd"] = grad_norm_for_loss(params, extras["_cd"])
     if criterion.lambda_rgb > 0:
         norms["rgb"] = grad_norm_for_loss(params, criterion.lambda_rgb * extras["_rgb"])
+        if (
+            getattr(criterion, "rgb_topk_frac", 0.0) > 0
+            and getattr(criterion, "rgb_topk_beta", 0.0) > 0
+            and "_rgb_mean" in extras
+            and "_rgb_topk" in extras
+        ):
+            norms["rgb_mean"] = grad_norm_for_loss(
+                params, criterion.lambda_rgb * extras["_rgb_mean"]
+            )
+            norms["rgb_topk"] = grad_norm_for_loss(
+                params,
+                criterion.lambda_rgb * criterion.rgb_topk_beta * extras["_rgb_topk"],
+            )
     if criterion.lambda_anc > 0:
         norms["anc"] = grad_norm_for_loss(params, criterion.lambda_anc * extras["_anc"])
     if getattr(criterion, "lambda_anc_cd", 0.0) > 0 and "_anc_cd" in extras:
         norms["anc_cd"] = grad_norm_for_loss(
             params, criterion.lambda_anc_cd * extras["_anc_cd"]
+        )
+    if getattr(criterion, "lambda_delta", 0.0) > 0 and "_delta" in extras:
+        norms["delta"] = grad_norm_for_loss(
+            params, criterion.lambda_delta * extras["_delta"]
         )
     return norms
 
@@ -119,10 +136,16 @@ def loss_balance_ratios(
     lambda_anc: float,
     loss_anc_cd: float = 0.0,
     lambda_anc_cd: float = 0.0,
+    loss_delta: float = 0.0,
+    lambda_delta: float = 0.0,
+    loss_rgb_mean: float = 0.0,
+    loss_rgb_topk: float = 0.0,
+    rgb_topk_beta: float = 0.0,
 ) -> Dict[str, float]:
     weighted_rgb = lambda_rgb * loss_rgb
     weighted_anc = lambda_anc * loss_anc
     weighted_anc_cd = lambda_anc_cd * loss_anc_cd
+    weighted_delta = lambda_delta * loss_delta
     eps = 1e-8
     out = {
         "loss_ratio/cd_over_rgb": loss_cd / (weighted_rgb + eps),
@@ -131,6 +154,12 @@ def loss_balance_ratios(
     if lambda_anc_cd > 0:
         out["loss_ratio/anc_cd_over_cd"] = weighted_anc_cd / (loss_cd + eps)
         out["loss_ratio/anc_cd_over_anc"] = weighted_anc_cd / (weighted_anc + eps)
+    if lambda_delta > 0:
+        out["loss_ratio/delta_over_cd"] = weighted_delta / (loss_cd + eps)
+    if rgb_topk_beta > 0 and loss_rgb_mean > 0:
+        out["loss_ratio/rgb_topk_over_mean"] = (
+            rgb_topk_beta * loss_rgb_topk / (loss_rgb_mean + eps)
+        )
     return out
 
 

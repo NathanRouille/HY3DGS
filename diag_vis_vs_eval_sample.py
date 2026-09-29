@@ -106,8 +106,14 @@ def main() -> None:
     gt_xyz, gt_rgb = ShapePCAE.surface_gt_points(
         surface, include_sharp_label=include_sharp
     )
-    weak, keep = _build_weak_context(
-        batch, vggt_builder, device, align_mode=align_mode
+    weak, keep, cam = _build_weak_context(
+        batch,
+        vggt_builder,
+        device,
+        align_mode=align_mode,
+        include_camera_in_sequence=not bool(
+            getattr(model, "adaln_camera_cond", False)
+        ),
     )
     assert weak is not None and keep is not None
 
@@ -130,11 +136,11 @@ def main() -> None:
         )
 
         specs = [
-            ("gen_vis_steps20_cfg1", weak, keep, 20, 1.0),
-            ("gen_null_steps20", null, None, 20, 1.0),
-            ("gen_eval_steps50_cfg1", weak, keep, 50, 1.0),
-            ("gen_eval_steps50_cfg3", weak, keep, 50, 3.0),
-            ("gen_null_steps50", null, None, 50, 1.0),
+            ("gen_vis_steps20_cfg1", weak, keep, cam, 20, 1.0),
+            ("gen_null_steps20", null, None, None, 20, 1.0),
+            ("gen_eval_steps50_cfg1", weak, keep, cam, 50, 1.0),
+            ("gen_eval_steps50_cfg3", weak, keep, cam, 50, 3.0),
+            ("gen_null_steps50", null, None, None, 50, 1.0),
         ]
 
         metrics = {
@@ -148,7 +154,7 @@ def main() -> None:
             "keep_true": int(keep.sum().item()),
         }
 
-        for name, ctx, ctx_keep, steps, gs in specs:
+        for name, ctx, ctx_keep, ctx_cam, steps, gs in specs:
             z_s = model.sample_latents(
                 ctx,
                 batch_size=1,
@@ -156,6 +162,7 @@ def main() -> None:
                 guidance_scale=gs,
                 noise=noise,
                 context_keep=ctx_keep,
+                cam_cond=ctx_cam,
                 device=device,
                 dtype=z_enc.dtype,
             )
@@ -182,6 +189,7 @@ def main() -> None:
             guidance_scale=1.0,
             noise=noise2,
             context_keep=keep,
+            cam_cond=cam,
             device=device,
             dtype=z_enc.dtype,
         )

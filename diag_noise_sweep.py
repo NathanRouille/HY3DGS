@@ -130,8 +130,9 @@ def main() -> None:
         gt_xyz, gt_rgb = ShapePCAE.surface_gt_points(
             surface, include_sharp_label=include_sharp
         )
-        weak, keep = _build_weak_context(
-            batch, builder, device, align_mode=align_mode
+        weak, keep, cam = _build_weak_context(
+            batch, builder, device, align_mode=align_mode,
+            include_camera_in_sequence=not bool(getattr(model, "adaln_camera_cond", False)),
         )
         assert weak is not None and keep is not None
 
@@ -167,6 +168,7 @@ def main() -> None:
                     guidance_scale=args.guidance_scale,
                     noise=noise,
                     context_keep=keep,
+                    cam_cond=cam,
                     device=device,
                     dtype=z_enc.dtype,
                 )
@@ -231,6 +233,7 @@ def main() -> None:
                 guidance_scale=args.guidance_scale,
                 noise=noise,
                 context_keep=keep,
+                    cam_cond=cam,
                 device=device,
                 dtype=z_enc.dtype,
             )

@@ -17,5 +17,6 @@ from .attention_processors import FlashVDMCrossAttentionProcessor, CrossAttentio
     FlashVDMTopMCrossAttentionProcessor
 from .model import ShapeVAE, VectsetVAE, ShapeGSAE
 from .shape_pc_ae import ShapePCAE
+from .shape_pc_unite import ShapePCUnite
 from .surface_extractors import SurfaceExtractors, MCSurfaceExtractor, DMCSurfaceExtractor, Latent2MeshOutput
 from .volume_decoders import HierarchicalVolumeDecoding, FlashVDMVolumeDecoding, VanillaVolumeDecoder

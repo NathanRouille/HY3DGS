@@ -236,7 +236,7 @@ def train(args):
         downsample_ratio=args.downsample_ratio,
         num_points_per_anchor=args.num_points_per_anchor,
         deterministic_encoder=args.deterministic_encoder,
-        max_anchor_delta=args.max_anchor_delta,
+        max_anchor_delta=getattr(args, "max_anchor_delta", None),
         qk_norm=bool(getattr(args, "qk_norm", True)),
         qkv_bias=bool(getattr(args, "qkv_bias", True)),
         include_pi=bool(getattr(args, "include_pi", True)),
@@ -275,9 +275,12 @@ def train(args):
         lambda_rgb=args.lambda_rgb,
         lambda_anc=args.lambda_anc,
         lambda_anc_cd=float(getattr(args, "lambda_anc_cd", 0.0)),
+        lambda_delta=float(getattr(args, "lambda_delta", 0.0)),
         bidirectional_rgb=True,
         sinkhorn_eps=args.sinkhorn_eps,
         sinkhorn_iters=args.sinkhorn_iters,
+        rgb_topk_frac=float(getattr(args, "rgb_topk_frac", 0.0)),
+        rgb_topk_beta=float(getattr(args, "rgb_topk_beta", 0.0)),
     )
 
     dataset = SurfaceOnlyDataset(
@@ -560,7 +563,12 @@ def parse_args():
     p.add_argument("--pc_size", type=int, default=5120)
     p.add_argument("--pc_sharpedge_size", type=int, default=5120)
     p.add_argument("--downsample_ratio", type=int, default=20)
-    p.add_argument("--max_anchor_delta", type=float, default=0.1)
+    p.add_argument(
+        "--max_anchor_delta",
+        type=float,
+        default=None,
+        help="Legacy hard clamp on local offset; default unbounded + λ_delta.",
+    )
     p.add_argument(
         "--deterministic_encoder",
         action=argparse.BooleanOptionalAction,
@@ -617,12 +625,30 @@ def parse_args():
     p.add_argument("--warmup_steps", type=int, default=200)
     p.add_argument("--max_grad_norm", type=float, default=1.0)
     p.add_argument("--lambda_rgb", type=float, default=1.0)
+    p.add_argument(
+        "--rgb_topk_frac",
+        type=float,
+        default=0.0,
+        help="Fraction for top-k RGB residual term (0=off).",
+    )
+    p.add_argument(
+        "--rgb_topk_beta",
+        type=float,
+        default=1.0,
+        help="Weight of top-k RGB residual: mean + beta * topk.",
+    )
     p.add_argument("--lambda_anc", type=float, default=0.1)
     p.add_argument(
         "--lambda_anc_cd",
         type=float,
         default=0.0,
         help="Weight for bidirectional Chamfer between anchors and FPS.",
+    )
+    p.add_argument(
+        "--lambda_delta",
+        type=float,
+        default=1.0,
+        help="Soft mean ||local-center||^2 (replaces hard max_anchor_delta).",
     )
     p.add_argument(
         "--sinkhorn_eps",

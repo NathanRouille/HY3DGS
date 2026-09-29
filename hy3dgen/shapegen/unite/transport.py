@@ -18,9 +18,10 @@ class Transport:
         train_eps: float = 5e-2,
         sample_eps: float = 5e-2,
         *,
-        use_lognorm: bool = True,
+        use_lognorm: bool = False,
         lognorm_mu: float = 1.0,
         lognorm_sigma: float = 1.6,
+        t0_force_prob: float = 0.0,
     ):
         self.path_sampler = ICPlan()
         self.train_eps = train_eps
@@ -28,6 +29,9 @@ class Transport:
         self.use_lognorm = use_lognorm
         self.lognorm_mu = lognorm_mu
         self.lognorm_sigma = lognorm_sigma
+        # PointDiT-style: with this probability override sampled t to exact 0
+        # (pure noise). At t=0, velocity and x_start losses coincide.
+        self.t0_force_prob = float(t0_force_prob)
 
     def check_interval(
         self,
@@ -71,6 +75,9 @@ class Transport:
             t = torch.rand(x1.shape[0]) * (sp_timesteps[1] - sp_timesteps[0]) + sp_timesteps[0]
         if timestep_shift > 0:
             t = timestep_shift * t / (1.0 + (timestep_shift - 1.0) * t)
+        if self.t0_force_prob > 0:
+            force = torch.rand(t.shape[0], device=t.device) < self.t0_force_prob
+            t = torch.where(force, torch.zeros_like(t), t)
         return t.to(x1.device), x0, x1
 
     def training_losses(

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict, Tuple
 
 import torch
 
 
 FLOW_LOSS_TYPES = ("velocity", "x_start")
+OFFPATH_MODES = ("none", "noise", "onestep")
 
 
 def compute_flow_loss(
@@ -47,6 +48,40 @@ def compute_flow_loss(
         "velocity_mse": velocity_mse.detach(),
         "x_start_mse": x_start_mse.detach(),
     }
+
+
+def make_noise_offpath_state(
+    xt: torch.Tensor,
+    *,
+    noise_std: float,
+) -> torch.Tensor:
+    """Mode A: isotropic jitter around the linear interpolant state."""
+    if noise_std <= 0:
+        return xt
+    return xt + noise_std * torch.randn_like(xt)
+
+
+def make_onestep_offpath_state(
+    xt: torch.Tensor,
+    t: torch.Tensor,
+    x_pred: torch.Tensor,
+    *,
+    step_size: float,
+    train_eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Mode B: one stop-grad Euler step, return ``(x_next, t_next)``.
+
+    Uses the straight-to-clean velocity implied by ``x_pred`` (same convention
+    as inference), then advances time by ``min(step_size, 1 - t - train_eps)``.
+    """
+    t = t.reshape(-1)
+    denom = (1.0 - t).clamp_min(train_eps).view(-1, *([1] * (xt.dim() - 1)))
+    v = (x_pred - xt) / denom
+    remain = (1.0 - t - train_eps).clamp_min(0.0)
+    dt = torch.minimum(torch.full_like(t, float(step_size)), remain)
+    t_next = t + dt
+    x_next = xt + dt.view(-1, *([1] * (xt.dim() - 1))) * v
+    return x_next, t_next
 
 
 def noising_latents(

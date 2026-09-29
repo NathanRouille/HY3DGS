@@ -7,7 +7,6 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 def pairwise_dist2(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -127,6 +126,32 @@ def gather_nn(values: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
     return torch.gather(values, 1, idx)
 
 
+def per_point_rgb_l1(
+    src_rgb: torch.Tensor,
+    ref_rgb: torch.Tensor,
+    idx_src_to_ref: torch.Tensor,
+) -> torch.Tensor:
+    """Per-point mean |src - ref[nn]| over channels → [B, N]."""
+    matched = gather_nn(ref_rgb, idx_src_to_ref)
+    return (src_rgb - matched).abs().mean(dim=-1)
+
+
+def _mean_and_topk(per_point_err: torch.Tensor, topk_frac: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Mean of per-point errors and mean of the worst top-k% (per batch item).
+
+    ``per_point_err``: [B, N].
+    """
+    mean = per_point_err.mean()
+    frac = float(topk_frac)
+    if frac <= 0.0:
+        return mean, per_point_err.new_zeros(())
+    n = per_point_err.shape[1]
+    k = max(1, min(n, int(round(frac * n))))
+    # torch.topk is differentiable w.r.t. the selected values.
+    topk_vals = torch.topk(per_point_err, k, dim=1, largest=True).values
+    return mean, topk_vals.mean()
+
+
 def rgb_l1_on_nn(
     pred_rgb: torch.Tensor,
     target_rgb: torch.Tensor,
@@ -134,15 +159,44 @@ def rgb_l1_on_nn(
     *,
     bidirectional: bool = True,
     idx_tgt_to_pred: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """L1 color loss using Chamfer NN matches from xyz."""
-    matched = gather_nn(target_rgb, idx_pred_to_tgt)
-    loss = F.l1_loss(pred_rgb, matched)
+    topk_frac: float = 0.0,
+    topk_beta: float = 0.0,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """L1 colour loss using Chamfer NN matches from xyz.
+
+    Returns ``(loss, parts)`` where::
+
+        loss = mean + topk_beta * topk_mean   (if topk_frac > 0 and topk_beta > 0)
+        loss = mean                           (otherwise; matches historical scalar)
+
+    ``parts`` always includes ``mean`` / ``topk`` (topk is 0 when disabled).
+    Bidirectional: average of pred→GT and GT→pred for both mean and top-k.
+    """
+    err_p = per_point_rgb_l1(pred_rgb, target_rgb, idx_pred_to_tgt)
+    mean_p, topk_p = _mean_and_topk(err_p, topk_frac)
+
     if bidirectional and idx_tgt_to_pred is not None:
-        matched_rev = gather_nn(pred_rgb, idx_tgt_to_pred)
-        loss = loss + F.l1_loss(target_rgb, matched_rev)
-        loss = loss * 0.5
-    return loss
+        err_t = per_point_rgb_l1(target_rgb, pred_rgb, idx_tgt_to_pred)
+        mean_t, topk_t = _mean_and_topk(err_t, topk_frac)
+        mean = 0.5 * (mean_p + mean_t)
+        topk = 0.5 * (topk_p + topk_t)
+    else:
+        mean = mean_p
+        topk = topk_p
+
+    beta = float(topk_beta)
+    frac = float(topk_frac)
+    if frac > 0.0 and beta > 0.0:
+        loss = mean + beta * topk
+    else:
+        loss = mean
+        topk = mean.new_zeros(())
+
+    return loss, {
+        "mean": mean,
+        "topk": topk,
+        "beta": mean.new_tensor(beta if frac > 0.0 else 0.0),
+    }
 
 
 class PointCloudAELoss(nn.Module):
@@ -153,10 +207,22 @@ class PointCloudAELoss(nn.Module):
         L = L_cd + λ_rgb L_rgb
           + λ_anc L_sinkhorn(centers, fps)
           + λ_anc_cd L_cd(centers, fps)
+          + λ_delta mean(||x - center||^2)
+
+    with colour::
+
+        L_rgb = mean_NN_L1 + β · mean(top-k% of per-point NN L1)
+
+    (both directions of the Chamfer correspondence when bidirectional).
+    Top-k pushes high residual colour (frets / paint edges); mean keeps
+    bulk panels. Disable top-k with ``rgb_topk_frac=0`` or ``rgb_topk_beta=0``.
 
     Sinkhorn provides soft nearly-bijective matching; centre–FPS Chamfer adds
     an independent hard NN geometric penalty so outlier centres far from every
     FPS (and uncovered FPS) still pay a full squared distance cost.
+
+    ``λ_delta`` softly keeps locals near their parent anchor (replacement for a
+    hard ``max_anchor_delta`` tanh ball).
     """
 
     def __init__(
@@ -165,17 +231,25 @@ class PointCloudAELoss(nn.Module):
         lambda_rgb: float = 1.0,
         lambda_anc: float = 0.1,
         lambda_anc_cd: float = 0.0,
+        lambda_delta: float = 0.0,
         bidirectional_rgb: bool = True,
         sinkhorn_eps: float = 0.02,
         sinkhorn_iters: int = 50,
+        rgb_topk_frac: float = 0.0,
+        rgb_topk_beta: float = 1.0,
+        geometry_only: bool = False,
     ):
         super().__init__()
-        self.lambda_rgb = float(lambda_rgb)
+        self.geometry_only = bool(geometry_only)
+        self.lambda_rgb = 0.0 if self.geometry_only else float(lambda_rgb)
         self.lambda_anc = float(lambda_anc)
         self.lambda_anc_cd = float(lambda_anc_cd)
+        self.lambda_delta = float(lambda_delta)
         self.bidirectional_rgb = bool(bidirectional_rgb)
         self.sinkhorn_eps = float(sinkhorn_eps)
         self.sinkhorn_iters = int(sinkhorn_iters)
+        self.rgb_topk_frac = float(rgb_topk_frac)
+        self.rgb_topk_beta = float(rgb_topk_beta)
 
     def forward(
         self,
@@ -187,24 +261,38 @@ class PointCloudAELoss(nn.Module):
         fps_xyz: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         cd, idx_p2t, idx_t2p = chamfer_distance(pred_xyz, gt_xyz)
-        rgb = rgb_l1_on_nn(
-            pred_rgb,
-            gt_rgb,
-            idx_p2t,
-            bidirectional=self.bidirectional_rgb,
-            idx_tgt_to_pred=idx_t2p if self.bidirectional_rgb else None,
-        )
-        total = cd + self.lambda_rgb * rgb
         zero = pred_xyz.new_zeros(())
+        if self.geometry_only or pred_rgb is None or gt_rgb is None:
+            # Skip the colour term outright rather than weighting it to zero: the
+            # NN gathers and top-k are pure waste in a geometry-only run.
+            rgb = zero
+            rgb_parts = {"mean": zero, "topk": zero, "beta": zero}
+        else:
+            rgb, rgb_parts = rgb_l1_on_nn(
+                pred_rgb,
+                gt_rgb,
+                idx_p2t,
+                bidirectional=self.bidirectional_rgb,
+                idx_tgt_to_pred=idx_t2p if self.bidirectional_rgb else None,
+                topk_frac=self.rgb_topk_frac,
+                topk_beta=self.rgb_topk_beta,
+            )
+        total = cd + self.lambda_rgb * rgb
         extras: Dict[str, torch.Tensor] = {
             "loss_cd": cd.detach(),
             "loss_rgb": rgb.detach(),
+            "loss_rgb_mean": rgb_parts["mean"].detach(),
+            "loss_rgb_topk": rgb_parts["topk"].detach(),
             "_cd": cd,
             "_rgb": rgb,
+            "_rgb_mean": rgb_parts["mean"],
+            "_rgb_topk": rgb_parts["topk"],
             "loss_anc": zero.detach(),
             "_anc": zero,
             "loss_anc_cd": zero.detach(),
             "_anc_cd": zero,
+            "loss_delta": zero.detach(),
+            "_delta": zero,
         }
 
         have_anchors = centers is not None and fps_xyz is not None
@@ -227,6 +315,22 @@ class PointCloudAELoss(nn.Module):
             extras["loss_anc_cd"] = anc_cd.detach()
             extras["_anc_cd"] = anc_cd
 
+        if centers is not None and self.lambda_delta > 0:
+            B, N, _ = pred_xyz.shape
+            R = centers.shape[1]
+            if N % R != 0:
+                raise ValueError(
+                    f"pred points N={N} not divisible by num anchors R={R} "
+                    "(cannot assign locals to centres for delta reg)"
+                )
+            K = N // R
+            delta = pred_xyz.view(B, R, K, 3) - centers.unsqueeze(2)
+            # Mean squared Euclidean radius of locals about their anchor.
+            d_loss = delta.pow(2).sum(dim=-1).mean()
+            total = total + self.lambda_delta * d_loss
+            extras["loss_delta"] = d_loss.detach()
+            extras["_delta"] = d_loss
+
         extras["loss_total"] = total.detach()
         return total, extras
 
@@ -242,4 +346,6 @@ class PointCloudAELoss(nn.Module):
             terms["anc"] = self.lambda_anc * extras["_anc"]
         if self.lambda_anc_cd > 0 and "_anc_cd" in extras:
             terms["anc_cd"] = self.lambda_anc_cd * extras["_anc_cd"]
+        if self.lambda_delta > 0 and "_delta" in extras:
+            terms["delta"] = self.lambda_delta * extras["_delta"]
         return terms

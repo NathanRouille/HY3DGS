@@ -46,7 +46,11 @@ def load_model(ckpt_path: str, device: torch.device) -> tuple[ShapePCAE, dict]:
         downsample_ratio=int(train_args.get("downsample_ratio", 20)),
         num_points_per_anchor=int(train_args.get("num_points_per_anchor", 8)),
         deterministic_encoder=bool(train_args.get("deterministic_encoder", True)),
-        max_anchor_delta=float(train_args.get("max_anchor_delta", 0.1)),
+        max_anchor_delta=(
+            float(train_args["max_anchor_delta"])
+            if train_args.get("max_anchor_delta") not in (None, 0, 0.0)
+            else None
+        ),
         qk_norm=bool(train_args.get("qk_norm", True)),
         qkv_bias=bool(train_args.get("qkv_bias", True)),
         include_pi=bool(train_args.get("include_pi", True)),
@@ -112,7 +116,7 @@ def evaluate(args):
             surface, include_sharp_label=include_sharp_label
         )
         cd, idx_p2t, idx_t2p = chamfer_distance(xyz, gt_xyz)
-        rgb_loss = rgb_l1_on_nn(rgb, gt_rgb, idx_p2t, bidirectional=True, idx_tgt_to_pred=idx_t2p)
+        rgb_loss, _ = rgb_l1_on_nn(rgb, gt_rgb, idx_p2t, bidirectional=True, idx_tgt_to_pred=idx_t2p)
         anc = sinkhorn_matching_loss(
             centers,
             fps_xyz,

@@ -43,19 +43,29 @@ class ode:
                 raise ImportError(
                     "torchdiffeq is required for non-euler ODE sampling (pip install torchdiffeq)"
                 )
+            # Collect every Euler state so callers can inspect the trajectory
+            # (``samples[-1]`` is still the endpoint — API-compatible).
+            if isinstance(x, tuple):
+                traj = [x]
+                x_cur = x
+                for i in range(len(t) - 1):
+                    t_i = t[i]
+                    dt = t[i + 1] - t_i
+                    t_b = torch.ones(x_cur[0].size(0), device=device) * t_i
+                    v = self.drift(x_cur, t_b, model, **model_kwargs)
+                    x_cur = tuple(xi + dt * vi for xi, vi in zip(x_cur, v))
+                    traj.append(x_cur)
+                return traj
+            traj = [x]
             x_cur = x
             for i in range(len(t) - 1):
                 t_i = t[i]
                 dt = t[i + 1] - t_i
-                t_b = torch.ones(
-                    x_cur.size(0) if not isinstance(x_cur, tuple) else x_cur[0].size(0),
-                    device=device,
-                ) * t_i
+                t_b = torch.ones(x_cur.size(0), device=device) * t_i
                 v = self.drift(x_cur, t_b, model, **model_kwargs)
-                x_cur = x_cur + dt * v if not isinstance(x_cur, tuple) else tuple(
-                    xi + dt * vi for xi, vi in zip(x_cur, v)
-                )
-            return torch.stack([x, x_cur]) if not isinstance(x, tuple) else (x, x_cur)
+                x_cur = x_cur + dt * v
+                traj.append(x_cur)
+            return torch.stack(traj)
 
         def _fn(t_step, x_in):
             t_b = (
