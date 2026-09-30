@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sample fixed-size surface point clouds for InternScenes pilot rooms.
+"""Sample fixed-size surface point clouds for InternScenes rooms.
 
 Robust 64k recipe (default):
   - target 32768 uniform + 32768 sharp
@@ -7,13 +7,23 @@ Robust 64k recipe (default):
     put the remainder into uniform so n_total stays fixed
   - seeds stored as int64 (sha256 can exceed int32)
 
-Writes only under --out_root (default: ~/Documents/research/pilot_scene_pc_v0).
+Full-gen layout (recommended)::
+
+    --mesh_root /mnt/hdd2/ismail/InternScenes/processed/glb_output/sample_scenes
+    --out_root  ~/Documents/research/internscenes_gen_pc_v0
+    --list_file .../gen_light.txt
+    --no_ply
+
+Writes ``{out_root}/rooms/{scene_id}/surface.npz`` (+ meta.json).
 Does not modify source InternScenes / Ismail storage.
+
+Pilot layout (no --mesh_root): reads/writes under
+``{out_root}/internscenes/{scene_id}/`` (local GLB copy).
 
 Example:
   conda activate hy3dgs
   export PYTHONPATH="$HOME/Documents/research/HY3DGS:$PYTHONPATH"
-  python sample_internscenes_pilot.py
+  python sample_internscenes_pilot.py --mesh_root ... --out_root ... --no_ply
 """
 
 from __future__ import annotations
@@ -134,6 +144,7 @@ def sample_one(
     n_sharp_target: int,
     global_seed: int,
     overwrite: bool,
+    write_ply_preview: bool,
 ) -> None:
     from hy3dgen.shapegen.surface_loaders import RGBSharpEdgeSurfaceLoader
 
@@ -142,7 +153,8 @@ def sample_one(
     ply_path = out_dir / "preview.ply"
     meta_path = out_dir / "meta.json"
 
-    if npz_path.exists() and ply_path.exists() and not overwrite:
+    # Resume on training artifact only (npz). PLY is optional viz.
+    if npz_path.exists() and not overwrite:
         logger.info("SKIP %s (exists)", scene_id)
         return
 
@@ -188,7 +200,8 @@ def sample_one(
         n_total=np.int32(n_total),
         seed=np.int64(seed),
     )
-    write_ply(ply_path, xyz, rgb_u8)
+    if write_ply_preview:
+        write_ply(ply_path, xyz, rgb_u8)
 
     meta = {
         "dataset": dataset,
@@ -201,6 +214,7 @@ def sample_one(
         "sharp_capped": bool(n_s < n_sharp_target),
         "seed": int(seed),
         "layout": "xyz|normals|sharp|rgb",
+        "preview_ply": bool(write_ply_preview),
         "note": (
             "Fixed n_total; sharp capped to available pool with uniform fill. "
             "surface_loaders.normalize_parts applies unit-box normalization."
@@ -218,12 +232,23 @@ def sample_one(
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     p.add_argument(
         "--out_root",
         type=Path,
-        default=Path.home() / "Documents/research/pilot_scene_pc_v0",
-        help="Pilot root (lists/ + internscenes/)",
+        default=Path.home() / "Documents/research/internscenes_gen_pc_v0",
+        help="Output root (rooms/ or pilot internscenes/)",
+    )
+    p.add_argument(
+        "--mesh_root",
+        type=Path,
+        default=None,
+        help=(
+            "Read {mesh_root}/{scene_id}/scene_split.glb (Ismail, no copy). "
+            "If omitted, uses pilot local {out_root}/internscenes/{id}/scene_split.glb"
+        ),
     )
     p.add_argument(
         "--list_file",
@@ -241,6 +266,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n_sharp_target", type=int, default=32768)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--overwrite", action="store_true")
+    p.add_argument(
+        "--no_ply",
+        action="store_true",
+        help="Do not write preview.ply (recommended for full-dataset runs)",
+    )
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args()
 
@@ -257,6 +287,9 @@ def main() -> int:
         return 2
 
     out_root: Path = args.out_root.expanduser().resolve()
+    mesh_root: Optional[Path] = (
+        args.mesh_root.expanduser().resolve() if args.mesh_root is not None else None
+    )
     list_file = (
         args.list_file.expanduser().resolve()
         if args.list_file is not None
@@ -275,10 +308,20 @@ def main() -> int:
             if ln.strip() and not ln.strip().startswith("#")
         ]
 
-    ok, fail = 0, 0
+    write_ply_preview = not args.no_ply
+    ok, fail, skipped = 0, 0, 0
+
     for sid in scene_ids:
-        mesh = out_root / "internscenes" / sid / "scene_split.glb"
-        out_dir = out_root / "internscenes" / sid
+        if mesh_root is not None:
+            mesh = mesh_root / sid / "scene_split.glb"
+            out_dir = out_root / "rooms" / sid
+        else:
+            mesh = out_root / "internscenes" / sid / "scene_split.glb"
+            out_dir = out_root / "internscenes" / sid
+
+        npz_path = out_dir / "surface.npz"
+        already = npz_path.exists() and not args.overwrite
+
         try:
             sample_one(
                 mesh_path=mesh,
@@ -289,13 +332,17 @@ def main() -> int:
                 n_sharp_target=args.n_sharp_target,
                 global_seed=args.seed,
                 overwrite=args.overwrite,
+                write_ply_preview=write_ply_preview,
             )
-            ok += 1
+            if already:
+                skipped += 1
+            else:
+                ok += 1
         except Exception:
             fail += 1
             logger.exception("FAIL %s", sid)
 
-    logger.info("DONE ok=%d fail=%d", ok, fail)
+    logger.info("DONE ok=%d skipped=%d fail=%d", ok, skipped, fail)
     return 0 if fail == 0 else 1
 
 
