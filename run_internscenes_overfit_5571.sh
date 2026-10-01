@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# 1-scene InternScenes overfit smoke: gen__bathroom__5571, view pool 1,3,7,9, MV2.
-# Run on gaas (CUDA). Object pipeline unchanged — pass --dataset internscenes only here.
+# 1-scene InternScenes overfit: gen__bathroom__5571, view pool 1,3,7,9, MV2.
+# Recipe mirrors exp15b (joint cache + c_meanrms + sharp/7 feats), except:
+#   - InternScenes data / views
+#   - max_items=1, batch_size=1, num_steps=5000 (overfit scale)
+#   - sample_renorm_output OFF (current correct default; exp15b inherited old True)
+#   - no offpath / no Surflo global cam / no adaln_camera_cond
 set -euo pipefail
 
 PACK="${PACK:-$HOME/datasets/internscenes_bathroom_130}"
@@ -24,7 +28,7 @@ python cache_vggt_features.py \
   --joint_pairs \
   --overwrite
 
-echo "=== Overfit train (same arch as object exp15+: L=1024, 10k GT subsample) ==="
+echo "=== Overfit train (exp15b knobs; sample_renorm OFF) ==="
 python train_pc_unite.py \
   --dataset internscenes \
   --data_dir "$PACK" \
@@ -36,14 +40,44 @@ python train_pc_unite.py \
   --align_mode c_meanrms \
   --vggt_cache_root "$CACHE" \
   --vggt_joint_cache \
-  --output_dir "$OUT" \
+  --device cuda \
+  --seed 0 \
   --batch_size 1 \
+  --num_workers 0 \
   --num_steps 5000 \
-  --log_interval 50 \
+  --lr 1e-4 \
+  --lr_schedule cosine \
+  --weight_decay 0.01 \
+  --pretrained_load cross_attn \
+  --pretrained_repo tencent/Hunyuan3D-2mini \
+  --pretrained_subfolder hunyuan3d-vae-v2-mini-withencoder \
+  --include_sharp_label \
+  --point_feats 7 \
+  --register_noise_mode random \
+  --representation_noising \
+  --noising_t_start 0.9 \
+  --flow_loss_type velocity \
+  --flow_steps_per_recon 8 \
+  --lambda_flow 1.0 \
+  --lambda_recon 1.0 \
+  --lambda_rgb 10.0 \
+  --lambda_anc 0.1 \
+  --lambda_anc_cd 10.0 \
+  --lambda_delta 0.05 \
+  --weak_context_dropout 0.1 \
+  --no-sample_renorm_output \
+  --offpath_mode none \
+  --no-adaln_camera_cond \
+  --no-tokenizer_use_weak_context \
+  --log_interval 100 \
   --ckpt_interval 1000 \
-  --vis_interval 500
+  --vis_interval 500 \
+  --wandb \
+  --wandb_project shapepcunite \
+  --wandb_name "internscenes_overfit_${ROOM}" \
+  --output_dir "$OUT"
 
-echo "=== Eval (fixed first pair in pool: views 1,3) ==="
+echo "=== Eval (view_sample_mode=first → fixed pair 1,3) ==="
 python evaluate_pc_unite.py \
   --dataset internscenes \
   --data_dir "$PACK" \
@@ -52,8 +86,10 @@ python evaluate_pc_unite.py \
   --output_dir "$OUT/eval" \
   --view_indices "$VIEWS" \
   --views_per_sample 2 \
+  --align_mode c_meanrms \
   --vggt_cache_root "$CACHE" \
   --vggt_joint_cache \
   --max_items 1 \
   --no_experiment_manifest \
+  --no-sample_renorm_output \
   --export_ply
