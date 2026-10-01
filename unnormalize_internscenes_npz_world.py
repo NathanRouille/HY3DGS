@@ -111,7 +111,8 @@ def process_one(
                 f"{float(np.abs(xyz_new).max()):.4f}"
             )
 
-        tmp = npz_path.with_suffix(".npz.tmp")
+        # Must end with ".npz" or numpy appends another ".npz" (→ *.tmp.npz orphans).
+        tmp = npz_path.with_name(npz_path.stem + ".tmp.npz")
         np.savez_compressed(tmp, **data)
         os.replace(tmp, npz_path)
 
