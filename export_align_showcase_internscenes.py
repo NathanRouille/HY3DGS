@@ -55,6 +55,7 @@ from hy3dgen.shapegen.cam_align import (
     mean_rms_mu_s,
     merge_unprojected_to_cam_ref,
 )
+from hy3dgen.shapegen.gs_export import export_xyz_pointcloud_ply
 from hy3dgen.shapegen.vggt_context import (
     VGGTContextBuilder,
     depth_map_to_cam_points,
@@ -274,13 +275,45 @@ def process_one(
         cy=cy,
     )
     centers_raw = full_c[full_keep.astype(bool)].astype(np.float32)
+    discarded_raw = full_c[~full_keep.astype(bool)].astype(np.float32)
+    n_keep = int(centers_raw.shape[0])
+    n_disc = int(discarded_raw.shape[0])
+    logger.info(
+        "%s view %d: kept_patches=%d discarded_patches=%d (%.1f%% discarded)",
+        stem,
+        view_idx,
+        n_keep,
+        n_disc,
+        100.0 * n_disc / max(n_keep + n_disc, 1),
+    )
     if centers_raw.shape[0] == 0:
         logger.warning("%s view %d: no kept patch centres — skipping", stem, view_idx)
         return []
 
+    # Camera-frame diagnostic PLYs (before align recipes)
+    export_xyz_pointcloud_ply(
+        centers_raw, out_dir / "patch_centers_raw_kept.ply", rgb=(32, 200, 64)
+    )
+    if discarded_raw.shape[0] > 0:
+        export_xyz_pointcloud_ply(
+            discarded_raw,
+            out_dir / "patch_centers_raw_discarded.ply",
+            rgb=(220, 40, 40),
+        )
+    with open(out_dir / "patch_filter.txt", "w", encoding="utf-8") as f:
+        f.write(
+            f"kept={n_keep}\ndiscarded={n_disc}\n"
+            f"conf_percentile={builder.conf_percentile}\n"
+            f"min_conf={builder.min_conf}\n"
+            f"mask_white_bg={builder.mask_white_bg}\n"
+            "colors: kept=green discarded=red (camera frame, pre-align)\n"
+        )
+
     pairs: Dict[str, Tuple[np.ndarray, np.ndarray]] = {
         "raw": (gt_cam, centers_raw),
     }
+    # discarded clouds transformed like PE for each method (for overlay in method folders)
+    discarded_by_method: Dict[str, np.ndarray] = {"raw": discarded_raw}
 
     mu_gt_i, s_gt_i = mean_rms_mu_s(gt_cam)
     mu_pe_i, s_pe_i = mean_rms_mu_s(centers_raw)
@@ -288,6 +321,10 @@ def process_one(
         apply_mu_s(gt_cam, mu_gt_i, s_gt_i).astype(np.float32),
         apply_mu_s(centers_raw, mu_pe_i, s_pe_i).astype(np.float32),
     )
+    if discarded_raw.shape[0] > 0:
+        discarded_by_method["indep_meanrms"] = apply_mu_s(
+            discarded_raw, mu_pe_i, s_pe_i
+        ).astype(np.float32)
 
     depth_np = view["depth"].numpy() if torch.is_tensor(view["depth"]) else np.asarray(view["depth"])
     mask_np = (
@@ -311,11 +348,23 @@ def process_one(
         apply_mu_s(gt_cam, mu_c, s_c).astype(np.float32),
         centers_c.astype(np.float32),
     )
+    if discarded_raw.shape[0] > 0:
+        (disc_c,), _, _ = shared_canonicalize_from_ref(
+            centers_raw, discarded_raw, scale="rms"
+        )
+        discarded_by_method["C_gt_depth_filter_zrobust_meanrms"] = disc_c.astype(
+            np.float32
+        )
 
     rows: List[Dict] = []
     for method, (gt_xyz, cen_xyz) in pairs.items():
         mdir = out_dir / method
         _export_pair(mdir, gt=gt_xyz, centers=cen_xyz, gt_rgb=gt_rgb)
+        disc = discarded_by_method.get(method)
+        if disc is not None and disc.shape[0] > 0:
+            export_xyz_pointcloud_ply(
+                disc, mdir / "discarded_centers.ply", rgb=(220, 40, 40)
+            )
         metrics = alignment_metrics(cen_xyz, gt_xyz, rng=rng)
         f1, prec, rec = f1_at_thresh(
             cen_xyz, gt_xyz, thresh=f1_thresh, max_n=4000, rng=rng
