@@ -44,7 +44,7 @@ python train_pc_unite.py \
   --seed 0 \
   --batch_size 1 \
   --num_workers 0 \
-  --num_steps 5000 \
+  --num_steps 20000 \
   --lr 1e-4 \
   --lr_schedule cosine \
   --weight_decay 0.01 \
