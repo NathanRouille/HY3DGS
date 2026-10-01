@@ -338,18 +338,29 @@ def compute_c_meanrms_gt_stats(
     c2w_ref: np.ndarray,
     *,
     erode_iters: int = 1,
+    depth_masks: Optional[List[np.ndarray]] = None,
 ) -> Dict[str, float]:
-    """mean+RMS stats from GT-depth ∪ (erode 1px) in ``c2w_ref`` camera frame."""
+    """mean+RMS stats from GT-depth ∪ (erode 1px) in ``c2w_ref`` camera frame.
+
+    When ``depth_masks`` is set (InternScenes traj masks), white-bg filtering is
+    skipped — same as ``export_align_showcase_internscenes``.
+    """
     valids = []
     Ks = []
-    for d, rgb, K in zip(depths, rgbs, intrinsics_list):
+    for i, (d, rgb, K) in enumerate(zip(depths, rgbs, intrinsics_list)):
         d = np.asarray(d, dtype=np.float32)
         if d.ndim == 3:
             d = d.squeeze()
-        rgb_np = np.asarray(rgb)
-        if rgb_np.ndim == 3 and rgb_np.shape[0] == 3:
-            rgb_np = np.transpose(rgb_np, (1, 2, 0))
-        valid = fg_mask_from_depth_rgb(d, rgb_np)
+        if depth_masks is not None:
+            m = np.asarray(depth_masks[i], dtype=bool)
+            if m.ndim == 3:
+                m = m.squeeze()
+            valid = m & np.isfinite(d) & (d > 1e-6)
+        else:
+            rgb_np = np.asarray(rgb)
+            if rgb_np.ndim == 3 and rgb_np.shape[0] == 3:
+                rgb_np = np.transpose(rgb_np, (1, 2, 0))
+            valid = fg_mask_from_depth_rgb(d, rgb_np)
         valid = _erode_mask(valid, iters=erode_iters)
         valids.append(valid)
         fx, fy, cx, cy = [float(x) for x in np.asarray(K).reshape(-1)[:4]]

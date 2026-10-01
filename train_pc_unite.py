@@ -29,6 +29,7 @@ from hy3dgen.shapegen.models.autoencoders.shape_pc_unite import ShapePCUnite
 from hy3dgen.shapegen.pc_debug_export import export_recon_debug_plys
 from hy3dgen.shapegen.pc_losses import PointCloudAELoss, chamfer_distance
 from hy3dgen.shapegen.pc_render_dataset import (
+    build_internscenes_render_dataset,
     build_surface_render_dataset,
     collate_surface_render,
 )
@@ -479,7 +480,10 @@ def train(args):
             subfolder=args.pretrained_subfolder or "hunyuan3d-vae-v2-mini-withencoder",
         )
 
-    vggt_builder = VGGTContextBuilder(width=args.width).to(device)
+    mask_white_bg = getattr(args, "dataset", "gobjaverse") != "internscenes"
+    vggt_builder = VGGTContextBuilder(
+        width=args.width, mask_white_bg=mask_white_bg
+    ).to(device)
     # Same Fourier basis as the surface encoder (camera-frame xyz → same freqs).
     vggt_builder.attach_fourier(model.fourier_embedder)
     if args.freeze_vggt_builder:
@@ -498,7 +502,11 @@ def train(args):
     )
 
     data_path = Path(args.data_dir).resolve()
-    manifest = load_experiment_manifest(str(data_path)) if not args.no_experiment_manifest else None
+    use_manifest = (
+        not args.no_experiment_manifest
+        and getattr(args, "dataset", "gobjaverse") != "internscenes"
+    )
+    manifest = load_experiment_manifest(str(data_path)) if use_manifest else None
     from hy3dgen.shapegen.gobjaverse_gt import parse_view_indices
 
     train_views = parse_view_indices(
@@ -544,26 +552,52 @@ def train(args):
                 n_pairs,
                 ",".join(str(v) for v in train_views),
             )
-    dataset = build_surface_render_dataset(
-        str(data_path),
-        max_items=args.max_items,
-        categories=categories,
-        include_sharp_label=include_sharp_label,
-        use_experiment_manifest=not args.no_experiment_manifest,
-        manifest=manifest,
-        render_root=args.gobjaverse_render_root,
-        view_indices=train_views,
-        views_per_sample=views_per_sample,
-        view_sample_mode="random",
-        vggt_cache_root=args.vggt_cache_root,
-        use_joint_vggt_cache=use_joint_cache,
-        pc_size=args.pc_size,
-        pc_sharpedge_size=args.pc_sharpedge_size,
-        seed=args.seed,
-        gobjaverse_normalization=not args.no_gobjaverse_normalization,
-        surface_in_camera_frame=not args.no_surface_camera_frame,
-        align_mode=args.align_mode,
-    )
+    if getattr(args, "dataset", "gobjaverse") == "internscenes":
+        room_ids = None
+        if getattr(args, "internscenes_room_ids", None):
+            room_ids = [
+                x.strip()
+                for x in str(args.internscenes_room_ids).split(",")
+                if x.strip()
+            ]
+        dataset = build_internscenes_render_dataset(
+            str(data_path),
+            split=str(getattr(args, "internscenes_split", "train")),
+            room_ids=room_ids,
+            max_items=args.max_items,
+            include_sharp_label=include_sharp_label,
+            view_indices=train_views,
+            views_per_sample=views_per_sample,
+            view_sample_mode="random",
+            vggt_cache_root=args.vggt_cache_root,
+            use_joint_vggt_cache=use_joint_cache,
+            pc_size=args.pc_size,
+            pc_sharpedge_size=args.pc_sharpedge_size,
+            seed=args.seed,
+            surface_in_camera_frame=not args.no_surface_camera_frame,
+            align_mode=args.align_mode,
+        )
+    else:
+        dataset = build_surface_render_dataset(
+            str(data_path),
+            max_items=args.max_items,
+            categories=categories,
+            include_sharp_label=include_sharp_label,
+            use_experiment_manifest=not args.no_experiment_manifest,
+            manifest=manifest,
+            render_root=args.gobjaverse_render_root,
+            view_indices=train_views,
+            views_per_sample=views_per_sample,
+            view_sample_mode="random",
+            vggt_cache_root=args.vggt_cache_root,
+            use_joint_vggt_cache=use_joint_cache,
+            pc_size=args.pc_size,
+            pc_sharpedge_size=args.pc_sharpedge_size,
+            seed=args.seed,
+            gobjaverse_normalization=not args.no_gobjaverse_normalization,
+            surface_in_camera_frame=not args.no_surface_camera_frame,
+            align_mode=args.align_mode,
+        )
     if use_joint_cache and len(dataset) == 0:
         raise RuntimeError(
             "No training samples with joint VGGT cache — run "
@@ -995,6 +1029,25 @@ def train(args):
 def parse_args():
     p = argparse.ArgumentParser(description="Train ShapePCUnite")
     p.add_argument("--data_dir", type=str, required=True)
+    p.add_argument(
+        "--dataset",
+        type=str,
+        default="gobjaverse",
+        choices=("gobjaverse", "internscenes"),
+        help="gobjaverse = experiment train/ manifest; internscenes = pack with rooms/",
+    )
+    p.add_argument(
+        "--internscenes_split",
+        type=str,
+        default="train",
+        help="When --dataset internscenes: splits/{name}.txt under pack root.",
+    )
+    p.add_argument(
+        "--internscenes_room_ids",
+        type=str,
+        default=None,
+        help='Override split with comma scene ids, e.g. "gen__bathroom__5571".',
+    )
     p.add_argument("--output_dir", type=str, default="runs/pc_unite")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--seed", type=int, default=0)

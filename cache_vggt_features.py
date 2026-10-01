@@ -33,6 +33,15 @@ Features are frozen, so they only need computing once per (mesh, view):
       --joint_pairs \
       --max_items 100
 
+    # InternScenes room (mask_white_bg=False):
+    python cache_vggt_features.py \
+      --dataset internscenes \
+      --data_dir ~/datasets/internscenes_bathroom_130 \
+      --internscenes_room_ids gen__bathroom__5571 \
+      --cache_root runs/vggt_cache/internscenes_5571_joint_1_3_7_9 \
+      --view_indices "1,3,7,9" \
+      --joint_pairs
+
 Payload (camera-frame, VGGT-depth centres; background patches already dropped):
   patch_tokens, camera_token, patch_centers, patch_keep,
   pe_frame='camera', geometry_source='vggt_depth'
@@ -52,7 +61,10 @@ from pathlib import Path
 import torch
 
 from hy3dgen.shapegen.gobjaverse_gt import parse_view_indices
-from hy3dgen.shapegen.pc_render_dataset import build_surface_render_dataset
+from hy3dgen.shapegen.pc_render_dataset import (
+    build_internscenes_render_dataset,
+    build_surface_render_dataset,
+)
 from hy3dgen.shapegen.vggt_context import (
     CachedVGGTContextStore,
     VGGTContextBuilder,
@@ -70,6 +82,14 @@ logger = logging.getLogger(__name__)
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--data_dir", required=True)
+    p.add_argument(
+        "--dataset",
+        type=str,
+        default="gobjaverse",
+        choices=("gobjaverse", "internscenes"),
+    )
+    p.add_argument("--internscenes_split", type=str, default="train")
+    p.add_argument("--internscenes_room_ids", type=str, default=None)
     p.add_argument("--cache_root", required=True)
     p.add_argument("--gobjaverse_render_root", default=None)
     p.add_argument("--max_items", type=int, default=None)
@@ -152,21 +172,43 @@ def main():
         load_experiment_manifest(str(data_path)) if not args.no_experiment_manifest else None
     )
     # Dataset only needs the view pool for mesh discovery / render filtering.
-    dataset = build_surface_render_dataset(
-        str(data_path),
-        max_items=args.max_items,
-        categories=resolve_category_ids(args.categories),
-        use_experiment_manifest=not args.no_experiment_manifest,
-        manifest=manifest,
-        render_root=args.gobjaverse_render_root,
-        view_indices=views,
-        surface_in_camera_frame=True,
-        filter_missing_views=True,
-    )
+    if args.dataset == "internscenes":
+        room_ids = None
+        if args.internscenes_room_ids:
+            room_ids = [
+                x.strip()
+                for x in str(args.internscenes_room_ids).split(",")
+                if x.strip()
+            ]
+        dataset = build_internscenes_render_dataset(
+            str(data_path),
+            split=str(args.internscenes_split),
+            room_ids=room_ids,
+            max_items=args.max_items,
+            view_indices=views,
+            surface_in_camera_frame=True,
+            filter_missing_views=True,
+            align_mode="c_meanrms",
+        )
+    else:
+        dataset = build_surface_render_dataset(
+            str(data_path),
+            max_items=args.max_items,
+            categories=resolve_category_ids(args.categories),
+            use_experiment_manifest=not args.no_experiment_manifest,
+            manifest=manifest,
+            render_root=args.gobjaverse_render_root,
+            view_indices=views,
+            surface_in_camera_frame=True,
+            filter_missing_views=True,
+        )
     if dataset.render_loader is None:
-        raise SystemExit("No G-Objaverse render source resolved; check --gobjaverse_render_root")
+        raise SystemExit("No render GT source resolved; check paths / --gobjaverse_render_root")
 
-    builder = VGGTContextBuilder(width=args.width).to(device)
+    mask_white_bg = args.dataset != "internscenes"
+    builder = VGGTContextBuilder(width=args.width, mask_white_bg=mask_white_bg).to(
+        device
+    )
     store = CachedVGGTContextStore(args.cache_root)
     store_dtype = torch.float32 if args.fp32 else torch.float16
 

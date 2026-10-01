@@ -35,7 +35,11 @@ from hy3dgen.shapegen.pc_debug_export import (
     export_vggt_debug_plys,
 )
 from hy3dgen.shapegen.pc_losses import chamfer_distance, rgb_l1_on_nn
-from hy3dgen.shapegen.pc_render_dataset import build_surface_render_dataset, collate_surface_render
+from hy3dgen.shapegen.pc_render_dataset import (
+    build_internscenes_render_dataset,
+    build_surface_render_dataset,
+    collate_surface_render,
+)
 from hy3dgen.shapegen.pc_unite_diagnostics import DEFAULT_T_GRID, run_eval_diagnostics
 from hy3dgen.shapegen.pretrained_profiles import resolve_include_sharp_label
 from hy3dgen.shapegen.surface_loaders import stable_mesh_seed
@@ -287,7 +291,10 @@ def load_unite_model(ckpt_path: str, device: torch.device, overrides: Optional[D
         )
     model.to(device).eval()
 
-    builder = VGGTContextBuilder(width=width)
+    ds_kind = str(args.get("dataset", "gobjaverse"))
+    builder = VGGTContextBuilder(
+        width=width, mask_white_bg=(ds_kind != "internscenes")
+    )
     builder.attach_fourier(model.fourier_embedder)
     if "vggt_builder" in ckpt:
         load_state_dict_skip_mismatch(
@@ -364,42 +371,87 @@ def evaluate(args):
             raise ValueError(
                 f"Need >= {views_per_sample} eval view indices, got {eval_view_indices}"
             )
+        dataset_kind_pre = args.dataset or train_args.get("dataset", "gobjaverse")
         if len(eval_view_indices) > views_per_sample:
-            logger.warning(
-                "Eval view pool %s is larger than views_per_sample=%d; "
-                "using fixed first-%d ordered tuple %s (pass --view_indices "
-                "to choose a different fixed pair)",
-                eval_view_indices,
-                views_per_sample,
-                views_per_sample,
-                eval_view_indices[:views_per_sample],
-            )
-            eval_view_indices = eval_view_indices[:views_per_sample]
+            if dataset_kind_pre != "internscenes":
+                logger.warning(
+                    "Eval view pool %s is larger than views_per_sample=%d; "
+                    "using fixed first-%d ordered tuple %s (pass --view_indices "
+                    "to choose a different fixed pair)",
+                    eval_view_indices,
+                    views_per_sample,
+                    views_per_sample,
+                    eval_view_indices[:views_per_sample],
+                )
+                eval_view_indices = eval_view_indices[:views_per_sample]
 
     # Primary eval: single-view (view_idx) unless the ckpt used multi-view c_meanrms.
     surface_seed = None if args.no_surface_seed else int(args.seed)
-    dataset = build_surface_render_dataset(
-        str(data_path),
-        max_items=args.max_items,
-        categories=categories,
-        include_sharp_label=include_sharp,
-        use_experiment_manifest=not args.no_experiment_manifest,
-        manifest=manifest,
-        render_root=args.gobjaverse_render_root,
-        view_idx=args.view_idx,
-        view_indices=eval_view_indices,
-        views_per_sample=views_per_sample,
-        view_sample_mode="first",
-        vggt_cache_root=args.vggt_cache_root,
-        use_joint_vggt_cache=use_joint_cache,
-        pc_size=int(train_args.get("pc_size", 5120)),
-        pc_sharpedge_size=int(train_args.get("pc_sharpedge_size", 5120)),
-        seed=surface_seed,
-        gobjaverse_normalization=not train_args.get("no_gobjaverse_normalization", False),
-        surface_in_camera_frame=not train_args.get("no_surface_camera_frame", False),
-        align_mode=align_mode,
-        strict_load=bool(args.strict_load),
-    )
+    dataset_kind = args.dataset or train_args.get("dataset", "gobjaverse")
+    if dataset_kind == "internscenes":
+        room_ids = None
+        if getattr(args, "internscenes_room_ids", None):
+            room_ids = [
+                x.strip()
+                for x in str(args.internscenes_room_ids).split(",")
+                if x.strip()
+            ]
+        elif train_args.get("internscenes_room_ids"):
+            room_ids = [
+                x.strip()
+                for x in str(train_args["internscenes_room_ids"]).split(",")
+                if x.strip()
+            ]
+        dataset = build_internscenes_render_dataset(
+            str(data_path),
+            split=str(
+                getattr(args, "internscenes_split", None)
+                or train_args.get("internscenes_split", "train")
+            ),
+            room_ids=room_ids,
+            max_items=args.max_items,
+            include_sharp_label=include_sharp,
+            view_indices=eval_view_indices,
+            views_per_sample=views_per_sample,
+            view_sample_mode="first",
+            vggt_cache_root=args.vggt_cache_root,
+            use_joint_vggt_cache=use_joint_cache,
+            pc_size=int(train_args.get("pc_size", 5120)),
+            pc_sharpedge_size=int(train_args.get("pc_sharpedge_size", 5120)),
+            seed=surface_seed,
+            surface_in_camera_frame=not train_args.get(
+                "no_surface_camera_frame", False
+            ),
+            align_mode=align_mode,
+            strict_load=bool(args.strict_load),
+        )
+    else:
+        dataset = build_surface_render_dataset(
+            str(data_path),
+            max_items=args.max_items,
+            categories=categories,
+            include_sharp_label=include_sharp,
+            use_experiment_manifest=not args.no_experiment_manifest,
+            manifest=manifest,
+            render_root=args.gobjaverse_render_root,
+            view_idx=args.view_idx,
+            view_indices=eval_view_indices,
+            views_per_sample=views_per_sample,
+            view_sample_mode="first",
+            vggt_cache_root=args.vggt_cache_root,
+            use_joint_vggt_cache=use_joint_cache,
+            pc_size=int(train_args.get("pc_size", 5120)),
+            pc_sharpedge_size=int(train_args.get("pc_sharpedge_size", 5120)),
+            seed=surface_seed,
+            gobjaverse_normalization=not train_args.get(
+                "no_gobjaverse_normalization", False
+            ),
+            surface_in_camera_frame=not train_args.get(
+                "no_surface_camera_frame", False
+            ),
+            align_mode=align_mode,
+            strict_load=bool(args.strict_load),
+        )
     logger.info(
         "Eval dataset: %d samples (views_per_sample=%d, align_mode=%s, "
         "view_indices=%s, joint_cache=%s, surface_seed=%s, strict_load=%s)",
@@ -904,6 +956,15 @@ def parse_args():
     p = argparse.ArgumentParser(description="Evaluate ShapePCUnite")
     p.add_argument("--ckpt", type=str, required=True)
     p.add_argument("--data_dir", type=str, required=True)
+    p.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        choices=("gobjaverse", "internscenes"),
+        help="Defaults to value stored in checkpoint args.",
+    )
+    p.add_argument("--internscenes_split", type=str, default=None)
+    p.add_argument("--internscenes_room_ids", type=str, default=None)
     p.add_argument("--output_dir", type=str, default="runs/pc_unite_eval")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--seed", type=int, default=0)

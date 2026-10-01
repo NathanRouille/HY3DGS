@@ -39,6 +39,12 @@ from .gobjaverse_gt import (
     _read_depth_exr,
     _read_rgb_image,
 )
+from .internscenes_gt import (
+    InternScenesGTSource,
+    InternScenesNPSurfaceLoader,
+    discover_internscenes_room_paths,
+    load_internscenes_view,
+)
 from .surface_loaders import RGBSharpEdgeSurfaceLoader
 from .vggt_context import (
     CachedVGGTContextStore,
@@ -65,6 +71,8 @@ class RenderViewLoader:
         self, mesh_path: str, view_idx: Optional[int] = None
     ) -> Dict[str, torch.Tensor]:
         vid = self.view_idx if view_idx is None else int(view_idx)
+        if getattr(self.gt_source, "KIND", None) == "internscenes":
+            return load_internscenes_view(mesh_path, vid)
         render_dir = self.gt_source.render_dir_for_mesh(mesh_path)
         rgb_path, nd_path, json_path = gobjaverse_view_paths(render_dir, vid)
         meta = read_gobjaverse_view_meta(json_path)
@@ -118,8 +126,10 @@ class SurfaceRenderDataset(Dataset):
         align_mode: str = "cross",
         filter_missing_views: bool = True,
         strict_load: bool = False,
+        internscenes_pack: bool = False,
     ):
         self.mesh_paths = mesh_paths
+        self.internscenes_pack = bool(internscenes_pack)
         self.include_sharp_label = include_sharp_label
         self.view_indices = (
             [int(v) for v in view_indices]
@@ -163,12 +173,20 @@ class SurfaceRenderDataset(Dataset):
         # Default True: put GT xyz into the same camera frame as VGGT PE.
         self.surface_in_camera_frame = bool(surface_in_camera_frame)
         self.align_mode = str(align_mode)
-        self.surface_loader = RGBSharpEdgeSurfaceLoader(
-            num_uniform_points=pc_size,
-            num_sharp_points=pc_sharpedge_size,
-            seed=seed,
-            include_sharp_label=include_sharp_label,
-        )
+        if self.internscenes_pack:
+            self.surface_loader = InternScenesNPSurfaceLoader(
+                num_uniform_points=pc_size,
+                num_sharp_points=pc_sharpedge_size,
+                seed=seed,
+                include_sharp_label=include_sharp_label,
+            )
+        else:
+            self.surface_loader = RGBSharpEdgeSurfaceLoader(
+                num_uniform_points=pc_size,
+                num_sharp_points=pc_sharpedge_size,
+                seed=seed,
+                include_sharp_label=include_sharp_label,
+            )
         self.render_loader = RenderViewLoader(gt_source, view_idx=self.view_idx) if gt_source else None
         if not self.mesh_paths:
             raise FileNotFoundError(f"No meshes under {data_dir}")
@@ -229,8 +247,12 @@ class SurfaceRenderDataset(Dataset):
             available: Optional[Set[int]] = None
             if filter_missing and self.render_loader is not None:
                 try:
-                    rd = self.render_loader.gt_source.render_dir_for_mesh(path)
-                    available = set(list_available_gobjaverse_views(rd))
+                    gs = self.render_loader.gt_source
+                    if getattr(gs, "KIND", None) == "internscenes":
+                        available = gs.list_available_views(path, self.view_indices)
+                    else:
+                        rd = gs.render_dir_for_mesh(path)
+                        available = set(list_available_gobjaverse_views(rd))
                 except Exception as e:
                     logger.warning("No render dir for %s: %s", path, e)
                     available = set()
@@ -380,6 +402,14 @@ class SurfaceRenderDataset(Dataset):
                 c2ws.append(
                     v["c2w"].numpy() if torch.is_tensor(v["c2w"]) else np.asarray(v["c2w"])
                 )
+            depth_masks = None
+            if views and all("depth_mask" in v for v in views):
+                depth_masks = []
+                for v in views:
+                    m = v["depth_mask"]
+                    depth_masks.append(
+                        m.numpy() if torch.is_tensor(m) else np.asarray(m)
+                    )
             stats = compute_c_meanrms_gt_stats(
                 depths,
                 rgbs,
@@ -387,6 +417,7 @@ class SurfaceRenderDataset(Dataset):
                 c2ws,
                 c2w_ref.numpy() if torch.is_tensor(c2w_ref) else np.asarray(c2w_ref),
                 erode_iters=1,
+                depth_masks=depth_masks,
             )
             surf = surface.clone()
             surf[:, :3] = align_gt_xyz(
@@ -483,7 +514,7 @@ class SurfaceRenderDataset(Dataset):
     def _load_multi_view_sample(self, path: str, view_ids: List[int]) -> Dict:
         """One object + N views; ref = view_ids[0] (VGGT + GT camera frame)."""
         if self.render_loader is None:
-            raise RuntimeError("Multi-view samples require a G-Objaverse render source")
+            raise RuntimeError("Multi-view samples require a render GT source")
         surface = self.surface_loader(
             path, gobjaverse_meta=self._surface_meta(path)
         ).squeeze(0)
@@ -649,4 +680,62 @@ def build_surface_render_dataset(
         align_mode=align_mode,
         filter_missing_views=filter_missing_views,
         strict_load=strict_load,
+        internscenes_pack=False,
+    )
+
+
+def build_internscenes_render_dataset(
+    pack_root: str,
+    *,
+    split: str = "train",
+    room_ids: Optional[List[str]] = None,
+    max_items: Optional[int] = None,
+    include_sharp_label: bool = False,
+    view_indices: Optional[List[int]] = None,
+    views_per_sample: int = 1,
+    view_sample_mode: str = "random",
+    vggt_cache_root: Optional[str] = None,
+    use_joint_vggt_cache: bool = False,
+    pc_size: int = 5120,
+    pc_sharpedge_size: int = 5120,
+    seed: Optional[int] = None,
+    surface_in_camera_frame: bool = True,
+    align_mode: str = "c_meanrms",
+    filter_missing_views: bool = True,
+    strict_load: bool = False,
+) -> SurfaceRenderDataset:
+    """InternScenes bathroom pack (or any ``pack/rooms/<id>/`` layout)."""
+    if align_mode not in ("cross", "fair_gobK", "c_meanrms"):
+        raise ValueError(f"bad align_mode {align_mode!r}")
+    if not view_indices:
+        raise ValueError("InternScenes dataset requires explicit view_indices")
+    resolved_views = [int(v) for v in view_indices]
+    room_paths = discover_internscenes_room_paths(
+        pack_root,
+        split=split,
+        room_ids=room_ids,
+        max_items=max_items,
+    )
+    gt_source = InternScenesGTSource(pack_root)
+    cache = CachedVGGTContextStore(vggt_cache_root) if vggt_cache_root else None
+    return SurfaceRenderDataset(
+        pack_root,
+        room_paths,
+        pc_size=pc_size,
+        pc_sharpedge_size=pc_sharpedge_size,
+        seed=seed,
+        include_sharp_label=include_sharp_label,
+        gt_source=gt_source,
+        view_idx=resolved_views[0],
+        view_indices=resolved_views,
+        views_per_sample=views_per_sample,
+        view_sample_mode=view_sample_mode,
+        vggt_cache=cache,
+        use_joint_vggt_cache=use_joint_vggt_cache,
+        gobjaverse_normalization=False,
+        surface_in_camera_frame=surface_in_camera_frame,
+        align_mode=align_mode,
+        filter_missing_views=filter_missing_views,
+        strict_load=strict_load,
+        internscenes_pack=True,
     )
