@@ -2,9 +2,13 @@
 # 1-scene InternScenes overfit: gen__bathroom__5571, view pool 1,3,7,9, MV2.
 # Recipe mirrors exp15b (joint cache + c_meanrms + sharp/7 feats), except:
 #   - InternScenes data / views
-#   - max_items=1, batch_size=1, num_steps=5000 (overfit scale)
+#   - max_items=1, batch_size=1, num_steps=20000 (overfit scale)
 #   - sample_renorm_output OFF (current correct default; exp15b inherited old True)
 #   - no offpath / no Surflo global cam / no adaln_camera_cond
+# Capacity (vs first overfit R=L=1024, K=8, 5k+5k, lambda_delta=0.05):
+#   - R=L=2048, K=16 → 32768 out
+#   - pc 10923 + 21845 = 32768 in (≈1/3 uniform, 2/3 sharp FPS)
+#   - lambda_delta=0
 set -euo pipefail
 
 PACK="${PACK:-$HOME/datasets/internscenes_bathroom_130}"
@@ -13,7 +17,7 @@ PACK="${PACK:-$HOME/datasets/internscenes_bathroom_130}"
 ROOM=gen__bathroom__5571
 VIEWS="1,3,7,9"
 CACHE="${CACHE:-runs/vggt_cache/internscenes_${ROOM}_joint_${VIEWS//,/}}"
-OUT="${OUT:-runs/internscenes_overfit_${ROOM}}"
+OUT="${OUT:-runs/internscenes_overfit_${ROOM}_r2048_k16}"
 
 cd "$(dirname "$0")"
 export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
@@ -28,7 +32,7 @@ python cache_vggt_features.py \
   --joint_pairs \
   --overwrite
 
-echo "=== Overfit train (exp15b knobs; sample_renorm OFF) ==="
+echo "=== Overfit train (exp15b knobs; R=L=2048 K=16; sample_renorm OFF; lambda_delta=0) ==="
 python train_pc_unite.py \
   --dataset internscenes \
   --data_dir "$PACK" \
@@ -48,6 +52,11 @@ python train_pc_unite.py \
   --lr 1e-4 \
   --lr_schedule cosine \
   --weight_decay 0.01 \
+  --num_latents 2048 \
+  --num_registers 2048 \
+  --num_points_per_anchor 16 \
+  --pc_size 10923 \
+  --pc_sharpedge_size 21845 \
   --pretrained_load cross_attn \
   --pretrained_repo tencent/Hunyuan3D-2mini \
   --pretrained_subfolder hunyuan3d-vae-v2-mini-withencoder \
@@ -63,7 +72,7 @@ python train_pc_unite.py \
   --lambda_rgb 10.0 \
   --lambda_anc 0.1 \
   --lambda_anc_cd 10.0 \
-  --lambda_delta 0.05 \
+  --lambda_delta 0 \
   --weak_context_dropout 0.1 \
   --no-sample_renorm_output \
   --offpath_mode none \
@@ -74,7 +83,7 @@ python train_pc_unite.py \
   --vis_interval 500 \
   --wandb \
   --wandb_project shapepcunite \
-  --wandb_name "internscenes_overfit_${ROOM}" \
+  --wandb_name "internscenes_overfit_${ROOM}_r2048_k16" \
   --output_dir "$OUT"
 
 echo "=== Eval (view_sample_mode=first → fixed pair 1,3) ==="
