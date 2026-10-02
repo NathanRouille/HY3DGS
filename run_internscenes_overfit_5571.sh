@@ -22,17 +22,19 @@ OUT="${OUT:-runs/internscenes_overfit_${ROOM}_r2048_k16}"
 cd "$(dirname "$0")"
 export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
 
-echo "=== VGGT joint cache (12 ordered pairs, mask_white_bg=False) ==="
-python cache_vggt_features.py \
-  --dataset internscenes \
-  --data_dir "$PACK" \
-  --internscenes_room_ids "$ROOM" \
-  --cache_root "$CACHE" \
-  --view_indices "$VIEWS" \
-  --joint_pairs \
-  --overwrite
+# Re-enable if views / room / mask_white_bg change (cache already built for 1,3,7,9).
+# echo "=== VGGT joint cache (12 ordered pairs, mask_white_bg=False) ==="
+# python cache_vggt_features.py \
+#   --dataset internscenes \
+#   --data_dir "$PACK" \
+#   --internscenes_room_ids "$ROOM" \
+#   --cache_root "$CACHE" \
+#   --view_indices "$VIEWS" \
+#   --joint_pairs \
+#   --overwrite
 
 echo "=== Overfit train (exp15b knobs; R=L=2048 K=16; sample_renorm OFF; lambda_delta=0) ==="
+echo "=== Reusing VGGT cache: $CACHE ==="
 python train_pc_unite.py \
   --dataset internscenes \
   --data_dir "$PACK" \
