@@ -494,11 +494,18 @@ def train(args):
         lambda_anc=args.lambda_anc,
         lambda_anc_cd=args.lambda_anc_cd,
         lambda_delta=float(getattr(args, "lambda_delta", 0.0)),
+        cd_pred2gt=float(getattr(args, "cd_pred2gt", 1.0)),
+        cd_gt2pred=float(getattr(args, "cd_gt2pred", 1.0)),
         sinkhorn_eps=args.sinkhorn_eps,
         sinkhorn_iters=args.sinkhorn_iters,
         rgb_topk_frac=float(getattr(args, "rgb_topk_frac", 0.0)),
         rgb_topk_beta=float(getattr(args, "rgb_topk_beta", 0.0)),
         geometry_only=args.geometry_only,
+    )
+    logger.info(
+        "Chamfer direction weights: cd_pred2gt=%.3f cd_gt2pred=%.3f",
+        criterion.cd_pred2gt,
+        criterion.cd_gt2pred,
     )
 
     data_path = Path(args.data_dir).resolve()
@@ -922,6 +929,12 @@ def train(args):
                     log_dict.update(
                         {
                             "train/cd": float(extras["loss_cd"]),
+                            "train/cd_pred2gt": float(
+                                extras.get("loss_cd_pred2gt", extras["loss_cd"])
+                            ),
+                            "train/cd_gt2pred": float(
+                                extras.get("loss_cd_gt2pred", 0.0)
+                            ),
                             "train/rgb": float(extras["loss_rgb"]),
                             "train/rgb_mean": float(
                                 extras.get("loss_rgb_mean", extras["loss_rgb"])
@@ -1276,6 +1289,24 @@ def parse_args():
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--max_grad_norm", type=float, default=1.0)
     p.add_argument("--lambda_rgb", type=float, default=10.0)
+    p.add_argument(
+        "--cd_pred2gt",
+        type=float,
+        default=1.0,
+        help=(
+            "Weight on pred→GT Chamfer (precision / floaters). "
+            "L_cd = cd_pred2gt * mean(pred→GT) + cd_gt2pred * mean(GT→pred)."
+        ),
+    )
+    p.add_argument(
+        "--cd_gt2pred",
+        type=float,
+        default=1.0,
+        help=(
+            "Weight on GT→pred Chamfer (coverage / holes). "
+            "Raise above 1 to push locals to fill uncovered GT."
+        ),
+    )
     p.add_argument(
         "--rgb_topk_frac",
         type=float,

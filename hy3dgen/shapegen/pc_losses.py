@@ -19,11 +19,16 @@ def chamfer_distance(
     target: torch.Tensor,
     *,
     bidirectional: bool = True,
+    w_pred2gt: float = 1.0,
+    w_gt2pred: float = 1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Symmetric Chamfer (mean of squared NN distances).
+    """Chamfer (mean of squared NN distances), optionally direction-weighted.
+
+    ``w_pred2gt`` scales precision (pred→GT); ``w_gt2pred`` scales coverage
+    (GT→pred). Defaults ``1, 1`` recover classic symmetric Chamfer.
 
     Returns:
-        loss: scalar Chamfer
+        loss: scalar Chamfer (weighted if bidirectional)
         idx_pred_to_tgt: [B, N] NN indices into target for each pred point
         idx_tgt_to_pred: [B, M] NN indices into pred for each target point
     """
@@ -31,9 +36,9 @@ def chamfer_distance(
     pred_to_tgt, idx_p2t = dist.min(dim=2)
     tgt_to_pred, idx_t2p = dist.min(dim=1)
     if bidirectional:
-        loss = pred_to_tgt.mean() + tgt_to_pred.mean()
+        loss = float(w_pred2gt) * pred_to_tgt.mean() + float(w_gt2pred) * tgt_to_pred.mean()
     else:
-        loss = pred_to_tgt.mean()
+        loss = float(w_pred2gt) * pred_to_tgt.mean()
     return loss, idx_p2t, idx_t2p
 
 
@@ -209,6 +214,10 @@ class PointCloudAELoss(nn.Module):
           + λ_anc_cd L_cd(centers, fps)
           + λ_delta mean(||x - center||^2)
 
+    with geometry::
+
+        L_cd = cd_pred2gt · mean(pred→GT) + cd_gt2pred · mean(GT→pred)
+
     with colour::
 
         L_rgb = mean_NN_L1 + β · mean(top-k% of per-point NN L1)
@@ -223,6 +232,9 @@ class PointCloudAELoss(nn.Module):
 
     ``λ_delta`` softly keeps locals near their parent anchor (replacement for a
     hard ``max_anchor_delta`` tanh ball).
+
+    ``cd_pred2gt`` / ``cd_gt2pred`` reweight the two Chamfer directions on the
+    recon cloud (precision vs coverage). Defaults ``1, 1`` = classic CD.
     """
 
     def __init__(
@@ -232,6 +244,8 @@ class PointCloudAELoss(nn.Module):
         lambda_anc: float = 0.1,
         lambda_anc_cd: float = 0.0,
         lambda_delta: float = 0.0,
+        cd_pred2gt: float = 1.0,
+        cd_gt2pred: float = 1.0,
         bidirectional_rgb: bool = True,
         sinkhorn_eps: float = 0.02,
         sinkhorn_iters: int = 50,
@@ -245,6 +259,8 @@ class PointCloudAELoss(nn.Module):
         self.lambda_anc = float(lambda_anc)
         self.lambda_anc_cd = float(lambda_anc_cd)
         self.lambda_delta = float(lambda_delta)
+        self.cd_pred2gt = float(cd_pred2gt)
+        self.cd_gt2pred = float(cd_gt2pred)
         self.bidirectional_rgb = bool(bidirectional_rgb)
         self.sinkhorn_eps = float(sinkhorn_eps)
         self.sinkhorn_iters = int(sinkhorn_iters)
@@ -260,7 +276,13 @@ class PointCloudAELoss(nn.Module):
         centers: Optional[torch.Tensor] = None,
         fps_xyz: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        cd, idx_p2t, idx_t2p = chamfer_distance(pred_xyz, gt_xyz)
+        # Unweighted direction means for logging; weighted sum enters the loss.
+        dist = pairwise_dist2(pred_xyz, gt_xyz)
+        pred_to_tgt, idx_p2t = dist.min(dim=2)
+        tgt_to_pred, idx_t2p = dist.min(dim=1)
+        cd_p2g = pred_to_tgt.mean()
+        cd_g2p = tgt_to_pred.mean()
+        cd = self.cd_pred2gt * cd_p2g + self.cd_gt2pred * cd_g2p
         zero = pred_xyz.new_zeros(())
         if self.geometry_only or pred_rgb is None or gt_rgb is None:
             # Skip the colour term outright rather than weighting it to zero: the
@@ -280,6 +302,8 @@ class PointCloudAELoss(nn.Module):
         total = cd + self.lambda_rgb * rgb
         extras: Dict[str, torch.Tensor] = {
             "loss_cd": cd.detach(),
+            "loss_cd_pred2gt": cd_p2g.detach(),
+            "loss_cd_gt2pred": cd_g2p.detach(),
             "loss_rgb": rgb.detach(),
             "loss_rgb_mean": rgb_parts["mean"].detach(),
             "loss_rgb_topk": rgb_parts["topk"].detach(),

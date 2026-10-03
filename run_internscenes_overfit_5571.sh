@@ -9,6 +9,7 @@
 #   - R=L=2048, K=16 → 32768 out
 #   - pc 10923 + 21845 = 32768 in (≈1/3 uniform, 2/3 sharp FPS)
 #   - lambda_delta=0
+#   - Chamfer: cd_pred2gt=1, cd_gt2pred=3 (stronger GT coverage); lambda_recon=1
 set -euo pipefail
 
 PACK="${PACK:-$HOME/datasets/internscenes_bathroom_130}"
@@ -17,7 +18,7 @@ PACK="${PACK:-$HOME/datasets/internscenes_bathroom_130}"
 ROOM=gen__bathroom__5571
 VIEWS="1,3,7,9"
 CACHE="${CACHE:-runs/vggt_cache/internscenes_${ROOM}_joint_${VIEWS//,/}}"
-OUT="${OUT:-runs/internscenes_overfit_${ROOM}_r2048_k16}"
+OUT="${OUT:-runs/internscenes_overfit_${ROOM}_r2048_k16_cdgt3}"
 
 cd "$(dirname "$0")"
 export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
@@ -33,7 +34,7 @@ export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
 #   --joint_pairs \
 #   --overwrite
 
-echo "=== Overfit train (exp15b knobs; R=L=2048 K=16; sample_renorm OFF; lambda_delta=0) ==="
+echo "=== Overfit train (R=L=2048 K=16; lambda_delta=0; cd_gt2pred=3) ==="
 echo "=== Reusing VGGT cache: $CACHE ==="
 python train_pc_unite.py \
   --dataset internscenes \
@@ -71,6 +72,8 @@ python train_pc_unite.py \
   --flow_steps_per_recon 8 \
   --lambda_flow 1.0 \
   --lambda_recon 1.0 \
+  --cd_pred2gt 1.0 \
+  --cd_gt2pred 3.0 \
   --lambda_rgb 10.0 \
   --lambda_anc 0.1 \
   --lambda_anc_cd 10.0 \
@@ -85,7 +88,7 @@ python train_pc_unite.py \
   --vis_interval 500 \
   --wandb \
   --wandb_project shapepcunite \
-  --wandb_name "internscenes_overfit_${ROOM}_r2048_k16" \
+  --wandb_name "internscenes_overfit_${ROOM}_r2048_k16_cdgt3" \
   --output_dir "$OUT"
 
 echo "=== Eval (view_sample_mode=first → fixed pair 1,3) ==="

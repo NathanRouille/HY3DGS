@@ -276,6 +276,8 @@ def train(args):
         lambda_anc=args.lambda_anc,
         lambda_anc_cd=float(getattr(args, "lambda_anc_cd", 0.0)),
         lambda_delta=float(getattr(args, "lambda_delta", 0.0)),
+        cd_pred2gt=float(getattr(args, "cd_pred2gt", 1.0)),
+        cd_gt2pred=float(getattr(args, "cd_gt2pred", 1.0)),
         bidirectional_rgb=True,
         sinkhorn_eps=args.sinkhorn_eps,
         sinkhorn_iters=args.sinkhorn_iters,
@@ -625,6 +627,18 @@ def parse_args():
     p.add_argument("--warmup_steps", type=int, default=200)
     p.add_argument("--max_grad_norm", type=float, default=1.0)
     p.add_argument("--lambda_rgb", type=float, default=1.0)
+    p.add_argument(
+        "--cd_pred2gt",
+        type=float,
+        default=1.0,
+        help="Weight on pred→GT Chamfer (precision).",
+    )
+    p.add_argument(
+        "--cd_gt2pred",
+        type=float,
+        default=1.0,
+        help="Weight on GT→pred Chamfer (coverage).",
+    )
     p.add_argument(
         "--rgb_topk_frac",
         type=float,
