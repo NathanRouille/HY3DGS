@@ -207,8 +207,9 @@ class InternScenesNPSurfaceLoader:
 
         si = _pick(sharp_idx, int(ns))
         ui = _pick(uniform_idx, int(nu))
-        pick = np.concatenate([si, ui], axis=0)
-        rng.shuffle(pick)
+        # Hunyuan / PointCrossAttentionEncoder layout: first pc_size = uniform,
+        # next pc_sharpedge_size = sharp. Do not shuffle — FPS splits by row range.
+        pick = np.concatenate([ui, si], axis=0)
 
         xyz_p = xyz[pick]
         nrm_p = nrm[pick]
