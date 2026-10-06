@@ -7,10 +7,10 @@
 #   - no offpath / no Surflo global cam / no adaln_camera_cond
 # Capacity (vs first overfit R=L=1024, K=8, 5k+5k, lambda_delta=0.05):
 #   - R=L=2048, K=16 → 32768 out
-#   - pc 10923 + 21845 = 32768 in (≈1/3 uniform, 2/3 sharp FPS)
+#   - pc 16384 + 16384 = 32768 in (50/50 uniform|sharp FPS; was 1/3–2/3)
 #   - lambda_delta=0
 #   - Chamfer: cd_pred2gt=1, cd_gt2pred=3 (stronger GT coverage); lambda_recon=1
-#   - Surface layout fix: [uniform | sharp], no shuffle (real 1/3–2/3 FPS)
+#   - Surface layout fix: [uniform | sharp], no shuffle (real 50/50 FPS)
 set -euo pipefail
 
 PACK="${PACK:-$HOME/datasets/internscenes_bathroom_130}"
@@ -19,7 +19,7 @@ PACK="${PACK:-$HOME/datasets/internscenes_bathroom_130}"
 ROOM=gen__bathroom__5571
 VIEWS="1,3,7,9"
 CACHE="${CACHE:-runs/vggt_cache/internscenes_${ROOM}_joint_${VIEWS//,/}}"
-OUT="${OUT:-runs/internscenes_overfit_${ROOM}_r2048_k16_cdgt3_surforder}"
+OUT="${OUT:-runs/internscenes_overfit_${ROOM}_r2048_k16_5050_cdgt3}"
 
 cd "$(dirname "$0")"
 export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
@@ -35,7 +35,7 @@ export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
 #   --joint_pairs \
 #   --overwrite
 
-echo "=== Overfit train (R=L=2048 K=16; lambda_delta=0; cd_gt2pred=3; surface [U|S]) ==="
+echo "=== Overfit train (R=L=2048 K=16; pc 50/50; lambda_delta=0; cd_gt2pred=3; surface [U|S]) ==="
 echo "=== Reusing VGGT cache: $CACHE ==="
 python train_pc_unite.py \
   --dataset internscenes \
@@ -59,8 +59,8 @@ python train_pc_unite.py \
   --num_latents 2048 \
   --num_registers 2048 \
   --num_points_per_anchor 16 \
-  --pc_size 10923 \
-  --pc_sharpedge_size 21845 \
+  --pc_size 16384 \
+  --pc_sharpedge_size 16384 \
   --pretrained_load cross_attn \
   --pretrained_repo tencent/Hunyuan3D-2mini \
   --pretrained_subfolder hunyuan3d-vae-v2-mini-withencoder \
@@ -89,7 +89,7 @@ python train_pc_unite.py \
   --vis_interval 500 \
   --wandb \
   --wandb_project shapepcunite \
-  --wandb_name "internscenes_overfit_${ROOM}_r2048_k16_cdgt3_surforder" \
+  --wandb_name "internscenes_overfit_${ROOM}_r2048_k16_5050_cdgt3" \
   --output_dir "$OUT"
 
 echo "=== Eval (view_sample_mode=first → fixed pair 1,3) ==="
