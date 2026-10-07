@@ -5,12 +5,14 @@
 #   - max_items=1, batch_size=1, num_steps=20000 (overfit scale)
 #   - sample_renorm_output OFF (current correct default; exp15b inherited old True)
 #   - no offpath / no Surflo global cam / no adaln_camera_cond
-# Capacity (vs first overfit R=L=1024, K=8, 5k+5k, lambda_delta=0.05):
+# Capacity:
 #   - R=L=2048, K=16 → 32768 out
-#   - pc 16384 + 16384 = 32768 in (50/50 uniform|sharp FPS; was 1/3–2/3)
+#   - pc 16384 + 16384 = 32768 in (50/50 surface layout; queries via weighted FPS)
+#   - query_sample_mode=weighted_fps (k-NN density on uniform ref, mild sharp β)
+#   - fps_density_k=16, fps_sharp_beta=0.2
 #   - lambda_delta=0
-#   - Chamfer: cd_pred2gt=1, cd_gt2pred=3 (stronger GT coverage); lambda_recon=1
-#   - Surface layout fix: [uniform | sharp], no shuffle (real 50/50 FPS)
+#   - Chamfer: cd_pred2gt=1, cd_gt2pred=2; lambda_recon=1
+#   - Surface layout: [uniform | sharp], no shuffle
 set -euo pipefail
 
 PACK="${PACK:-$HOME/datasets/internscenes_bathroom_130}"
@@ -19,7 +21,7 @@ PACK="${PACK:-$HOME/datasets/internscenes_bathroom_130}"
 ROOM=gen__bathroom__5571
 VIEWS="1,3,7,9"
 CACHE="${CACHE:-runs/vggt_cache/internscenes_${ROOM}_joint_${VIEWS//,/}}"
-OUT="${OUT:-runs/internscenes_overfit_${ROOM}_r2048_k16_5050_cdgt3}"
+OUT="${OUT:-runs/internscenes_overfit_${ROOM}_r2048_k16_5050_cdgt2_wfps_k16_b0.2}"
 
 cd "$(dirname "$0")"
 export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
@@ -35,7 +37,7 @@ export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
 #   --joint_pairs \
 #   --overwrite
 
-echo "=== Overfit train (R=L=2048 K=16; pc 50/50; lambda_delta=0; cd_gt2pred=3; surface [U|S]) ==="
+echo "=== Overfit train (R=L=2048 K=16; pc 50/50; weighted_fps k=16 β=0.2; cd_gt2pred=2) ==="
 echo "=== Reusing VGGT cache: $CACHE ==="
 python train_pc_unite.py \
   --dataset internscenes \
@@ -61,6 +63,11 @@ python train_pc_unite.py \
   --num_points_per_anchor 16 \
   --pc_size 16384 \
   --pc_sharpedge_size 16384 \
+  --query_sample_mode weighted_fps \
+  --fps_density_k 16 \
+  --fps_sharp_beta 0.2 \
+  --fps_density_clip_low 5 \
+  --fps_density_clip_high 95 \
   --pretrained_load cross_attn \
   --pretrained_repo tencent/Hunyuan3D-2mini \
   --pretrained_subfolder hunyuan3d-vae-v2-mini-withencoder \
@@ -74,7 +81,7 @@ python train_pc_unite.py \
   --lambda_flow 1.0 \
   --lambda_recon 1.0 \
   --cd_pred2gt 1.0 \
-  --cd_gt2pred 3.0 \
+  --cd_gt2pred 2.0 \
   --lambda_rgb 10.0 \
   --lambda_anc 0.1 \
   --lambda_anc_cd 10.0 \
@@ -89,7 +96,7 @@ python train_pc_unite.py \
   --vis_interval 500 \
   --wandb \
   --wandb_project shapepcunite \
-  --wandb_name "internscenes_overfit_${ROOM}_r2048_k16_5050_cdgt3" \
+  --wandb_name "internscenes_overfit_${ROOM}_r2048_k16_5050_cdgt2_wfps_k16_b0.2" \
   --output_dir "$OUT"
 
 echo "=== Eval (view_sample_mode=first → fixed pair 1,3) ==="

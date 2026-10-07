@@ -67,6 +67,11 @@ class ShapePCAE(nn.Module):
         register_noise_mode: str = "random",
         geometry_only: bool = False,
         max_anchor_delta: Optional[float] = None,
+        query_sample_mode: str = "split_fps",
+        fps_density_k: int = 16,
+        fps_sharp_beta: float = 0.2,
+        fps_density_clip_low: float = 5.0,
+        fps_density_clip_high: float = 95.0,
         ckpt_path=None,
     ):
         super().__init__()
@@ -77,6 +82,11 @@ class ShapePCAE(nn.Module):
         self.point_feats = int(point_feats)
         self.num_points_per_anchor = int(num_points_per_anchor)
         self.geometry_only = bool(geometry_only)
+        self.query_sample_mode = str(query_sample_mode)
+        self.fps_density_k = int(fps_density_k)
+        self.fps_sharp_beta = float(fps_sharp_beta)
+        self.fps_density_clip_low = float(fps_density_clip_low)
+        self.fps_density_clip_high = float(fps_density_clip_high)
         # Channels the decoder emits per point: xyz, plus rgb unless geometry-only.
         self.point_out_channels = 3 if self.geometry_only else 6
         if register_noise_mode not in REGISTER_NOISE_MODES:
@@ -110,6 +120,11 @@ class ShapePCAE(nn.Module):
             use_ln_post=use_ln_post,
             qk_norm=qk_norm,
             deterministic=deterministic_encoder,
+            query_sample_mode=self.query_sample_mode,
+            fps_density_k=self.fps_density_k,
+            fps_sharp_beta=self.fps_sharp_beta,
+            fps_density_clip_low=self.fps_density_clip_low,
+            fps_density_clip_high=self.fps_density_clip_high,
         )
 
         ge_ctx = self.num_registers + self.num_latents

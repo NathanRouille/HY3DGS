@@ -495,6 +495,9 @@ class CrossAttentionDecoder(nn.Module):
         return occ
 
 
+QUERY_SAMPLE_MODES = ("split_fps", "weighted_fps")
+
+
 def fps(
     src: torch.Tensor,
     batch: Optional[Tensor] = None,
@@ -507,6 +510,104 @@ def fps(
     from torch_cluster import fps as fps_fn
     output = fps_fn(src, batch, ratio, random_start, batch_size, ptr)
     return output
+
+
+def knn_density_from_reference(
+    candidates: torch.Tensor,
+    reference: torch.Tensor,
+    *,
+    k: int,
+    candidates_in_reference: bool = False,
+) -> torch.Tensor:
+    """Local density ρ_i = 1 / (d_{i,(k)} + ε) via k-NN into ``reference``.
+
+    When ``candidates_in_reference`` is True, the 0-distance self match is
+    skipped so ``k`` still means the k-th *other* neighbour.
+    """
+    if candidates.numel() == 0:
+        return candidates.new_zeros(candidates.shape[0])
+    if reference.shape[0] == 0:
+        return candidates.new_ones(candidates.shape[0])
+
+    k = max(int(k), 1)
+    # Need k (+1 if self is in the reference set) neighbours.
+    k_fetch = k + 1 if candidates_in_reference else k
+    k_fetch = min(k_fetch, reference.shape[0])
+
+    # Chunked cdist keeps peak memory reasonable for ~32k×16k.
+    chunk = 4096
+    dk_parts = []
+    for start in range(0, candidates.shape[0], chunk):
+        end = min(start + chunk, candidates.shape[0])
+        dists = torch.cdist(candidates[start:end].float(), reference.float())
+        vals, _ = dists.topk(k_fetch, largest=False, dim=-1)
+        if candidates_in_reference:
+            # vals[:, 0] ≈ 0 (self); use the k-th other neighbour when available.
+            col = min(k, vals.shape[-1] - 1)
+        else:
+            col = min(k - 1, vals.shape[-1] - 1)
+        dk_parts.append(vals[:, col])
+    dk = torch.cat(dk_parts, dim=0).to(dtype=candidates.dtype)
+    return 1.0 / (dk + 1e-6)
+
+
+def percentile_clip(values: torch.Tensor, p_low: float = 5.0, p_high: float = 95.0) -> torch.Tensor:
+    """Clamp to the [p_low, p_high] percentiles of ``values``."""
+    if values.numel() == 0:
+        return values
+    lo = torch.quantile(values.float(), float(p_low) / 100.0)
+    hi = torch.quantile(values.float(), float(p_high) / 100.0)
+    if not torch.isfinite(lo) or not torch.isfinite(hi) or hi <= lo:
+        return values
+    return values.clamp(lo.to(values.dtype), hi.to(values.dtype))
+
+
+def weighted_fps_indices(
+    xyz: torch.Tensor,
+    weights: torch.Tensor,
+    num_samples: int,
+    *,
+    deterministic: bool = True,
+) -> torch.Tensor:
+    """Greedy weighted FPS: repeatedly pick argmax_i w_i * min_j∈S ||x_i - x_j||.
+
+    Args:
+        xyz: [N, 3]
+        weights: [N] non-negative
+        num_samples: number of indices to return
+    Returns:
+        LongTensor [num_samples] into the N points.
+    """
+    n = xyz.shape[0]
+    num_samples = int(min(max(num_samples, 0), n))
+    if num_samples == 0:
+        return xyz.new_zeros((0,), dtype=torch.long)
+    if num_samples == n:
+        return torch.arange(n, device=xyz.device, dtype=torch.long)
+
+    w = weights.float().clamp_min(0.0)
+    if not torch.isfinite(w).all() or float(w.sum()) <= 0:
+        w = torch.ones_like(w)
+
+    selected = torch.empty(num_samples, device=xyz.device, dtype=torch.long)
+    min_dist = torch.full((n,), float("inf"), device=xyz.device, dtype=xyz.dtype)
+    taken = torch.zeros(n, device=xyz.device, dtype=torch.bool)
+
+    if deterministic:
+        start = int(torch.argmax(w).item())
+    else:
+        start = int(torch.multinomial(w / w.sum(), 1).item())
+
+    pts = xyz.float()
+    for i in range(num_samples):
+        selected[i] = start
+        taken[start] = True
+        dist = torch.norm(pts - pts[start], dim=-1)
+        min_dist = torch.minimum(min_dist, dist.to(dtype=min_dist.dtype))
+        score = w * min_dist.float()
+        score = score.masked_fill(taken, float("-inf"))
+        start = int(torch.argmax(score).item())
+    return selected
 
 
 class PointCrossAttentionEncoder(nn.Module):
@@ -528,6 +629,11 @@ class PointCrossAttentionEncoder(nn.Module):
         use_checkpoint: bool = False,
         qk_norm: bool = False,
         deterministic: bool = True,
+        query_sample_mode: str = "split_fps",
+        fps_density_k: int = 16,
+        fps_sharp_beta: float = 0.2,
+        fps_density_clip_low: float = 5.0,
+        fps_density_clip_high: float = 95.0,
     ):
 
         super().__init__()
@@ -543,10 +649,27 @@ class PointCrossAttentionEncoder(nn.Module):
         # original stochastic-augmentation behaviour during generalisation training.
         self.deterministic = deterministic
 
+        mode = str(query_sample_mode).lower()
+        if mode not in QUERY_SAMPLE_MODES:
+            raise ValueError(
+                f"query_sample_mode must be one of {QUERY_SAMPLE_MODES}, got {query_sample_mode!r}"
+            )
+        self.query_sample_mode = mode
+        self.fps_density_k = int(fps_density_k)
+        self.fps_sharp_beta = float(fps_sharp_beta)
+        self.fps_density_clip_low = float(fps_density_clip_low)
+        self.fps_density_clip_high = float(fps_density_clip_high)
+
         if pc_sharpedge_size == 0:
             logger.info('PointCrossAttentionEncoder: pc_sharpedge_size=0, using pc_size for both splits')
         else:
             logger.info(f'PointCrossAttentionEncoder: pc_size={pc_size}, pc_sharpedge_size={pc_sharpedge_size}')
+        if self.query_sample_mode == "weighted_fps":
+            logger.info(
+                "PointCrossAttentionEncoder: query_sample_mode=weighted_fps "
+                f"(k={self.fps_density_k}, beta={self.fps_sharp_beta}, "
+                f"clip=[{self.fps_density_clip_low},{self.fps_density_clip_high}])"
+            )
 
         self.pc_size = pc_size
         self.pc_sharpedge_size = pc_sharpedge_size
@@ -608,6 +731,199 @@ class PointCrossAttentionEncoder(nn.Module):
             dim=0,
         )
 
+    def _build_split_input_pools(
+        self,
+        pc: torch.FloatTensor,
+        feats: Optional[torch.FloatTensor],
+        *,
+        num_latents: int,
+    ):
+        """Subsample uniform|sharp pools used as cross-attn KV (and split-FPS candidates)."""
+        B, _, D = pc.shape
+        num_random_query = self.pc_size / (self.pc_size + self.pc_sharpedge_size) * num_latents
+        num_sharpedge_query = num_latents - num_random_query
+
+        random_pc, sharpedge_pc = torch.split(pc, [self.pc_size, self.pc_sharpedge_size], dim=1)
+        assert random_pc.shape[1] <= self.pc_size, "Random surface points size must be less than or equal to pc_size"
+        assert sharpedge_pc.shape[
+                   1] <= self.pc_sharpedge_size, "Sharpedge surface points size must be less than or equal to pc_sharpedge_size"
+
+        input_random_pc_size = min(int(num_random_query * self.downsample_ratio), random_pc.shape[1])
+        idx_random_pc_list = self._select_point_indices(
+            random_pc.shape[1],
+            input_random_pc_size,
+            random_pc.device,
+            deterministic=self.deterministic,
+            batch_size=B,
+        )
+        input_random_pc = self._gather_batch_rows(random_pc, idx_random_pc_list)
+
+        input_sharpedge_pc_size = int(num_sharpedge_query * self.downsample_ratio)
+        if input_sharpedge_pc_size == 0:
+            input_sharpedge_pc = torch.zeros(B, 0, D, dtype=input_random_pc.dtype, device=pc.device)
+            idx_sharpedge_pc_list = [
+                torch.zeros(0, device=pc.device, dtype=torch.long) for _ in range(B)
+            ]
+        else:
+            input_sharpedge_pc_size = min(input_sharpedge_pc_size, sharpedge_pc.shape[1])
+            idx_sharpedge_pc_list = self._select_point_indices(
+                sharpedge_pc.shape[1],
+                input_sharpedge_pc_size,
+                sharpedge_pc.device,
+                deterministic=self.deterministic,
+                batch_size=B,
+            )
+            input_sharpedge_pc = self._gather_batch_rows(sharpedge_pc, idx_sharpedge_pc_list)
+
+        input_random_feats = None
+        input_sharpedge_feats = None
+        if self.point_feats != 0 and feats is not None:
+            random_feats, sharpedge_feats = torch.split(
+                feats, [self.pc_size, self.pc_sharpedge_size], dim=1
+            )
+            input_random_feats = self._gather_batch_rows(random_feats, idx_random_pc_list)
+            if input_sharpedge_pc_size == 0:
+                input_sharpedge_feats = torch.zeros(
+                    B, 0, self.point_feats, dtype=input_random_feats.dtype, device=pc.device
+                )
+            else:
+                input_sharpedge_feats = self._gather_batch_rows(
+                    sharpedge_feats, idx_sharpedge_pc_list
+                )
+
+        return {
+            "num_random_query": num_random_query,
+            "num_sharpedge_query": num_sharpedge_query,
+            "input_random_pc_size": input_random_pc_size,
+            "input_sharpedge_pc_size": input_sharpedge_pc_size,
+            "idx_random_pc_list": idx_random_pc_list,
+            "idx_sharpedge_pc_list": idx_sharpedge_pc_list,
+            "input_random_pc": input_random_pc,
+            "input_sharpedge_pc": input_sharpedge_pc,
+            "input_random_feats": input_random_feats,
+            "input_sharpedge_feats": input_sharpedge_feats,
+        }
+
+    def _split_fps_queries(self, pools: dict, *, num_latents: int, D: int):
+        """Legacy Hunyuan: independent FPS on uniform and sharp pools."""
+        B = pools["input_random_pc"].shape[0]
+        input_random_pc_size = pools["input_random_pc_size"]
+        input_sharpedge_pc_size = pools["input_sharpedge_pc_size"]
+        num_random_query = pools["num_random_query"]
+        num_sharpedge_query = pools["num_sharpedge_query"]
+        fps_random_start = not self.deterministic
+
+        flatten_input_random_pc = pools["input_random_pc"].reshape(B * input_random_pc_size, D)
+        batch_down = torch.arange(B, device=flatten_input_random_pc.device)
+        batch_down = torch.repeat_interleave(batch_down, input_random_pc_size)
+        random_query_ratio = num_random_query / input_random_pc_size
+        idx_query_random = fps(
+            flatten_input_random_pc, batch_down, ratio=random_query_ratio,
+            random_start=fps_random_start,
+        )
+        query_random_pc = flatten_input_random_pc[idx_query_random].view(B, -1, D)
+
+        if input_sharpedge_pc_size == 0:
+            query_sharpedge_pc = torch.zeros(
+                B, 0, D, dtype=query_random_pc.dtype, device=query_random_pc.device
+            )
+            idx_query_sharpedge = None
+        else:
+            flatten_sharp = pools["input_sharpedge_pc"].reshape(B * input_sharpedge_pc_size, D)
+            batch_down = torch.arange(B, device=flatten_sharp.device)
+            batch_down = torch.repeat_interleave(batch_down, input_sharpedge_pc_size)
+            sharpedge_query_ratio = num_sharpedge_query / input_sharpedge_pc_size
+            idx_query_sharpedge = fps(
+                flatten_sharp, batch_down, ratio=sharpedge_query_ratio,
+                random_start=fps_random_start,
+            )
+            query_sharpedge_pc = flatten_sharp[idx_query_sharpedge].view(B, -1, D)
+
+        query_pc = torch.cat([query_random_pc, query_sharpedge_pc], dim=1)
+
+        query_feats = None
+        if self.point_feats != 0 and pools["input_random_feats"] is not None:
+            flat_rf = pools["input_random_feats"].reshape(B * input_random_pc_size, -1)
+            query_random_feats = flat_rf[idx_query_random].view(B, -1, flat_rf.shape[-1])
+            if input_sharpedge_pc_size == 0:
+                query_sharpedge_feats = torch.zeros(
+                    B, 0, self.point_feats, dtype=query_random_feats.dtype, device=query_random_feats.device
+                )
+            else:
+                flat_sf = pools["input_sharpedge_feats"].reshape(B * input_sharpedge_pc_size, -1)
+                query_sharpedge_feats = flat_sf[idx_query_sharpedge].view(B, -1, flat_sf.shape[-1])
+            query_feats = torch.cat([query_random_feats, query_sharpedge_feats], dim=1)
+
+        return query_pc, query_random_pc, query_sharpedge_pc, query_feats
+
+    def _weighted_fps_queries(self, pools: dict, *, num_latents: int):
+        """Density-weighted FPS on the concatenated [uniform|sharp] input pool.
+
+        Density ρ is estimated with k-NN into the **uniform** subset only (avoids
+        replacement-padded sharp duplicates inflating edge density). Optional
+        sharp boost: w = clip(ρ) * (1 + β * sharp).
+        """
+        input_random_pc = pools["input_random_pc"]
+        input_sharpedge_pc = pools["input_sharpedge_pc"]
+        B, n_u, D = input_random_pc.shape
+        n_s = input_sharpedge_pc.shape[1]
+        input_pc = torch.cat([input_random_pc, input_sharpedge_pc], dim=1)
+        n_all = input_pc.shape[1]
+        num_latents = int(min(num_latents, n_all))
+
+        input_feats = None
+        if self.point_feats != 0 and pools["input_random_feats"] is not None:
+            if n_s == 0:
+                input_feats = pools["input_random_feats"]
+            else:
+                input_feats = torch.cat(
+                    [pools["input_random_feats"], pools["input_sharpedge_feats"]], dim=1
+                )
+
+        # point_feats=4 (normals|sharp) or 7 (normals|sharp|rgb) → sharp at channel 3.
+        use_sharp = (
+            input_feats is not None
+            and self.point_feats in (4, 7)
+            and input_feats.shape[-1] >= 4
+            and self.fps_sharp_beta != 0.0
+        )
+
+        query_list = []
+        query_feat_list = []
+        for b in range(B):
+            cand = input_pc[b]  # [N, 3]
+            ref = input_random_pc[b]  # uniform-only density reference
+            rho_u = knn_density_from_reference(
+                ref, ref, k=self.fps_density_k, candidates_in_reference=True
+            )
+            if n_s > 0:
+                rho_s = knn_density_from_reference(
+                    input_sharpedge_pc[b], ref, k=self.fps_density_k, candidates_in_reference=False
+                )
+                rho = torch.cat([rho_u, rho_s], dim=0)
+            else:
+                rho = rho_u
+            rho = percentile_clip(
+                rho, self.fps_density_clip_low, self.fps_density_clip_high
+            )
+            w = rho
+            if use_sharp:
+                sharp = input_feats[b, :, 3].float().clamp(0.0, 1.0)
+                w = w * (1.0 + self.fps_sharp_beta * sharp)
+            idx = weighted_fps_indices(
+                cand, w, num_latents, deterministic=self.deterministic
+            )
+            query_list.append(cand[idx])
+            if input_feats is not None:
+                query_feat_list.append(input_feats[b, idx])
+
+        query_pc = torch.stack(query_list, dim=0)
+        # Debug splits: treat all weighted queries as "random" bucket (no U/S FPS split).
+        query_random_pc = query_pc
+        query_sharpedge_pc = torch.zeros(B, 0, D, dtype=query_pc.dtype, device=query_pc.device)
+        query_feats = torch.stack(query_feat_list, dim=0) if query_feat_list else None
+        return query_pc, query_random_pc, query_sharpedge_pc, query_feats
+
     def sample_points_and_latents(
         self,
         pc: torch.FloatTensor,
@@ -619,111 +935,42 @@ class PointCrossAttentionEncoder(nn.Module):
         # Compute number of latents
         num_latents = int(num_pts / self.downsample_ratio)
 
-        # Compute the number of random and sharpedge latents
-        num_random_query = self.pc_size / (self.pc_size + self.pc_sharpedge_size) * num_latents
-        num_sharpedge_query = num_latents - num_random_query
-
-        # Split random and sharpedge surface points
-        random_pc, sharpedge_pc = torch.split(pc, [self.pc_size, self.pc_sharpedge_size], dim=1)
-        assert random_pc.shape[1] <= self.pc_size, "Random surface points size must be less than or equal to pc_size"
-        assert sharpedge_pc.shape[
-                   1] <= self.pc_sharpedge_size, "Sharpedge surface points size must be less than or equal to pc_sharpedge_size"
-
         # Select random surface points and random query points.
-        # In deterministic mode use sequential indexing + FPS random_start=False so
-        # the encoder output is a pure function of the parameters; this matters for
+        # In deterministic mode use sequential indexing + FPS starting seed so
+        # the encoder output is a pure function of the parameters. This matters for
         # overfit, where stochastic per-step anchors otherwise inject noise into the
         # loss that cannot be explained away by depth-sorting (see plan §1).
-        input_random_pc_size = min(int(num_random_query * self.downsample_ratio), random_pc.shape[1])
-        random_query_ratio = num_random_query / input_random_pc_size
-        idx_random_pc_list = self._select_point_indices(
-            random_pc.shape[1],
-            input_random_pc_size,
-            random_pc.device,
-            deterministic=self.deterministic,
-            batch_size=B,
-        )
-        input_random_pc = self._gather_batch_rows(random_pc, idx_random_pc_list)
-        flatten_input_random_pc = input_random_pc.reshape(B * input_random_pc_size, D)
-        N_down = int(flatten_input_random_pc.shape[0] / B)
-        batch_down = torch.arange(B).to(pc.device)
-        batch_down = torch.repeat_interleave(batch_down, N_down)
-        fps_random_start = not self.deterministic
-        idx_query_random = fps(
-            flatten_input_random_pc, batch_down, ratio=random_query_ratio,
-            random_start=fps_random_start,
-        )
-        query_random_pc = flatten_input_random_pc[idx_query_random].view(B, -1, D)
-
-        # Select sharpedge surface points and sharpedge query points (same determinism rule)
-        input_sharpedge_pc_size = int(num_sharpedge_query * self.downsample_ratio)
-        if input_sharpedge_pc_size == 0:
-            input_sharpedge_pc = torch.zeros(B, 0, D, dtype=input_random_pc.dtype).to(pc.device)
-            query_sharpedge_pc = torch.zeros(B, 0, D, dtype=query_random_pc.dtype).to(pc.device)
-        else:
-            input_sharpedge_pc_size = min(input_sharpedge_pc_size, sharpedge_pc.shape[1])
-            sharpedge_query_ratio = num_sharpedge_query / input_sharpedge_pc_size
-            idx_sharpedge_pc_list = self._select_point_indices(
-                sharpedge_pc.shape[1],
-                input_sharpedge_pc_size,
-                sharpedge_pc.device,
-                deterministic=self.deterministic,
-                batch_size=B,
-            )
-            input_sharpedge_pc = self._gather_batch_rows(sharpedge_pc, idx_sharpedge_pc_list)
-            flatten_input_sharpedge_surface_points = input_sharpedge_pc.reshape(
-                B * input_sharpedge_pc_size, D,
-            )
-            N_down = int(flatten_input_sharpedge_surface_points.shape[0] / B)
-            batch_down = torch.arange(B).to(pc.device)
-            batch_down = torch.repeat_interleave(batch_down, N_down)
-            idx_query_sharpedge = fps(
-                flatten_input_sharpedge_surface_points, batch_down, ratio=sharpedge_query_ratio,
-                random_start=fps_random_start,
-            )
-            query_sharpedge_pc = flatten_input_sharpedge_surface_points[idx_query_sharpedge].view(B, -1, D)
-
-        # Concatenate random and sharpedge surface points and query points
-        query_pc = torch.cat([query_random_pc, query_sharpedge_pc], dim=1)
+        pools = self._build_split_input_pools(pc, feats, num_latents=num_latents)
+        input_random_pc = pools["input_random_pc"]
+        input_sharpedge_pc = pools["input_sharpedge_pc"]
+        input_sharpedge_pc_size = pools["input_sharpedge_pc_size"]
         input_pc = torch.cat([input_random_pc, input_sharpedge_pc], dim=1)
+
+        if self.query_sample_mode == "weighted_fps":
+            query_pc, query_random_pc, query_sharpedge_pc, query_feats = self._weighted_fps_queries(
+                pools, num_latents=num_latents
+            )
+        else:
+            query_pc, query_random_pc, query_sharpedge_pc, query_feats = self._split_fps_queries(
+                pools, num_latents=num_latents, D=D
+            )
 
         # PE
         query = self.fourier_embedder(query_pc)
         data = self.fourier_embedder(input_pc)
 
         # Concat normal if given
-        if self.point_feats != 0:
-
-            random_surface_feats, sharpedge_surface_feats = torch.split(feats, [self.pc_size, self.pc_sharpedge_size],
-                                                                        dim=1)
-            input_random_surface_feats = self._gather_batch_rows(
-                random_surface_feats, idx_random_pc_list,
-            )
-            flatten_input_random_surface_feats = input_random_surface_feats.reshape(
-                B * input_random_pc_size, -1,
-            )
-            query_random_feats = flatten_input_random_surface_feats[idx_query_random].view(B, -1,
-                                                                                           flatten_input_random_surface_feats.shape[
-                                                                                               -1])
-
+        if self.point_feats != 0 and feats is not None:
+            if pools["input_random_feats"] is None:
+                raise RuntimeError("point_feats>0 but surface feats were not provided")
             if input_sharpedge_pc_size == 0:
-                input_sharpedge_surface_feats = torch.zeros(B, 0, self.point_feats,
-                                                            dtype=input_random_surface_feats.dtype).to(pc.device)
-                query_sharpedge_feats = torch.zeros(B, 0, self.point_feats, dtype=query_random_feats.dtype).to(
-                    pc.device)
+                input_feats = pools["input_random_feats"]
             else:
-                input_sharpedge_surface_feats = self._gather_batch_rows(
-                    sharpedge_surface_feats, idx_sharpedge_pc_list,
+                input_feats = torch.cat(
+                    [pools["input_random_feats"], pools["input_sharpedge_feats"]], dim=1
                 )
-                flatten_input_sharpedge_surface_feats = input_sharpedge_surface_feats.reshape(
-                    B * input_sharpedge_pc_size, -1,
-                )
-                query_sharpedge_feats = flatten_input_sharpedge_surface_feats[idx_query_sharpedge].view(B, -1,
-                                                                                                        flatten_input_sharpedge_surface_feats.shape[
-                                                                                                            -1])
-
-            query_feats = torch.cat([query_random_feats, query_sharpedge_feats], dim=1)
-            input_feats = torch.cat([input_random_surface_feats, input_sharpedge_surface_feats], dim=1)
+            if query_feats is None:
+                raise RuntimeError("point_feats>0 but query feats were not gathered")
 
             if self.normal_pe:
                 query_normal_pe = self.fourier_embedder(query_feats[..., :3])

@@ -400,6 +400,11 @@ def train(args):
         downsample_ratio=args.downsample_ratio,
         num_points_per_anchor=args.num_points_per_anchor,
         deterministic_encoder=args.deterministic_encoder,
+        query_sample_mode=args.query_sample_mode,
+        fps_density_k=args.fps_density_k,
+        fps_sharp_beta=args.fps_sharp_beta,
+        fps_density_clip_low=args.fps_density_clip_low,
+        fps_density_clip_high=args.fps_density_clip_high,
         register_noise_mode=args.register_noise_mode,
         geometry_only=args.geometry_only,
         sample_renorm_output=args.sample_renorm_output,
@@ -447,6 +452,8 @@ def train(args):
     model.representation_noising = bool(args.representation_noising)
     logger.info(
         "include_sharp_label=%s point_feats=%d geometry_only=%s "
+        "query_sample_mode=%s fps_density_k=%d fps_sharp_beta=%.3f "
+        "fps_density_clip=[%.1f,%.1f] "
         "representation_noising=%s (t_start=%.2f) register_noise=%s "
         "sample_renorm_output=%s tokenizer_use_weak_context=%s adaln_camera_cond=%s "
         "surflo_global_cam=%s "
@@ -456,6 +463,11 @@ def train(args):
         include_sharp_label,
         point_feats,
         args.geometry_only,
+        args.query_sample_mode,
+        args.fps_density_k,
+        args.fps_sharp_beta,
+        args.fps_density_clip_low,
+        args.fps_density_clip_high,
         model.representation_noising,
         args.noising_t_start,
         args.register_noise_mode,
@@ -1160,6 +1172,42 @@ def parse_args():
         ),
     )
     p.add_argument("--deterministic_encoder", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument(
+        "--query_sample_mode",
+        type=str,
+        default="split_fps",
+        choices=["split_fps", "weighted_fps"],
+        help=(
+            "Encoder query selection. 'split_fps' (default): Hunyuan independent "
+            "FPS on uniform|sharp pools. 'weighted_fps': single density-weighted "
+            "FPS on the concat pool (ρ from k-NN into uniform only, "
+            "w=clip(ρ)*(1+β*sharp))."
+        ),
+    )
+    p.add_argument(
+        "--fps_density_k",
+        type=int,
+        default=16,
+        help="k for k-NN density in weighted_fps (ρ=1/d_(k)). Ignored for split_fps.",
+    )
+    p.add_argument(
+        "--fps_sharp_beta",
+        type=float,
+        default=0.2,
+        help="Sharp boost β in weighted_fps: w∝ρ*(1+β*sharp). Try 0.1–0.3 first.",
+    )
+    p.add_argument(
+        "--fps_density_clip_low",
+        type=float,
+        default=5.0,
+        help="Low percentile for clipping ρ in weighted_fps.",
+    )
+    p.add_argument(
+        "--fps_density_clip_high",
+        type=float,
+        default=95.0,
+        help="High percentile for clipping ρ in weighted_fps.",
+    )
     p.add_argument(
         "--register_noise_mode",
         type=str,
