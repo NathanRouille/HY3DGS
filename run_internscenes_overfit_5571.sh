@@ -9,7 +9,7 @@
 #   - R=L=2048, K=16 → 32768 out
 #   - pc 16384 + 16384 = 32768 in (50/50 surface layout; queries via weighted FPS)
 #   - query_sample_mode=weighted_fps (k-NN density on uniform ref, mild sharp β)
-#   - fps_density_k=16, fps_sharp_beta=0.2
+#   - fps_density_k=8, fps_sharp_beta=0.2, no ρ percentile clip (0–100)
 #   - lambda_delta=0
 #   - Chamfer: cd_pred2gt=1, cd_gt2pred=2; lambda_recon=1
 #   - Surface layout: [uniform | sharp], no shuffle
@@ -21,7 +21,7 @@ PACK="${PACK:-$HOME/datasets/internscenes_bathroom_130}"
 ROOM=gen__bathroom__5571
 VIEWS="1,3,7,9"
 CACHE="${CACHE:-runs/vggt_cache/internscenes_${ROOM}_joint_${VIEWS//,/}}"
-OUT="${OUT:-runs/internscenes_overfit_${ROOM}_r2048_k16_5050_cdgt2_wfps_k16_b0.2}"
+OUT="${OUT:-runs/internscenes_overfit_${ROOM}_r2048_k16_5050_cdgt2_wfps_k8_b0.2_noclip}"
 
 cd "$(dirname "$0")"
 export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
@@ -37,7 +37,7 @@ export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
 #   --joint_pairs \
 #   --overwrite
 
-echo "=== Overfit train (R=L=2048 K=16; pc 50/50; weighted_fps k=16 β=0.2; cd_gt2pred=2) ==="
+echo "=== Overfit train (R=L=2048 K=16; pc 50/50; weighted_fps k=8 β=0.2 noclip; cd_gt2pred=2) ==="
 echo "=== Reusing VGGT cache: $CACHE ==="
 python train_pc_unite.py \
   --dataset internscenes \
@@ -64,10 +64,10 @@ python train_pc_unite.py \
   --pc_size 16384 \
   --pc_sharpedge_size 16384 \
   --query_sample_mode weighted_fps \
-  --fps_density_k 16 \
+  --fps_density_k 8 \
   --fps_sharp_beta 0.2 \
-  --fps_density_clip_low 5 \
-  --fps_density_clip_high 95 \
+  --fps_density_clip_low 0 \
+  --fps_density_clip_high 100 \
   --pretrained_load cross_attn \
   --pretrained_repo tencent/Hunyuan3D-2mini \
   --pretrained_subfolder hunyuan3d-vae-v2-mini-withencoder \
@@ -96,7 +96,7 @@ python train_pc_unite.py \
   --vis_interval 500 \
   --wandb \
   --wandb_project shapepcunite \
-  --wandb_name "internscenes_overfit_${ROOM}_r2048_k16_5050_cdgt2_wfps_k16_b0.2" \
+  --wandb_name "internscenes_overfit_${ROOM}_r2048_k16_5050_cdgt2_wfps_k8_b0.2_noclip" \
   --output_dir "$OUT"
 
 echo "=== Eval (view_sample_mode=first → fixed pair 1,3) ==="
