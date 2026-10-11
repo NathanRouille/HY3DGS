@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import random
+from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -46,6 +47,7 @@ from .internscenes_gt import (
     load_internscenes_view,
 )
 from .surface_loaders import RGBSharpEdgeSurfaceLoader
+from .room_view_pools import normalize_room_view_pools, pooled_view_indices
 from .vggt_context import (
     CachedVGGTContextStore,
     ordered_view_tuples,
@@ -117,6 +119,7 @@ class SurfaceRenderDataset(Dataset):
         gt_source: Optional[GObjaverseGTSource] = None,
         view_idx: int = 0,
         view_indices: Optional[List[int]] = None,
+        room_view_pools: Optional[Dict[str, List[int]]] = None,
         views_per_sample: int = 1,
         view_sample_mode: str = "random",
         vggt_cache: Optional[CachedVGGTContextStore] = None,
@@ -130,6 +133,9 @@ class SurfaceRenderDataset(Dataset):
     ):
         self.mesh_paths = mesh_paths
         self.internscenes_pack = bool(internscenes_pack)
+        self.room_view_pools = (
+            normalize_room_view_pools(room_view_pools) if room_view_pools else None
+        )
         self.include_sharp_label = include_sharp_label
         self.view_indices = (
             [int(v) for v in view_indices]
@@ -139,6 +145,11 @@ class SurfaceRenderDataset(Dataset):
         if not self.view_indices:
             raise ValueError("view_indices must be non-empty")
         self.views_per_sample = max(int(views_per_sample), 1)
+        if self.room_view_pools:
+            for path in self.mesh_paths:
+                pool = self._pool_for_mesh(path)
+                if len(pool) < self.views_per_sample:
+                    raise ValueError(f"{path}: too few configured views: {pool}")
         if self.views_per_sample > len(self.view_indices):
             raise ValueError(
                 f"views_per_sample={self.views_per_sample} > "
@@ -197,12 +208,12 @@ class SurfaceRenderDataset(Dataset):
             filter_missing=filter_missing_views
         )
         logger.info(
-            "SurfaceRenderDataset: %d meshes, pool=%d view(s), views_per_sample=%d "
+            "SurfaceRenderDataset: %d meshes, pool=%s, views_per_sample=%d "
             "(%s) → %d samples, align_mode=%s, render=%s, vggt_cache=%s, "
             "joint_vggt_cache=%s, "
             "gobjaverse_norm=%s, surface_frame=%s, seed=%s, strict_load=%s",
             len(self.mesh_paths),
-            len(self.view_indices),
+            "room-specific" if self.room_view_pools else f"{len(self.view_indices)} view(s)",
             self.views_per_sample,
             self.view_sample_mode,
             len(self.samples),
@@ -216,10 +227,18 @@ class SurfaceRenderDataset(Dataset):
             self.strict_load,
         )
 
+    def _pool_for_mesh(self, path: str) -> List[int]:
+        if self.room_view_pools is None:
+            return self.view_indices
+        room_id = Path(path).name
+        if room_id not in self.room_view_pools:
+            raise ValueError(f"No view pool configured for {room_id}")
+        return self.room_view_pools[room_id]
+
     def _available_pool_views(self, path: str, available: Optional[Set[int]]) -> List[int]:
         """Pool views that exist on disk for this mesh (order = view_indices)."""
         out: List[int] = []
-        for vid in self.view_indices:
+        for vid in self._pool_for_mesh(path):
             if available is not None and vid not in available:
                 continue
             out.append(int(vid))
@@ -237,19 +256,18 @@ class SurfaceRenderDataset(Dataset):
         ) or (
             multi and self.use_joint_vggt_cache and self.vggt_cache is not None
         )
-        joint_fixed = (
-            self.use_joint_vggt_cache
-            and len(self.view_indices) == self.views_per_sample
-        )
-        joint_pool = self.use_joint_vggt_cache and not joint_fixed
+        joint_pool = False
 
         for path in self.mesh_paths:
+            configured_pool = self._pool_for_mesh(path)
+            joint_fixed = self.use_joint_vggt_cache and len(configured_pool) == self.views_per_sample
+            joint_pool = joint_pool or (self.use_joint_vggt_cache and not joint_fixed)
             available: Optional[Set[int]] = None
             if filter_missing and self.render_loader is not None:
                 try:
                     gs = self.render_loader.gt_source
                     if getattr(gs, "KIND", None) == "internscenes":
-                        available = gs.list_available_views(path, self.view_indices)
+                        available = gs.list_available_views(path, configured_pool)
                     else:
                         rd = gs.render_dir_for_mesh(path)
                         available = set(list_available_gobjaverse_views(rd))
@@ -257,6 +275,8 @@ class SurfaceRenderDataset(Dataset):
                     logger.warning("No render dir for %s: %s", path, e)
                     available = set()
             pool = self._available_pool_views(path, available)
+            if self.room_view_pools and pool != configured_pool:
+                raise FileNotFoundError(f"{path}: missing configured views {sorted(set(configured_pool) - set(pool))}")
             self._mesh_available[path] = pool
 
             if multi:
@@ -265,10 +285,10 @@ class SurfaceRenderDataset(Dataset):
                     continue
                 if self.use_joint_vggt_cache:
                     if joint_fixed:
-                        if not all(v in pool for v in self.view_indices):
+                        if not all(v in pool for v in configured_pool):
                             skipped_too_few += 1
                             continue
-                        needed = [list(self.view_indices)]
+                        needed = [list(configured_pool)]
                     else:
                         # All ordered k-tuples among available pool views.
                         needed = ordered_view_tuples(
@@ -278,6 +298,8 @@ class SurfaceRenderDataset(Dataset):
                         t for t in needed if not self.vggt_cache.has_joint(path, t)
                     ]
                     if missing:
+                        if self.room_view_pools:
+                            raise FileNotFoundError(f"{path}: missing joint VGGT tuples {missing}")
                         skipped_cache += 1
                         continue
                 # Sentinel view_idx=-1 → choose N views in __getitem__.
@@ -289,7 +311,7 @@ class SurfaceRenderDataset(Dataset):
                     skipped_cache += 1
                     continue
                 samples.append((path, int(vid)))
-            skipped_render += max(0, len(self.view_indices) - len(pool))
+            skipped_render += max(0, len(configured_pool) - len(pool))
 
         if skipped_render:
             logger.info("Skipped %d (mesh, view) pairs with missing renders", skipped_render)
@@ -327,7 +349,7 @@ class SurfaceRenderDataset(Dataset):
         return samples
 
     def _choose_views(self, path: str, idx: int) -> List[int]:
-        pool = list(self._mesh_available.get(path) or self.view_indices)
+        pool = list(self._mesh_available.get(path) or self._pool_for_mesh(path))
         k = self.views_per_sample
         if len(pool) < k:
             raise RuntimeError(
@@ -335,12 +357,9 @@ class SurfaceRenderDataset(Dataset):
             )
         # Fixed ordered tuple: exact view_indices (eval / legacy joint), or
         # view_sample_mode=first → first-k of the available pool.
+        if self.use_joint_vggt_cache and len(self._pool_for_mesh(path)) == k:
+            return pool
         if self.view_sample_mode == "first":
-            if (
-                self.use_joint_vggt_cache
-                and len(self.view_indices) == self.views_per_sample
-            ):
-                return list(self.view_indices)
             return pool[:k]
         # Fresh random ordered k-tuple each __getitem__ (covers all P(n,k)).
         del idx  # unused; keeps signature stable for callers
@@ -692,6 +711,7 @@ def build_internscenes_render_dataset(
     max_items: Optional[int] = None,
     include_sharp_label: bool = False,
     view_indices: Optional[List[int]] = None,
+    room_view_pools: Optional[Dict[str, List[int]]] = None,
     views_per_sample: int = 1,
     view_sample_mode: str = "random",
     vggt_cache_root: Optional[str] = None,
@@ -707,6 +727,16 @@ def build_internscenes_render_dataset(
     """InternScenes bathroom pack (or any ``pack/rooms/<id>/`` layout)."""
     if align_mode not in ("cross", "fair_gobK", "c_meanrms"):
         raise ValueError(f"bad align_mode {align_mode!r}")
+    if room_view_pools is not None:
+        room_view_pools = normalize_room_view_pools(room_view_pools)
+        if room_ids is None:
+            room_ids = list(room_view_pools)
+        view_indices = pooled_view_indices(room_view_pools)
+        for room_id in room_ids:
+            if room_id not in room_view_pools:
+                raise ValueError(f"No view pool configured for {room_id}")
+            if not (Path(pack_root) / "rooms" / room_id / "surface.npz").is_file():
+                raise FileNotFoundError(f"Room {room_id} has no surface.npz under {pack_root}")
     if not view_indices:
         raise ValueError("InternScenes dataset requires explicit view_indices")
     resolved_views = [int(v) for v in view_indices]
@@ -728,6 +758,7 @@ def build_internscenes_render_dataset(
         gt_source=gt_source,
         view_idx=resolved_views[0],
         view_indices=resolved_views,
+        room_view_pools=room_view_pools,
         views_per_sample=views_per_sample,
         view_sample_mode=view_sample_mode,
         vggt_cache=cache,

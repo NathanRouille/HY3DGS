@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import random
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -533,6 +534,14 @@ def train(args):
         num_views=args.num_views,
         view_indices=args.view_indices,
     )
+    room_pools = None
+    if args.room_view_pools_json:
+        if args.dataset != "internscenes":
+            raise ValueError("--room_view_pools_json requires --dataset internscenes")
+        from hy3dgen.shapegen.room_view_pools import load_room_view_pools, pooled_view_indices
+        room_pools = load_room_view_pools(args.room_view_pools_json)
+        args.room_view_pools = room_pools  # Embed pools in checkpoints for portable eval.
+        train_views = pooled_view_indices(room_pools)
     views_per_sample = int(getattr(args, "views_per_sample", 1) or 1)
     if views_per_sample > 1 and args.align_mode != "c_meanrms":
         raise ValueError(
@@ -550,7 +559,9 @@ def train(args):
                 "--vggt_joint_cache requires len(--view_indices) >= "
                 f"--views_per_sample ({len(train_views)} vs {views_per_sample})"
             )
-        if len(train_views) == views_per_sample:
+        if room_pools:
+            logger.info("Joint VGGT cache: %d room-specific view pools", len(room_pools))
+        elif len(train_views) == views_per_sample:
             logger.info(
                 "Joint VGGT cache (fixed ordered tuple): views=%s "
                 "(view 0 = VGGT ref / GT camera)",
@@ -586,6 +597,7 @@ def train(args):
             max_items=args.max_items,
             include_sharp_label=include_sharp_label,
             view_indices=train_views,
+            room_view_pools=room_pools,
             views_per_sample=views_per_sample,
             view_sample_mode="random",
             vggt_cache_root=args.vggt_cache_root,
@@ -595,6 +607,7 @@ def train(args):
             seed=args.seed,
             surface_in_camera_frame=not args.no_surface_camera_frame,
             align_mode=args.align_mode,
+            strict_load=bool(room_pools),
         )
     else:
         dataset = build_surface_render_dataset(
@@ -633,11 +646,11 @@ def train(args):
         )
     if views_per_sample > 1:
         logger.info(
-            "Train dataset: %d samples (%d meshes, pool=%d views, "
+            "Train dataset: %d samples (%d meshes, pool=%s, "
             "views_per_sample=%d random, align_mode=%s, joint_vggt_cache=%s)",
             len(dataset),
             len(dataset.mesh_paths),
-            len(train_views),
+            "room-specific" if room_pools else f"{len(train_views)} views",
             views_per_sample,
             args.align_mode,
             use_joint_cache,
@@ -1074,6 +1087,7 @@ def parse_args():
         help='Override split with comma scene ids, e.g. "gen__bathroom__5571".',
     )
     p.add_argument("--output_dir", type=str, default="runs/pc_unite")
+    p.add_argument("--room_view_pools_json", default=None, help="JSON mapping InternScenes room IDs to ordered view pools; embedded in checkpoints.")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--max_items", type=int, default=None)
@@ -1541,6 +1555,8 @@ if __name__ == "__main__":
     args = parse_args()
     if args.seed is not None:
         torch.manual_seed(args.seed)
+        if args.room_view_pools_json:
+            random.seed(args.seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(args.seed)
     train(args)

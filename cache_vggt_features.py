@@ -90,6 +90,7 @@ def main():
     )
     p.add_argument("--internscenes_split", type=str, default="train")
     p.add_argument("--internscenes_room_ids", type=str, default=None)
+    p.add_argument("--room_view_pools_json", default=None, help="JSON mapping room IDs to ordered view pools (InternScenes only).")
     p.add_argument("--cache_root", required=True)
     p.add_argument("--gobjaverse_render_root", default=None)
     p.add_argument("--max_items", type=int, default=None)
@@ -145,6 +146,16 @@ def main():
         num_views=args.num_views,
         view_indices=args.view_indices,
     )
+    room_pools = None
+    if args.room_view_pools_json:
+        if args.dataset != "internscenes":
+            raise SystemExit("--room_view_pools_json requires --dataset internscenes")
+        from hy3dgen.shapegen.room_view_pools import load_room_view_pools, pooled_view_indices
+        room_pools = load_room_view_pools(args.room_view_pools_json)
+        views = pooled_view_indices(room_pools)
+        minimum = int(args.pair_size) if args.joint_pairs else (2 if args.joint else 1)
+        if any(len(pool) < minimum for pool in room_pools.values()):
+            raise SystemExit(f"Each room needs at least {minimum} configured views")
     if args.joint and len(views) < 2:
         raise SystemExit("--joint requires >=2 views in --view_indices (order matters).")
     if args.joint_pairs:
@@ -153,6 +164,8 @@ def main():
                 f"--joint_pairs requires >= {args.pair_size} views in --view_indices"
             )
         n_tuples = len(ordered_view_tuples(views, tuple_size=int(args.pair_size)))
+        if room_pools:
+            n_tuples = sum(len(ordered_view_tuples(pool, tuple_size=int(args.pair_size))) for pool in room_pools.values())
         mode = f"joint_pairs({n_tuples} ordered {args.pair_size}-tuples)"
     elif args.joint:
         mode = "joint"
@@ -186,6 +199,7 @@ def main():
             room_ids=room_ids,
             max_items=args.max_items,
             view_indices=views,
+            room_view_pools=room_pools,
             surface_in_camera_frame=True,
             filter_missing_views=True,
             align_mode="c_meanrms",
@@ -212,7 +226,24 @@ def main():
     store = CachedVGGTContextStore(args.cache_root)
     store_dtype = torch.float32 if args.fp32 else torch.float16
 
-    if args.joint_pairs:
+    if room_pools:
+        # Reuse the frozen VGGT builder while caching only each room's tuples.
+        cache_fn = (
+            cache_vggt_joint_ordered_pair_contexts if args.joint_pairs
+            else cache_vggt_joint_contexts if args.joint
+            else cache_vggt_contexts
+        )
+        written = 0
+        for path in dataset.mesh_paths:
+            pool = room_pools[Path(path).name]
+            kwargs = {"pair_size": int(args.pair_size)} if args.joint_pairs else {}
+            logger.info("Caching %s with room-specific views %s", Path(path).name, pool)
+            written += cache_fn(
+                [path], dataset.render_loader, store, builder,
+                view_indices=pool, device=device, overwrite=args.overwrite,
+                store_dtype=store_dtype, **kwargs,
+            )
+    elif args.joint_pairs:
         written = cache_vggt_joint_ordered_pair_contexts(
             list(dataset.mesh_paths),
             dataset.render_loader,

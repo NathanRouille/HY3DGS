@@ -353,6 +353,14 @@ def evaluate(args):
         or train_args.get("vggt_joint_cache", False)
     )
     eval_view_indices = None
+    room_pools = None
+    from hy3dgen.shapegen.room_view_pools import load_room_view_pools, pooled_view_indices
+    if args.room_view_pools_json:
+        room_pools = load_room_view_pools(args.room_view_pools_json)
+    elif not args.view_indices:
+        room_pools = train_args.get("room_view_pools")
+        if room_pools is None and train_args.get("room_view_pools_json"):
+            room_pools = load_room_view_pools(train_args["room_view_pools_json"])
     if views_per_sample > 1:
         from hy3dgen.shapegen.gobjaverse_gt import parse_view_indices
 
@@ -360,7 +368,9 @@ def evaluate(args):
         # args; if train used a larger pool, take the first views_per_sample
         # and warn (eval must be deterministic).
         cli_views = getattr(args, "view_indices", None)
-        if cli_views:
+        if room_pools:
+            eval_view_indices = pooled_view_indices(room_pools)
+        elif cli_views:
             eval_view_indices = parse_view_indices(
                 view_idx=args.view_idx,
                 num_views=None,
@@ -393,6 +403,8 @@ def evaluate(args):
     # Primary eval: single-view (view_idx) unless the ckpt used multi-view c_meanrms.
     surface_seed = None if args.no_surface_seed else int(args.seed)
     dataset_kind = args.dataset or train_args.get("dataset", "gobjaverse")
+    if room_pools and dataset_kind != "internscenes":
+        raise ValueError("Room-specific view pools require --dataset internscenes")
     if dataset_kind == "internscenes":
         room_ids = None
         if getattr(args, "internscenes_room_ids", None):
@@ -417,6 +429,7 @@ def evaluate(args):
             max_items=args.max_items,
             include_sharp_label=include_sharp,
             view_indices=eval_view_indices,
+            room_view_pools=room_pools,
             views_per_sample=views_per_sample,
             view_sample_mode="first",
             vggt_cache_root=args.vggt_cache_root,
@@ -874,6 +887,7 @@ def evaluate(args):
         "data_dir": str(data_path),
         "output_dir": str(out_dir),
         "view_indices": eval_view_indices if eval_view_indices is not None else [args.view_idx],
+        "room_view_pools": room_pools,
         "views_per_sample": views_per_sample,
         "align_mode": align_mode,
         "vggt_cache_root": args.vggt_cache_root,
@@ -1027,6 +1041,7 @@ def parse_args():
             "the ckpt trained on a larger joint pool."
         ),
     )
+    p.add_argument("--room_view_pools_json", default=None, help="Override checkpoint room view pools; eval uses each pool's first ordered pair.")
     p.add_argument(
         "--views_per_sample",
         type=int,
