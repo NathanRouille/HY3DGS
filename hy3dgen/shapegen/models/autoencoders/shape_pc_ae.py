@@ -296,10 +296,19 @@ class ShapePCAE(nn.Module):
         h = h + self.decoder_pos_embed.to(dtype=h.dtype)
         h = self.decoder(h)
 
-        centers = self.anchor_mlp(h)
-        raw = self.point_head(h).view(
-            h.shape[0], h.shape[1], K, self.point_out_channels
-        )
+        # Optional AMP keeps the coordinate/color heads and anchor addition in
+        # FP32: casting BF16 coordinates afterwards cannot recover lost detail.
+        if getattr(self, "fp32_output_heads", False):
+            with torch.autocast(device_type=h.device.type, enabled=False):
+                centers = self.anchor_mlp(h.float())
+                raw = self.point_head(h.float()).view(
+                    h.shape[0], h.shape[1], K, self.point_out_channels
+                )
+        else:
+            centers = self.anchor_mlp(h)
+            raw = self.point_head(h).view(
+                h.shape[0], h.shape[1], K, self.point_out_channels
+            )
         # Unbound offset by default; optional legacy hard ball via tanh clamp.
         if self.max_anchor_delta is not None:
             delta = self.max_anchor_delta * torch.tanh(raw[..., :3])

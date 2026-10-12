@@ -29,6 +29,9 @@ from hy3dgen.shapegen.models.autoencoders.shape_pc_ae import (
 from hy3dgen.shapegen.models.autoencoders.shape_pc_unite import ShapePCUnite
 from hy3dgen.shapegen.pc_debug_export import export_recon_debug_plys
 from hy3dgen.shapegen.pc_losses import PointCloudAELoss, chamfer_distance
+from hy3dgen.shapegen.pc_recon_runtime import (
+    FixedSurfaceDataset, autocast_context, flow_training_output, precision_preflight,
+)
 from hy3dgen.shapegen.pc_render_dataset import (
     build_internscenes_render_dataset,
     build_surface_render_dataset,
@@ -363,6 +366,19 @@ def _log_visuals(
 
 
 def train(args):
+    if args.recon_only and args.freeze_recon:
+        raise ValueError("--recon_only cannot be combined with --freeze_recon")
+    if args.cache_fixed_surfaces and (not args.recon_only or args.tokenizer_use_weak_context):
+        raise ValueError("--cache_fixed_surfaces requires unconditioned --recon_only")
+    if args.grad_log_interval <= 0 or args.log_interval <= 0 or args.fps_query_cache_items < 0:
+        raise ValueError("Log intervals must be positive and cache size nonnegative")
+    if args.recon_only and args.align_mode != "c_meanrms":
+        raise ValueError("--recon_only currently requires --align_mode c_meanrms")
+    if args.recon_only and args.vis_interval > 0:
+        raise ValueError("Use --vis_interval 0 for --recon_only; evaluate reconstruction separately")
+    if args.precision == "bf16" and not args.recon_only:
+        raise ValueError("BF16 currently requires --recon_only; joint training keeps its existing precision")
+    needs_weak_context = not args.recon_only or args.tokenizer_use_weak_context
     _apply_ca_profile_flags(args)
     include_sharp_label = resolve_include_sharp_label(args)
     point_feats = int(getattr(args, "point_feats", 6 if not include_sharp_label else 7))
@@ -431,6 +447,8 @@ def train(args):
         offpath_noise_std=float(getattr(args, "offpath_noise_std", 0.1)),
         offpath_step_size=float(getattr(args, "offpath_step_size", 0.05)),
     ).to(device)
+    model.fp32_output_heads = args.precision == "bf16"
+    model.encoder.query_cache_max_items = int(args.fps_query_cache_items)
     if args.surflo_global_cam:
         if args.adaln_camera_cond:
             raise ValueError(
@@ -499,7 +517,7 @@ def train(args):
     ).to(device)
     # Same Fourier basis as the surface encoder (camera-frame xyz → same freqs).
     vggt_builder.attach_fourier(model.fourier_embedder)
-    if args.freeze_vggt_builder:
+    if args.freeze_vggt_builder or not needs_weak_context:
         _set_requires_grad(vggt_builder, False)
 
     criterion = PointCloudAELoss(
@@ -514,6 +532,12 @@ def train(args):
         rgb_topk_frac=float(getattr(args, "rgb_topk_frac", 0.0)),
         rgb_topk_beta=float(getattr(args, "rgb_topk_beta", 0.0)),
         geometry_only=args.geometry_only,
+        chamfer_backend=args.chamfer_backend,
+        chamfer_chunk_size=args.chamfer_chunk_size,
+        local_loss=args.local_loss,
+        lambda_local=args.lambda_local,
+        local_patch_count=args.local_patch_count,
+        local_radius_scale=args.local_radius_scale,
     )
     logger.info(
         "Chamfer direction weights: cd_pred2gt=%.3f cd_gt2pred=%.3f",
@@ -548,7 +572,7 @@ def train(args):
             "views_per_sample>1 requires --align_mode c_meanrms "
             f"(got align_mode={args.align_mode!r})"
         )
-    use_joint_cache = bool(getattr(args, "vggt_joint_cache", False))
+    use_joint_cache = bool(getattr(args, "vggt_joint_cache", False)) and needs_weak_context
     if use_joint_cache:
         if not args.vggt_cache_root:
             raise ValueError("--vggt_joint_cache requires --vggt_cache_root")
@@ -599,8 +623,8 @@ def train(args):
             view_indices=train_views,
             room_view_pools=room_pools,
             views_per_sample=views_per_sample,
-            view_sample_mode="random",
-            vggt_cache_root=args.vggt_cache_root,
+            view_sample_mode=args.view_sample_mode,
+            vggt_cache_root=args.vggt_cache_root if needs_weak_context else None,
             use_joint_vggt_cache=use_joint_cache,
             pc_size=args.pc_size,
             pc_sharpedge_size=args.pc_sharpedge_size,
@@ -620,8 +644,8 @@ def train(args):
             render_root=args.gobjaverse_render_root,
             view_indices=train_views,
             views_per_sample=views_per_sample,
-            view_sample_mode="random",
-            vggt_cache_root=args.vggt_cache_root,
+            view_sample_mode=args.view_sample_mode,
+            vggt_cache_root=args.vggt_cache_root if needs_weak_context else None,
             use_joint_vggt_cache=use_joint_cache,
             pc_size=args.pc_size,
             pc_sharpedge_size=args.pc_sharpedge_size,
@@ -662,6 +686,9 @@ def train(args):
             len(dataset.mesh_paths),
             len(train_views),
         )
+    if args.cache_fixed_surfaces:
+        dataset = FixedSurfaceDataset(dataset)
+        logger.info("Cached %d fixed normalized surfaces; render/VGGT reads skipped in the loop", len(dataset))
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -685,7 +712,17 @@ def train(args):
     ckpt_has_tokenizer_ge = False
     ckpt_has_denoiser_pe = False
     if args.resume_ckpt:
-        ckpt = torch.load(args.resume_ckpt, map_location=device, weights_only=False)
+        ckpt = torch.load(args.resume_ckpt, map_location="cpu", weights_only=False)
+        if args.recon_only:
+            # Fail before optimization instead of silently loading another shape.
+            critical = ("num_latents", "num_registers", "embed_dim", "width", "heads",
+                        "num_ge_layers", "num_decoder_layers", "num_points_per_anchor",
+                        "pc_size", "pc_sharpedge_size", "point_feats", "query_sample_mode",
+                        "geometry_only", "tokenizer_use_weak_context", "adaln_camera_cond")
+            saved_args = ckpt.get("args") or {}
+            for key in critical:
+                if key in saved_args and saved_args[key] != getattr(args, key):
+                    raise ValueError(f"Checkpoint mismatch for {key}: {saved_args[key]} != {getattr(args, key)}")
         ckpt_has_tokenizer_ge = any(
             k.startswith("tokenizer_ge.") for k in ckpt["model"]
         )
@@ -693,7 +730,9 @@ def train(args):
         # Allocate tokenizer_ge before load so its keys are not dropped as unexpected.
         if ckpt_has_tokenizer_ge and model.tokenizer_ge is None:
             model.freeze_tokenizer_ge(replace=True)
-        model.load_state_dict(ckpt["model"], strict=False)
+        missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+        if args.recon_only and (missing or unexpected):
+            raise ValueError(f"Reconstruction resume requires an exact checkpoint: missing={missing}, unexpected={unexpected}")
         if not ckpt_has_denoiser_pe:
             model.sync_denoiser_pos_embed_from_tokenizer()
             logger.info(
@@ -767,13 +806,31 @@ def train(args):
             except (ValueError, KeyError):
                 logger.warning("Skipping scheduler state (incompatible checkpoint)")
 
+    # Release the old checkpoint (including discarded optimizer tensors) before training.
+    ckpt = None
+
     if args.wandb and wandb is not None:
         wandb.init(project=args.wandb_project, name=args.wandb_name or output_dir.name, config=vars(args))
 
     model.train()
     vggt_builder.train()
     model.ensure_tokenizer_ge_eval()
+    if args.precision_preflight:
+        if not args.recon_only or needs_weak_context:
+            raise ValueError("Precision preflight requires unconditioned --recon_only")
+        # Probe every diagnostic room with the same baseline, then restore RNG.
+        probe = torch.stack([dataset[i]["surface"] for i in range(min(3, len(dataset)))]).to(device)
+        args.precision, report = precision_preflight(model, probe, criterion, args.precision)
+        logger.info("Precision preflight: %s", json.dumps(report))
+        (output_dir / "precision_preflight.json").write_text(json.dumps(report, indent=2))
+        del probe
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        with open(output_dir / "args.json", "w") as f:
+            json.dump(vars(args), f, indent=2, default=str)
     step = start_step
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     data_iter = iter(loader)
     t0 = time.time()
     zero = torch.zeros((), device=device)
@@ -798,18 +855,17 @@ def train(args):
         # Surflo global-cam keeps per-view cameras in the sequence; only the
         # legacy --adaln_camera_cond path removes them.
         include_cams_in_seq = not args.adaln_camera_cond
-        weak_ctx, ctx_keep, cam_cond = _build_weak_context(
-            batch,
-            vggt_builder,
-            device,
-            null_weak_context=model.null_weak_context,
-            use_null=args.null_weak_context,
-            align_mode=args.align_mode,
-            include_camera_in_sequence=include_cams_in_seq,
-        )
+        weak_ctx = ctx_keep = cam_cond = None
+        if needs_weak_context:
+            weak_ctx, ctx_keep, cam_cond = _build_weak_context(
+                batch, vggt_builder, device,
+                null_weak_context=model.null_weak_context,
+                use_null=args.null_weak_context, align_mode=args.align_mode,
+                include_camera_in_sequence=include_cams_in_seq,
+            )
         raw_cams = (
             extract_raw_vggt_camera_tokens(batch, device)
-            if args.surflo_global_cam
+            if args.surflo_global_cam and not args.recon_only
             else None
         )
 
@@ -857,11 +913,13 @@ def train(args):
                     recon_loss = zero
                     extras = empty_extras
         else:
-            z, fps_xyz, xyz, rgb, centers = model.forward_tokenizer(
-                surface,
-                weak_context=weak_ctx,
-                weak_context_keep=ctx_keep,
-            )
+            with autocast_context(device, args.precision):
+                z, fps_xyz, xyz, rgb, centers = model.forward_tokenizer(
+                    surface, weak_context=weak_ctx, weak_context_keep=ctx_keep,
+                )
+            # All reconstruction geometry, RGB matching and OT arithmetic stays FP32.
+            xyz, centers, fps_xyz = xyz.float(), centers.float(), fps_xyz.float()
+            rgb = rgb.float() if rgb is not None else None
             gt_xyz, gt_rgb = ShapePCAE.surface_gt_points(
                 surface,
                 include_sharp_label=include_sharp_label,
@@ -870,10 +928,18 @@ def train(args):
             recon_loss, extras = criterion(
                 xyz, rgb, gt_xyz, gt_rgb, centers=centers, fps_xyz=fps_xyz.detach()
             )
+            if args.recon_only and args.local_loss != "none" and args.lambda_local > 0 and step == start_step:
+                used = float(extras.get("local/used_patches", 0.0))
+                if used < 8:
+                    raise RuntimeError(f"Only {used:g} supported local patches per sample; refusing an ineffective local-loss run")
+                logger.info("Local supervision: %s", json.dumps({
+                    k: float(v) for k, v in extras.items() if k.startswith("local/")
+                }))
 
-        flow_out = model.forward_denoising(
+        flow_out = flow_training_output(model,
             z,
             weak_ctx,
+            recon_only=args.recon_only,
             context_keep=ctx_keep,
             cam_cond=cam_cond,
             raw_camera_tokens=raw_cams,
@@ -883,28 +949,32 @@ def train(args):
         # into the optimised loss so train/loss stays pure flow.
         if args.freeze_recon:
             loss = args.lambda_flow * flow_loss
+        elif args.recon_only:
+            loss = args.lambda_recon * recon_loss
         else:
             loss = args.lambda_recon * recon_loss + args.lambda_flow * flow_loss
 
-        will_log = (step + 1) % args.log_interval == 0 or step == 0
+        will_log = (step + 1) % args.log_interval == 0 or step == start_step
         grad_norms = None
         # Per-term grad norms need a live graph; under --freeze_recon the recon
         # terms come from a no_grad block, so skip them instead of crashing.
         if (
             will_log
-            and args.wandb
-            and wandb is not None
             and args.log_grad_norms
+            and (step == start_step or (step + 1) % args.grad_log_interval == 0)
             and not args.freeze_recon
         ):
             grad_norms = compute_pc_loss_grad_norms(model, criterion, extras=extras)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        if args.recon_only and not torch.isfinite(loss.detach()):
+            raise FloatingPointError(f"Non-finite reconstruction loss at step {step + 1}")
         if args.max_grad_norm > 0:
             grad_norm_preclip = torch.nn.utils.clip_grad_norm_(
                 list(model.parameters()) + list(vggt_builder.parameters()),
                 args.max_grad_norm,
+                error_if_nonfinite=args.recon_only,
             )
         else:
             grad_norm_preclip = global_grad_norm(model)
@@ -934,7 +1004,8 @@ def train(args):
                 keep_msg,
                 time.time() - t0,
             )
-            if args.wandb and wandb is not None:
+            # Keep a local metrics record even when W&B is offline/disabled.
+            if will_log:
                 log_dict = {
                     "train/loss": float(loss),
                     "train/recon": float(recon_loss),
@@ -968,6 +1039,8 @@ def train(args):
                             "train/anc": float(extras["loss_anc"]),
                             "train/anc_cd": float(extras.get("loss_anc_cd", 0.0)),
                             "train/delta": float(extras.get("loss_delta", 0.0)),
+                            "train/local": float(extras.get("loss_local", 0.0)),
+                            "train/local_weighted": args.lambda_local * float(extras.get("loss_local", 0.0)),
                         }
                     )
                     log_dict.update(
@@ -988,6 +1061,7 @@ def train(args):
                     )
                     if centers is not None:
                         log_dict.update(anchor_diagnostics(centers, fps_xyz))
+                    log_dict.update({k: float(v) for k, v in extras.items() if k.startswith("local/")})
                 if ctx_keep is not None:
                     # Sanity: variable-length VGGT pad/keep (camera always kept).
                     n_keep = ctx_keep.float().sum(dim=-1)
@@ -1002,9 +1076,24 @@ def train(args):
                         if torch.is_tensor(grad_norm_preclip)
                         else grad_norm_preclip
                     )
+                    log_dict["grad_norm/clip_factor"] = (
+                        min(1.0, args.max_grad_norm / max(log_dict["grad_norm/total"], 1e-12))
+                        if args.max_grad_norm > 0 else 1.0
+                    )
                     for k, v in grad_norms.items():
                         log_dict[f"grad_norm/{k}"] = v
-                wandb.log(log_dict, step=step)
+                log_dict["runtime/precision"] = args.precision
+                log_dict["runtime/recon_only"] = args.recon_only
+                log_dict["runtime/seconds_per_step"] = (time.time() - t0) / max(step - start_step, 1)
+                if device.type == "cuda":
+                    log_dict["runtime/peak_allocated_gib"] = torch.cuda.max_memory_allocated(device) / 2**30
+                    log_dict["runtime/peak_reserved_gib"] = torch.cuda.max_memory_reserved(device) / 2**30
+                with open(output_dir / "metrics.jsonl", "a") as metrics_file:
+                    metrics_file.write(json.dumps(log_dict) + "\n")
+                if grad_norms:
+                    logger.info("Weighted gradient norms: %s", json.dumps(grad_norms))
+                if args.wandb and wandb is not None:
+                    wandb.log(log_dict, step=step)
 
         if args.vis_interval > 0 and step % args.vis_interval == 0:
             vis = _log_visuals(
@@ -1039,7 +1128,7 @@ def train(args):
             if args.wandb and wandb is not None:
                 wandb.log({**vis["metrics"], **vis["objects"]}, step=step)
 
-        if args.ckpt_interval > 0 and step % args.ckpt_interval == 0:
+        if args.ckpt_interval > 0 and step % args.ckpt_interval == 0 and step < total_steps:
             _save_ckpt(
                 output_dir / f"ckpt_{step:07d}.pt",
                 step=step,
@@ -1332,6 +1421,18 @@ def parse_args():
 
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--num_workers", type=int, default=0)
+    p.add_argument("--recon_only", action="store_true", help="Skip the entire flow forward and unused conditioning.")
+    p.add_argument("--view_sample_mode", choices=("random", "first"), default="random")
+    p.add_argument("--cache_fixed_surfaces", action="store_true")
+    p.add_argument("--fps_query_cache_items", type=int, default=0)
+    p.add_argument("--precision", choices=("fp32", "bf16"), default="fp32")
+    p.add_argument("--precision_preflight", action="store_true")
+    p.add_argument("--chamfer_backend", choices=("dense", "chunked"), default="dense")
+    p.add_argument("--chamfer_chunk_size", type=int, default=1024)
+    p.add_argument("--local_loss", choices=("none", "cd", "ot"), default="none")
+    p.add_argument("--lambda_local", type=float, default=0.1)
+    p.add_argument("--local_patch_count", type=int, default=64)
+    p.add_argument("--local_radius_scale", type=float, default=0.5)
     p.add_argument("--num_steps", type=int, default=5000)
     p.add_argument(
         "--additional_steps",
@@ -1527,6 +1628,7 @@ def parse_args():
         help="Recon points farther than this from GT go into intruders.ply.",
     )
     p.add_argument("--log_grad_norms", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--grad_log_interval", type=int, default=500)
     p.add_argument(
         "--save_optimizer",
         action=argparse.BooleanOptionalAction,

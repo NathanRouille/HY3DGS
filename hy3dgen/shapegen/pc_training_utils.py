@@ -26,12 +26,8 @@ def grad_norm_for_loss(
         retain_graph=True,
         allow_unused=True,
     )
-    total_sq = sum(
-        g.detach().float().norm().pow(2).item()
-        for g in grads
-        if g is not None
-    )
-    return float(total_sq ** 0.5)
+    squares = [g.detach().float().square().sum() for g in grads if g is not None]
+    return float(torch.stack(squares).sum().sqrt().item()) if squares else 0.0
 
 
 def global_grad_norm(model: nn.Module) -> float:
@@ -55,6 +51,11 @@ def compute_pc_loss_grad_norms(
     params = list(model.parameters())
     norms: Dict[str, float] = {}
     norms["cd"] = grad_norm_for_loss(params, extras["_cd"])
+    for name, weight in (("cd_pred2gt", criterion.cd_pred2gt), ("cd_gt2pred", criterion.cd_gt2pred)):
+        if "_" + name in extras:
+            norms[name] = grad_norm_for_loss(params, weight * extras["_" + name])
+    if getattr(criterion.local_loss, "mode", "none") != "none":
+        norms["local"] = grad_norm_for_loss(params, criterion.lambda_local * extras["_local"])
     if criterion.lambda_rgb > 0:
         norms["rgb"] = grad_norm_for_loss(params, criterion.lambda_rgb * extras["_rgb"])
         if (

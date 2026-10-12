@@ -14,6 +14,44 @@ def pairwise_dist2(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return torch.cdist(a, b, p=2).pow(2)
 
 
+def nearest_neighbor_distances(pred, target, *, backend="dense", chunk_size=1024):
+    """Exact bidirectional NN search; chunked mode stores no distance graph.
+
+    Search every reference point, preserve first-index ties, then differentiate
+    the selected squared residuals. This is the same piecewise Chamfer objective,
+    with only floating-point roundoff differences from cdist's matrix formula.
+    """
+    if pred.ndim != 3 or target.ndim != 3 or pred.shape[0] != target.shape[0]:
+        raise ValueError("Expected matching batches of [B,N,3] point clouds")
+    if not pred.shape[1] or not target.shape[1]:
+        raise ValueError("Nearest-neighbour clouds must be nonempty")
+    if backend == "dense":
+        dist = pairwise_dist2(pred, target)
+        p_dist, p_idx = dist.min(dim=2)
+        t_dist, t_idx = dist.min(dim=1)
+        return p_dist, t_dist, p_idx, t_idx
+    if backend != "chunked" or int(chunk_size) <= 0:
+        raise ValueError("backend must be dense/chunked and chunk_size positive")
+    with torch.no_grad():
+        p_idx = torch.empty(pred.shape[:2], dtype=torch.long, device=pred.device)
+        t_idx = torch.zeros(target.shape[:2], dtype=torch.long, device=pred.device)
+        best = target.new_full(target.shape[:2], float("inf"))
+        mode = ("use_mm_for_euclid_dist" if max(pred.shape[1], target.shape[1]) > 25
+                else "donot_use_mm_for_euclid_dist")
+        for start in range(0, pred.shape[1], int(chunk_size)):
+            distance = torch.cdist(pred[:, start:start + chunk_size].detach(),
+                                   target.detach(), compute_mode=mode)
+            p_idx[:, start:start + chunk_size] = distance.argmin(dim=2)
+            value, index = distance.min(dim=1)
+            better = value < best  # Strict: earlier source wins ties across chunks.
+            t_idx = torch.where(better, index + start, t_idx)
+            best = torch.minimum(best, value)
+    matched_t = target.gather(1, p_idx[..., None].expand(-1, -1, 3))
+    matched_p = pred.gather(1, t_idx[..., None].expand(-1, -1, 3))
+    return ((pred - matched_t).square().sum(-1),
+            (target - matched_p).square().sum(-1), p_idx, t_idx)
+
+
 def chamfer_distance(
     pred: torch.Tensor,
     target: torch.Tensor,
@@ -21,6 +59,8 @@ def chamfer_distance(
     bidirectional: bool = True,
     w_pred2gt: float = 1.0,
     w_gt2pred: float = 1.0,
+    backend: str = "dense",
+    chunk_size: int = 1024,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Chamfer (mean of squared NN distances), optionally direction-weighted.
 
@@ -32,9 +72,9 @@ def chamfer_distance(
         idx_pred_to_tgt: [B, N] NN indices into target for each pred point
         idx_tgt_to_pred: [B, M] NN indices into pred for each target point
     """
-    dist = pairwise_dist2(pred, target)  # [B, N, M]
-    pred_to_tgt, idx_p2t = dist.min(dim=2)
-    tgt_to_pred, idx_t2p = dist.min(dim=1)
+    pred_to_tgt, tgt_to_pred, idx_p2t, idx_t2p = nearest_neighbor_distances(
+        pred, target, backend=backend, chunk_size=chunk_size
+    )
     if bidirectional:
         loss = float(w_pred2gt) * pred_to_tgt.mean() + float(w_gt2pred) * tgt_to_pred.mean()
     else:
@@ -102,7 +142,10 @@ def sinkhorn_matching_loss(
         return pred.new_zeros(())
 
     C_xy = pairwise_dist2(pred, target)
-    cost_xy, P_xy = _sinkhorn_transport_cost(C_xy, epsilon=epsilon, n_iters=n_iters)
+    # The default objective stops gradients through the plan. Avoid constructing
+    # fifty iterations of an autograd graph that would immediately be detached.
+    with torch.set_grad_enabled(torch.is_grad_enabled() and not detach_plan):
+        cost_xy, P_xy = _sinkhorn_transport_cost(C_xy, epsilon=epsilon, n_iters=n_iters)
     if detach_plan:
         # Regress positions under a frozen soft assignment (Hungarian-like).
         cost_xy = (P_xy.detach() * C_xy).sum(dim=(1, 2)) * float(N)
@@ -113,8 +156,9 @@ def sinkhorn_matching_loss(
     # Sinkhorn divergence correction (stop-grad on self-OT plans).
     C_xx = pairwise_dist2(pred, pred)
     C_yy = pairwise_dist2(target, target)
-    cost_xx, P_xx = _sinkhorn_transport_cost(C_xx, epsilon=epsilon, n_iters=n_iters)
-    cost_yy, P_yy = _sinkhorn_transport_cost(C_yy, epsilon=epsilon, n_iters=n_iters)
+    with torch.set_grad_enabled(torch.is_grad_enabled() and not detach_plan):
+        cost_xx, P_xx = _sinkhorn_transport_cost(C_xx, epsilon=epsilon, n_iters=n_iters)
+        cost_yy, P_yy = _sinkhorn_transport_cost(C_yy, epsilon=epsilon, n_iters=n_iters)
     if detach_plan:
         cost_xx = (P_xx.detach() * C_xx).sum(dim=(1, 2)) * float(N)
         cost_yy = (P_yy.detach() * C_yy).sum(dim=(1, 2)) * float(N)
@@ -252,6 +296,12 @@ class PointCloudAELoss(nn.Module):
         rgb_topk_frac: float = 0.0,
         rgb_topk_beta: float = 1.0,
         geometry_only: bool = False,
+        chamfer_backend: str = "dense",
+        chamfer_chunk_size: int = 1024,
+        local_loss: str = "none",
+        lambda_local: float = 0.1,
+        local_patch_count: int = 64,
+        local_radius_scale: float = 0.5,
     ):
         super().__init__()
         self.geometry_only = bool(geometry_only)
@@ -266,6 +316,11 @@ class PointCloudAELoss(nn.Module):
         self.sinkhorn_iters = int(sinkhorn_iters)
         self.rgb_topk_frac = float(rgb_topk_frac)
         self.rgb_topk_beta = float(rgb_topk_beta)
+        self.chamfer_backend = chamfer_backend
+        self.chamfer_chunk_size = int(chamfer_chunk_size)
+        self.lambda_local = float(lambda_local)
+        from .pc_local_loss import LocalPatchLoss
+        self.local_loss = LocalPatchLoss(local_loss, local_patch_count, local_radius_scale)
 
     def forward(
         self,
@@ -277,9 +332,10 @@ class PointCloudAELoss(nn.Module):
         fps_xyz: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         # Unweighted direction means for logging; weighted sum enters the loss.
-        dist = pairwise_dist2(pred_xyz, gt_xyz)
-        pred_to_tgt, idx_p2t = dist.min(dim=2)
-        tgt_to_pred, idx_t2p = dist.min(dim=1)
+        pred_to_tgt, tgt_to_pred, idx_p2t, idx_t2p = nearest_neighbor_distances(
+            pred_xyz, gt_xyz, backend=self.chamfer_backend,
+            chunk_size=self.chamfer_chunk_size,
+        )
         cd_p2g = pred_to_tgt.mean()
         cd_g2p = tgt_to_pred.mean()
         cd = self.cd_pred2gt * cd_p2g + self.cd_gt2pred * cd_g2p
@@ -308,6 +364,8 @@ class PointCloudAELoss(nn.Module):
             "loss_rgb_mean": rgb_parts["mean"].detach(),
             "loss_rgb_topk": rgb_parts["topk"].detach(),
             "_cd": cd,
+            "_cd_pred2gt": cd_p2g,
+            "_cd_gt2pred": cd_g2p,
             "_rgb": rgb,
             "_rgb_mean": rgb_parts["mean"],
             "_rgb_topk": rgb_parts["topk"],
@@ -317,6 +375,8 @@ class PointCloudAELoss(nn.Module):
             "_anc_cd": zero,
             "loss_delta": zero.detach(),
             "_delta": zero,
+            "loss_local": zero.detach(),
+            "_local": zero,
         }
 
         have_anchors = centers is not None and fps_xyz is not None
@@ -334,7 +394,8 @@ class PointCloudAELoss(nn.Module):
         if have_anchors and self.lambda_anc_cd > 0:
             # Bidirectional squared Chamfer: hard NN pin centres↔FPS.
             # fps is typically already detached by the trainer.
-            anc_cd, _, _ = chamfer_distance(centers, fps_xyz, bidirectional=True)
+            anc_cd, _, _ = chamfer_distance(centers, fps_xyz, bidirectional=True,
+                backend=self.chamfer_backend, chunk_size=self.chamfer_chunk_size)
             total = total + self.lambda_anc_cd * anc_cd
             extras["loss_anc_cd"] = anc_cd.detach()
             extras["_anc_cd"] = anc_cd
@@ -355,6 +416,13 @@ class PointCloudAELoss(nn.Module):
             extras["loss_delta"] = d_loss.detach()
             extras["_delta"] = d_loss
 
+        if have_anchors and self.local_loss.mode != "none" and self.lambda_local > 0:
+            local, stats = self.local_loss(pred_xyz, centers, gt_xyz, fps_xyz)
+            total = total + self.lambda_local * local
+            extras["loss_local"] = local.detach()
+            extras["_local"] = local
+            extras.update(stats)
+
         extras["loss_total"] = total.detach()
         return total, extras
 
@@ -363,7 +431,7 @@ class PointCloudAELoss(nn.Module):
         extras: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
         """Weighted scalar loss terms for per-term grad-norm logging."""
-        terms: Dict[str, torch.Tensor] = {"cd": extras["loss_cd"]}
+        terms: Dict[str, torch.Tensor] = {"cd": extras["_cd"]}
         if self.lambda_rgb > 0:
             terms["rgb"] = self.lambda_rgb * extras["_rgb"]
         if self.lambda_anc > 0 and "_anc" in extras:
@@ -372,4 +440,6 @@ class PointCloudAELoss(nn.Module):
             terms["anc_cd"] = self.lambda_anc_cd * extras["_anc_cd"]
         if self.lambda_delta > 0 and "_delta" in extras:
             terms["delta"] = self.lambda_delta * extras["_delta"]
+        if self.lambda_local > 0 and "_local" in extras:
+            terms["local"] = self.lambda_local * extras["_local"]
         return terms

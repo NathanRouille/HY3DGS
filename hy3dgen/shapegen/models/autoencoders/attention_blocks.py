@@ -659,6 +659,8 @@ class PointCrossAttentionEncoder(nn.Module):
         self.fps_sharp_beta = float(fps_sharp_beta)
         self.fps_density_clip_low = float(fps_density_clip_low)
         self.fps_density_clip_high = float(fps_density_clip_high)
+        self.query_cache_max_items = 0  # Opt-in, bounded, not checkpoint state.
+        self._weighted_query_cache = []
 
         if pc_sharpedge_size == 0:
             logger.info('PointCrossAttentionEncoder: pc_sharpedge_size=0, using pc_size for both splits')
@@ -893,6 +895,28 @@ class PointCrossAttentionEncoder(nn.Module):
         for b in range(B):
             cand = input_pc[b]  # [N, 3]
             ref = input_random_pc[b]  # uniform-only density reference
+            candidate_feats = input_feats[b] if input_feats is not None else None
+            cacheable = (self.query_cache_max_items > 0 and self.deterministic
+                         and not cand.requires_grad
+                         and (candidate_feats is None or not candidate_feats.requires_grad))
+            cache_key = (num_latents, n_u, self.fps_density_k, self.fps_sharp_beta,
+                         self.fps_density_clip_low, self.fps_density_clip_high,
+                         cand.device, cand.dtype)
+            cached_idx = None
+            if cacheable:
+                for key, xyz_saved, feats_saved, indices in self._weighted_query_cache:
+                    if key == cache_key and torch.equal(xyz_saved, cand) and (
+                        (feats_saved is None and candidate_feats is None)
+                        or (feats_saved is not None and candidate_feats is not None
+                            and torch.equal(feats_saved, candidate_feats))
+                    ):
+                        cached_idx = indices
+                        break
+            if cached_idx is not None:
+                query_list.append(cand[cached_idx])
+                if input_feats is not None:
+                    query_feat_list.append(input_feats[b, cached_idx])
+                continue
             rho_u = knn_density_from_reference(
                 ref, ref, k=self.fps_density_k, candidates_in_reference=True
             )
@@ -913,6 +937,12 @@ class PointCrossAttentionEncoder(nn.Module):
             idx = weighted_fps_indices(
                 cand, w, num_latents, deterministic=self.deterministic
             )
+            if cacheable:
+                if len(self._weighted_query_cache) >= self.query_cache_max_items:
+                    self._weighted_query_cache.pop(0)
+                self._weighted_query_cache.append((cache_key, cand.detach().clone(),
+                    candidate_feats.detach().clone() if candidate_feats is not None else None,
+                    idx.detach().clone()))
             query_list.append(cand[idx])
             if input_feats is not None:
                 query_feat_list.append(input_feats[b, idx])
