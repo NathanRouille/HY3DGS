@@ -617,6 +617,7 @@ def collate_surface_render(batch: List[Dict]) -> Dict:
             [b["intrinsics_views"] for b in batch], dim=0
         )
         out["c2w_views"] = torch.stack([b["c2w_views"] for b in batch], dim=0)
+    if all("view_indices" in b for b in batch):
         out["view_indices"] = torch.stack([b["view_indices"] for b in batch], dim=0)
     if all("vggt_cache" in b for b in batch):
         out["vggt_cache"] = [b["vggt_cache"] for b in batch]

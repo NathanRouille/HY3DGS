@@ -1,5 +1,6 @@
 """Conservative runtime helpers for fixed-view reconstruction experiments."""
 import copy
+import itertools
 from contextlib import nullcontext
 
 import torch
@@ -24,6 +25,41 @@ class FixedSurfaceDataset(Dataset):
         # Tensor clones protect the stored normalized data from in-place callers.
         return {k: v.clone() if torch.is_tensor(v) else v
                 for k, v in self.items[index].items()}
+
+
+class PooledSurfaceDataset(Dataset):
+    """Cache every ordered view tuple while preserving room/pair sampling.
+
+    Images are needed for normalization only during preload. Cached VGGT
+    payloads remain on CPU; learned context projections still run every step.
+    """
+    def __init__(self, source, *, keep_context=False):
+        if source.seed is None or source.views_per_sample < 2:
+            raise ValueError("Pooled caching requires a seed and multi-view samples")
+        if keep_context and not source.use_joint_vggt_cache:
+            raise ValueError("Conditioned pooled caching requires joint VGGT caches")
+        self.source = source
+        self.mesh_paths, self.samples = source.mesh_paths, source.samples
+        self.items = {}
+        keys = {"surface", "mesh_path", "surface_frame", "view_idx", "view_indices", "align_mode"}
+        if keep_context:
+            keys.add("vggt_cache")
+        for path, _ in self.samples:
+            pool = source._mesh_available.get(path) or source._pool_for_mesh(path)
+            for views in itertools.permutations(pool, source.views_per_sample):
+                item = source._load_multi_view_sample(path, list(views))
+                if keep_context and "vggt_cache" not in item:
+                    raise ValueError(f"Missing joint context: {path} {views}")
+                self.items[path, views] = {k: v for k, v in item.items() if k in keys}
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        path, _ = self.samples[index]
+        views = tuple(self.source._choose_views(path, index))
+        return {k: v.clone() if torch.is_tensor(v) else v
+                for k, v in self.items[path, views].items()}
 
 
 def autocast_context(device, precision):

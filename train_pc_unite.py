@@ -30,7 +30,7 @@ from hy3dgen.shapegen.models.autoencoders.shape_pc_unite import ShapePCUnite
 from hy3dgen.shapegen.pc_debug_export import export_recon_debug_plys
 from hy3dgen.shapegen.pc_losses import PointCloudAELoss, chamfer_distance
 from hy3dgen.shapegen.pc_recon_runtime import (
-    FixedSurfaceDataset, autocast_context, flow_training_output, precision_preflight,
+    FixedSurfaceDataset, PooledSurfaceDataset, autocast_context, flow_training_output, precision_preflight,
 )
 from hy3dgen.shapegen.pc_render_dataset import (
     build_internscenes_render_dataset,
@@ -370,6 +370,14 @@ def train(args):
         raise ValueError("--recon_only cannot be combined with --freeze_recon")
     if args.cache_fixed_surfaces and (not args.recon_only or args.tokenizer_use_weak_context):
         raise ValueError("--cache_fixed_surfaces requires unconditioned --recon_only")
+    if args.cache_pooled_surfaces:
+        if args.cache_fixed_surfaces or args.num_workers != 0 or args.align_mode != "c_meanrms":
+            raise ValueError("Pooled caching requires c_meanrms, num_workers=0 and no fixed cache")
+        if not args.recon_only or args.tokenizer_use_weak_context:
+            if not args.vggt_joint_cache or args.surflo_global_cam:
+                raise ValueError("Conditioned pooled caching requires joint VGGT and no Surflo camera")
+    if args.local_target_cache_items <= 0:
+        raise ValueError("local_target_cache_items must be positive")
     if args.grad_log_interval <= 0 or args.log_interval <= 0 or args.fps_query_cache_items < 0:
         raise ValueError("Log intervals must be positive and cache size nonnegative")
     if args.recon_only and args.align_mode != "c_meanrms":
@@ -539,6 +547,7 @@ def train(args):
         local_patch_count=args.local_patch_count,
         local_radius_scale=args.local_radius_scale,
     )
+    criterion.local_loss.cache_max_items = args.local_target_cache_items
     logger.info(
         "Chamfer direction weights: cd_pred2gt=%.3f cd_gt2pred=%.3f",
         criterion.cd_pred2gt,
@@ -689,6 +698,9 @@ def train(args):
     if args.cache_fixed_surfaces:
         dataset = FixedSurfaceDataset(dataset)
         logger.info("Cached %d fixed normalized surfaces; render/VGGT reads skipped in the loop", len(dataset))
+    if args.cache_pooled_surfaces:
+        dataset = PooledSurfaceDataset(dataset, keep_context=needs_weak_context)
+        logger.info("Cached %d ordered tuples for %d rooms; random pair sampling preserved", len(dataset.items), len(dataset))
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -974,7 +986,7 @@ def train(args):
             grad_norm_preclip = torch.nn.utils.clip_grad_norm_(
                 list(model.parameters()) + list(vggt_builder.parameters()),
                 args.max_grad_norm,
-                error_if_nonfinite=args.recon_only,
+                error_if_nonfinite=args.recon_only or args.freeze_recon,
             )
         else:
             grad_norm_preclip = global_grad_norm(model)
@@ -1424,6 +1436,8 @@ def parse_args():
     p.add_argument("--recon_only", action="store_true", help="Skip the entire flow forward and unused conditioning.")
     p.add_argument("--view_sample_mode", choices=("random", "first"), default="random")
     p.add_argument("--cache_fixed_surfaces", action="store_true")
+    p.add_argument("--cache_pooled_surfaces", action="store_true")
+    p.add_argument("--local_target_cache_items", type=int, default=16)
     p.add_argument("--fps_query_cache_items", type=int, default=0)
     p.add_argument("--precision", choices=("fp32", "bf16"), default="fp32")
     p.add_argument("--precision_preflight", action="store_true")

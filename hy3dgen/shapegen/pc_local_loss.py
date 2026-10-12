@@ -32,6 +32,7 @@ class LocalPatchLoss:
             raise ValueError("Local patch count and radius scale must be positive")
         self.mode, self.patch_count, self.radius_scale = mode, int(patch_count), float(radius_scale)
         self.cache = []  # Bounded, runtime-only. Each entry checks the full inputs.
+        self.cache_max_items = 16
 
     def _targets(self, gt, fps, size):
         for item in self.cache:
@@ -52,7 +53,7 @@ class LocalPatchLoss:
                 "target": torch.as_tensor(unique[neighbors], device=gt.device, dtype=gt.dtype),
                 "radius": torch.as_tensor(radius, device=gt.device, dtype=gt.dtype),
                 "valid": torch.as_tensor(valid, device=gt.device), "cursor": 0}
-        if len(self.cache) >= 16:
+        if len(self.cache) >= self.cache_max_items:
             self.cache.pop(0)
         self.cache.append(item)
         return item

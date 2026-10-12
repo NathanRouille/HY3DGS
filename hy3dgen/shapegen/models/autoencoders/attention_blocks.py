@@ -901,7 +901,7 @@ class PointCrossAttentionEncoder(nn.Module):
                          and (candidate_feats is None or not candidate_feats.requires_grad))
             cache_key = (num_latents, n_u, self.fps_density_k, self.fps_sharp_beta,
                          self.fps_density_clip_low, self.fps_density_clip_high,
-                         cand.device, cand.dtype)
+                         cand.device, cand.dtype, use_sharp)
             cached_idx = None
             if cacheable:
                 for key, xyz_saved, feats_saved, indices in self._weighted_query_cache:
