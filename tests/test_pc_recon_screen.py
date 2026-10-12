@@ -24,6 +24,33 @@ torch.set_num_threads(2)
 
 
 class ReconstructionScreenTests(unittest.TestCase):
+    def test_pbs_startup_creates_fresh_output_before_writing_revision(self):
+        repo = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            project.mkdir()
+            # Exercise the real shell startup, with cluster/GPU commands stubbed.
+            # This test performs no submission, conda activation or GPU work.
+            text = (repo / "train_recon_screen.pbs").read_text()
+            text = text.replace("PROJECT_ROOT=/projects_vol/gp_chuanxia.zheng/nathan/HY3DGS",
+                                "PROJECT_ROOT=" + str(project))
+            text = text.replace('eval "$(/usr/local/anaconda2025/bin/conda shell.bash hook)"', ":")
+            stubs = "module() { :; }\nconda() { :; }\ngit() { echo tested_revision; }\nnvidia-smi() { :; }\npython() { :; }\n"
+            launcher = project / "test.pbs"
+            launcher.write_text(stubs + text)
+            (project / "run_internscenes_recon_screen.sh").write_text(
+                'set -eu\ntest -s "$OUT/git_commit.txt"\nprintf reached > "$OUT/training_reached"\n')
+            for index, experiment in enumerate(("global", "local_cd", "local_ot")):
+                job_id = f"test{index}.gaas"
+                env = dict(os.environ, PBS_JOBID=job_id, EXPERIMENT=experiment)
+                result = subprocess.run(["bash", str(launcher)], env=env,
+                                        capture_output=True, text=True, timeout=10)
+                out = project / "runs/recon_screen" / f"{experiment}_{job_id}"
+                log = project / "runs/logs" / f"recon_{experiment}_{job_id}.log"
+                self.assertEqual(result.returncode, 0, log.read_text() if log.exists() else result.stderr)
+                self.assertEqual((out / "git_commit.txt").read_text().strip(), "tested_revision")
+                self.assertTrue((out / "training_reached").exists())
+
     def test_detached_sinkhorn_plan_optimization_preserves_historical_objective(self):
         torch.manual_seed(4)
         p = torch.randn(2, 7, 3, dtype=torch.float64, requires_grad=True)
