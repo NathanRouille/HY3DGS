@@ -29,6 +29,7 @@ from hy3dgen.shapegen.models.autoencoders.shape_pc_ae import (
 from hy3dgen.shapegen.models.autoencoders.shape_pc_unite import ShapePCUnite
 from hy3dgen.shapegen.pc_debug_export import export_recon_debug_plys
 from hy3dgen.shapegen.pc_losses import PointCloudAELoss, chamfer_distance
+from hy3dgen.shapegen.pc_joint_runtime import make_lr_scheduler, shared_ge_gradient_metrics
 from hy3dgen.shapegen.pc_recon_runtime import (
     FixedSurfaceDataset, PooledSurfaceDataset, autocast_context, flow_training_output, precision_preflight,
 )
@@ -378,6 +379,11 @@ def train(args):
                 raise ValueError("Conditioned pooled caching requires joint VGGT and no Surflo camera")
     if args.local_target_cache_items <= 0:
         raise ValueError("local_target_cache_items must be positive")
+    if args.joint_eval_interval < 0 or args.joint_eval_sample_steps < 2:
+        raise ValueError("Joint evaluation interval must be nonnegative and sample steps >=2")
+    if args.joint_eval_interval and (not args.cache_pooled_surfaces or args.recon_only
+            or args.freeze_recon or args.tokenizer_use_weak_context or args.surflo_global_cam):
+        raise ValueError("Joint pair evaluation requires pooled joint training with an unconditioned tokenizer")
     if args.grad_log_interval <= 0 or args.log_interval <= 0 or args.fps_query_cache_items < 0:
         raise ValueError("Log intervals must be positive and cache size nonnegative")
     if args.recon_only and args.align_mode != "c_meanrms":
@@ -513,11 +519,19 @@ def train(args):
         model.offpath_step_size,
     )
     if args.pretrained_load == "cross_attn" and not args.resume_ckpt:
-        model.load_shapevae_cross_attn(
+        report = model.load_shapevae_cross_attn(
             args.pretrained_repo,
             rgb_feat_init=args.rgb_feat_init,
             subfolder=args.pretrained_subfolder or "hunyuan3d-vae-v2-mini-withencoder",
         )
+        if not {"input_proj.weight", "cross_attn.*"}.issubset(report["loaded_keys"]):
+            raise RuntimeError("Requested pretrained point encoder weights were not loaded")
+        # Original HY3DGS architecture has Q/KV biases; Hunyuan's CA has none.
+        # Keep those two biases at their fresh initialization, as in the original run.
+        expected_missing = {"attn.c_q.bias", "attn.c_kv.bias"}
+        if (set(report.get("cross_attn_missing", ())) - expected_missing
+                or report.get("cross_attn_unexpected")):
+            raise RuntimeError(f"Unexpected pretrained cross-attention mismatch: {report}")
 
     mask_white_bg = getattr(args, "dataset", "gobjaverse") != "internscenes"
     vggt_builder = VGGTContextBuilder(
@@ -709,6 +723,7 @@ def train(args):
         collate_fn=collate_surface_render,
         pin_memory=(device.type == "cuda"),
         drop_last=len(dataset) >= args.batch_size,
+        generator=torch.Generator().manual_seed(args.seed) if args.seed is not None else None,
     )
 
     output_dir = Path(args.output_dir)
@@ -797,14 +812,10 @@ def train(args):
     # Build the schedule only once total_steps is final; T_max used to come from
     # --num_steps even when --additional_steps shortened the run.
     remaining = max(total_steps - start_step, 1)
-    if args.lr_schedule == "cosine":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=remaining, eta_min=args.lr * 0.01
-        )
-    else:
-        scheduler = torch.optim.lr_scheduler.ConstantLR(
-            optimizer, factor=1.0, total_iters=0
-        )
+    schedule_steps = total_steps if (ckpt is not None and args.lr_warmup_steps
+                                    and not args.reset_optimizer_on_resume) else remaining
+    scheduler = make_lr_scheduler(optimizer, schedule=args.lr_schedule, steps=schedule_steps,
+        warmup_steps=args.lr_warmup_steps, min_ratio=args.lr_min_ratio)
 
     if ckpt is not None:
         if "optimizer" in ckpt and not args.reset_optimizer_on_resume:
@@ -812,7 +823,7 @@ def train(args):
                 optimizer.load_state_dict(ckpt["optimizer"])
             except (ValueError, KeyError):
                 logger.warning("Skipping optimizer state (incompatible checkpoint)")
-        if "scheduler" in ckpt and start_step > 0 and args.lr_schedule == "cosine":
+        if "scheduler" in ckpt and start_step > 0 and not args.reset_optimizer_on_resume:
             try:
                 scheduler.load_state_dict(ckpt["scheduler"])
             except (ValueError, KeyError):
@@ -845,6 +856,7 @@ def train(args):
         torch.cuda.reset_peak_memory_stats(device)
     data_iter = iter(loader)
     t0 = time.time()
+    evaluation_seconds = 0.0
     zero = torch.zeros((), device=device)
     empty_extras = {
         "loss_cd": zero,
@@ -968,6 +980,7 @@ def train(args):
 
         will_log = (step + 1) % args.log_interval == 0 or step == start_step
         grad_norms = None
+        shared_grad_metrics = {}
         # Per-term grad norms need a live graph; under --freeze_recon the recon
         # terms come from a no_grad block, so skip them instead of crashing.
         if (
@@ -977,16 +990,19 @@ def train(args):
             and not args.freeze_recon
         ):
             grad_norms = compute_pc_loss_grad_norms(model, criterion, extras=extras)
+            if not args.recon_only:
+                shared_grad_metrics = shared_ge_gradient_metrics(model,
+                    args.lambda_recon * recon_loss, args.lambda_flow * flow_loss)
 
         optimizer.zero_grad(set_to_none=True)
+        if not torch.isfinite(loss.detach()):
+            raise FloatingPointError(f"Non-finite training loss at step {step + 1}")
         loss.backward()
-        if args.recon_only and not torch.isfinite(loss.detach()):
-            raise FloatingPointError(f"Non-finite reconstruction loss at step {step + 1}")
         if args.max_grad_norm > 0:
             grad_norm_preclip = torch.nn.utils.clip_grad_norm_(
                 list(model.parameters()) + list(vggt_builder.parameters()),
                 args.max_grad_norm,
-                error_if_nonfinite=args.recon_only or args.freeze_recon,
+                error_if_nonfinite=True,
             )
         else:
             grad_norm_preclip = global_grad_norm(model)
@@ -1082,6 +1098,7 @@ def train(args):
                     log_dict["context/n_keep_max"] = float(n_keep.max())
                     log_dict["context/keep_frac"] = float(ctx_keep.float().mean())
                 log_dict.update(latent_statistics(z))
+                log_dict.update(shared_grad_metrics)
                 if grad_norms:
                     log_dict["grad_norm/total"] = float(
                         grad_norm_preclip.detach().item()
@@ -1096,7 +1113,8 @@ def train(args):
                         log_dict[f"grad_norm/{k}"] = v
                 log_dict["runtime/precision"] = args.precision
                 log_dict["runtime/recon_only"] = args.recon_only
-                log_dict["runtime/seconds_per_step"] = (time.time() - t0) / max(step - start_step, 1)
+                log_dict["runtime/seconds_per_step"] = (time.time() - t0 - evaluation_seconds) / max(step - start_step, 1)
+                log_dict["runtime/evaluation_seconds"] = evaluation_seconds
                 if device.type == "cuda":
                     log_dict["runtime/peak_allocated_gib"] = torch.cuda.max_memory_allocated(device) / 2**30
                     log_dict["runtime/peak_reserved_gib"] = torch.cuda.max_memory_reserved(device) / 2**30
@@ -1151,6 +1169,20 @@ def train(args):
                 args=args,
                 include_optimizer=args.save_optimizer,
             )
+            if args.save_latest_optimizer:
+                temporary = output_dir / "ckpt_last_resume.tmp.pt"
+                _save_ckpt(temporary, step=step, model=model, vggt_builder=vggt_builder,
+                    optimizer=optimizer, scheduler=scheduler, args=args, include_optimizer=True)
+                temporary.replace(output_dir / "ckpt_last_resume.pt")
+
+        if args.joint_eval_interval and step % args.joint_eval_interval == 0 and step < total_steps:
+            from hy3dgen.shapegen.pc_joint_eval import evaluate_joint_pairs
+            summary = evaluate_joint_pairs(model, vggt_builder, dataset.items, _build_weak_context,
+                output_dir=output_dir / "eval" / f"step_{step:07d}", step=step,
+                sample_steps=args.joint_eval_sample_steps, gen_seeds=(0,))
+            evaluation_seconds += summary["seconds"]
+            with open(output_dir / "evaluation_summary.jsonl", "a") as evaluation_file:
+                evaluation_file.write(json.dumps(summary) + "\n")
 
     _save_ckpt(
         output_dir / "ckpt_final.pt",
@@ -1160,8 +1192,19 @@ def train(args):
         optimizer=optimizer,
         scheduler=scheduler,
         args=args,
-        include_optimizer=args.save_optimizer,
+        include_optimizer=args.save_optimizer or args.save_latest_optimizer,
     )
+    if args.joint_eval_interval:
+        from hy3dgen.shapegen.pc_joint_eval import evaluate_joint_pairs
+        summary = evaluate_joint_pairs(model, vggt_builder, dataset.items, _build_weak_context,
+            output_dir=output_dir / "eval" / "final", step=step,
+            sample_steps=args.joint_eval_sample_steps, gen_seeds=(0, 1, 2), export_ply=True)
+        evaluation_seconds += summary["seconds"]
+        with open(output_dir / "evaluation_summary.jsonl", "a") as evaluation_file:
+            evaluation_file.write(json.dumps(summary) + "\n")
+        (output_dir / "runtime_summary.json").write_text(json.dumps({
+            "updates": step - start_step, "training_seconds": time.time() - t0 - evaluation_seconds,
+            "evaluation_seconds": evaluation_seconds, "wall_seconds": time.time() - t0}, indent=2))
     logger.info("Training done: %s", output_dir / "ckpt_final.pt")
 
 
@@ -1464,6 +1507,8 @@ def parse_args():
         "peak LR is what blew up Exp 0.",
     )
     p.add_argument("--weight_decay", type=float, default=0.01)
+    p.add_argument("--lr_warmup_steps", type=int, default=0)
+    p.add_argument("--lr_min_ratio", type=float, default=.01)
     p.add_argument("--max_grad_norm", type=float, default=1.0)
     p.add_argument("--lambda_rgb", type=float, default=10.0)
     p.add_argument(
@@ -1643,6 +1688,11 @@ def parse_args():
     )
     p.add_argument("--log_grad_norms", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--grad_log_interval", type=int, default=500)
+    p.add_argument("--joint_eval_interval", type=int, default=0,
+                   help="Evaluate all cached ordered pairs; one gen seed periodically, three at the end")
+    p.add_argument("--joint_eval_sample_steps", type=int, default=50)
+    p.add_argument("--save_latest_optimizer", action="store_true",
+                   help="Keep model-only snapshots plus one rotating full checkpoint and a full final checkpoint")
     p.add_argument(
         "--save_optimizer",
         action=argparse.BooleanOptionalAction,

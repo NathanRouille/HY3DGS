@@ -1,0 +1,38 @@
+#!/bin/bash
+#PBS -N bath10_joint
+#PBS -P gs_ccds_chuanxia.zheng
+#PBS -q gpu_as
+#PBS -l select=1:ncpus=12:ngpus=1:mem=250gb
+#PBS -l walltime=24:00:00
+#PBS -j oe
+
+set -eo pipefail
+PROJECT_ROOT=/projects_vol/gp_chuanxia.zheng/nathan/HY3DGS
+export EXPERIMENT="${EXPERIMENT:-coverage4}"
+export OUT="$PROJECT_ROOT/runs/joint_from_scratch/${EXPERIMENT}_${PBS_JOBID}"
+LOGDIR="$PROJECT_ROOT/runs/logs"
+mkdir -p "$LOGDIR" "$OUT"
+LOG="$LOGDIR/joint_from_scratch_${EXPERIMENT}_${PBS_JOBID}.log"
+exec >"$LOG" 2>&1
+echo "Logging to $LOG"
+module load anaconda/2025
+eval "$(/usr/local/anaconda2025/bin/conda shell.bash hook)"
+conda activate /projects_vol/gp_chuanxia.zheng/nathan/env_hy3dgs
+cd "$PROJECT_ROOT"
+export HF_HOME="$PROJECT_ROOT/runs/model_cache/huggingface"
+export TORCH_HOME="$PROJECT_ROOT/runs/model_cache/torch"
+export XDG_CACHE_HOME="$PROJECT_ROOT/runs/model_cache/xdg"
+export TMPDIR="$PROJECT_ROOT/runs/tmp/${PBS_JOBID}"
+mkdir -p "$HF_HOME" "$TORCH_HOME" "$XDG_CACHE_HOME" "$TMPDIR"
+git rev-parse HEAD > "$OUT/git_commit.txt"
+nvidia-smi --query-gpu=name,memory.total --format=csv
+python -c 'import json,os,socket,torch
+if not torch.cuda.is_available(): raise SystemExit("No CUDA GPU available")
+torch.cuda.init()
+count = torch._C._cuda_getDeviceCount()
+if count != 1: raise SystemExit(f"Expected one PBS-isolated GPU, found {count}")
+p = torch.cuda.get_device_properties(0)
+info = {"host":socket.gethostname(),"device_count":count,"name":p.name,"uuid":str(getattr(p,"uuid","unknown")),"memory_gib":p.total_memory/2**30,"CUDA_VISIBLE_DEVICES":os.environ.get("CUDA_VISIBLE_DEVICES")}
+print(json.dumps(info),flush=True)
+with open(os.path.join(os.environ["OUT"],"gpu.json"),"w") as f: json.dump(info,f,indent=2)'
+bash run_internscenes_joint_from_scratch.sh
