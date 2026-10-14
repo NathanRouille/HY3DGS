@@ -495,7 +495,7 @@ class CrossAttentionDecoder(nn.Module):
         return occ
 
 
-QUERY_SAMPLE_MODES = ("split_fps", "weighted_fps")
+QUERY_SAMPLE_MODES = ("split_fps", "weighted_fps", "balanced_patches")
 
 
 def fps(
@@ -634,6 +634,7 @@ class PointCrossAttentionEncoder(nn.Module):
         fps_sharp_beta: float = 0.2,
         fps_density_clip_low: float = 5.0,
         fps_density_clip_high: float = 95.0,
+        patch_descriptor_mode: str = "none",
     ):
 
         super().__init__()
@@ -661,6 +662,11 @@ class PointCrossAttentionEncoder(nn.Module):
         self.fps_density_clip_high = float(fps_density_clip_high)
         self.query_cache_max_items = 0  # Opt-in, bounded, not checkpoint state.
         self._weighted_query_cache = []
+        self.patch_descriptor_mode = patch_descriptor_mode
+        if patch_descriptor_mode not in ("none", "scale", "scale_cov"):
+            raise ValueError("Unknown patch descriptor mode")
+        if patch_descriptor_mode != "none" and mode != "balanced_patches":
+            raise ValueError("Patch descriptors require balanced_patches queries")
 
         if pc_sharpedge_size == 0:
             logger.info('PointCrossAttentionEncoder: pc_sharpedge_size=0, using pc_size for both splits')
@@ -679,6 +685,13 @@ class PointCrossAttentionEncoder(nn.Module):
         self.fourier_embedder = fourier_embedder
 
         self.input_proj = nn.Linear(self.fourier_embedder.out_dim + point_feats, width)
+        self.patch_proj = None
+        if patch_descriptor_mode != "none":
+            # Do not shift initialization of GE/decoder between descriptor
+            # ablations by consuming a new random draw for a zero-init layer.
+            with torch.random.fork_rng(devices=[]):
+                self.patch_proj = nn.Linear(1 if patch_descriptor_mode == "scale" else 7, width, bias=False)
+            nn.init.zeros_(self.patch_proj.weight)
         self.cross_attn = ResidualCrossAttentionBlock(
             width=width,
             heads=heads,
@@ -958,6 +971,7 @@ class PointCrossAttentionEncoder(nn.Module):
         self,
         pc: torch.FloatTensor,
         feats: Optional[torch.FloatTensor] = None,
+        *, patch_indices=None, query_indices=None,
     ):
         B, N, D = pc.shape
         num_pts = self.num_latents * self.downsample_ratio
@@ -976,7 +990,19 @@ class PointCrossAttentionEncoder(nn.Module):
         input_sharpedge_pc_size = pools["input_sharpedge_pc_size"]
         input_pc = torch.cat([input_random_pc, input_sharpedge_pc], dim=1)
 
-        if self.query_sample_mode == "weighted_fps":
+        descriptors = None
+        if self.query_sample_mode == "balanced_patches":
+            from ...pc_patches import patch_descriptors
+            if patch_indices is None or query_indices is None:
+                raise ValueError("balanced_patches requires offline patch_indices and query_indices")
+            if patch_indices.shape != (B, num_latents, N // num_latents) or query_indices.shape != (B, num_latents):
+                raise ValueError("Prepared patch budget differs from encoder input/query budget")
+            row = torch.arange(B, device=pc.device)[:, None]
+            query_pc = pc[row, query_indices.long()]
+            query_feats = feats[row, query_indices.long()] if feats is not None else None
+            query_random_pc, query_sharpedge_pc = query_pc, query_pc[:, :0]
+            descriptors = patch_descriptors(pc, patch_indices, self.patch_descriptor_mode)
+        elif self.query_sample_mode == "weighted_fps":
             query_pc, query_random_pc, query_sharpedge_pc, query_feats = self._weighted_fps_queries(
                 pools, num_latents=num_latents
             )
@@ -1014,15 +1040,17 @@ class PointCrossAttentionEncoder(nn.Module):
         if input_sharpedge_pc_size == 0:
             query_sharpedge_pc = torch.zeros(B, 1, D).to(pc.device)
             input_sharpedge_pc = torch.zeros(B, 1, D).to(pc.device)
-        return query.view(B, -1, query.shape[-1]), data.view(B, -1, data.shape[-1]), [query_pc, input_pc,
-                                                                                      query_random_pc, input_random_pc,
-                                                                                      query_sharpedge_pc,
-                                                                                      input_sharpedge_pc]
+        infos = [query_pc, input_pc, query_random_pc, input_random_pc,
+                 query_sharpedge_pc, input_sharpedge_pc]
+        if self.query_sample_mode == "balanced_patches":
+            infos.append(descriptors)
+        return query.view(B, -1, query.shape[-1]), data.view(B, -1, data.shape[-1]), infos
 
     def forward(
         self,
         pc,
         feats,
+        *, patch_indices=None, query_indices=None,
     ):
         """
 
@@ -1034,9 +1062,12 @@ class PointCrossAttentionEncoder(nn.Module):
 
         """
 
-        query, data, pc_infos = self.sample_points_and_latents(pc, feats)
+        query, data, pc_infos = self.sample_points_and_latents(pc, feats,
+            patch_indices=patch_indices, query_indices=query_indices)
 
         query = self.input_proj(query)
+        if self.patch_proj is not None:
+            query = query + self.patch_proj(pc_infos[6].to(query.dtype))
         query = query
         data = self.input_proj(data)
         data = data

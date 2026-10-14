@@ -106,7 +106,8 @@ def _sinkhorn_transport_cost(
 
     log_P = log_u.unsqueeze(2) + log_K + log_v.unsqueeze(1)
     P = torch.exp(log_P)
-    # sum_{ij} P_ij = 1; scale by N → mean cost per source point
+    # P has total mass one (already a mean transport cost). Preserve the
+    # historical N multiplier: this is a sum-scaled anchor objective.
     cost = (P * C).sum(dim=(1, 2)) * float(N)
     return cost, P
 
@@ -302,6 +303,9 @@ class PointCloudAELoss(nn.Module):
         lambda_local: float = 0.1,
         local_patch_count: int = 64,
         local_radius_scale: float = 0.5,
+        anchor_loss_mode: str = "sinkhorn",
+        lambda_matched_anchor: float = -1.,
+        assignment_backend: str = "auto",
     ):
         super().__init__()
         self.geometry_only = bool(geometry_only)
@@ -319,6 +323,14 @@ class PointCloudAELoss(nn.Module):
         self.chamfer_backend = chamfer_backend
         self.chamfer_chunk_size = int(chamfer_chunk_size)
         self.lambda_local = float(lambda_local)
+        self.anchor_loss_mode = anchor_loss_mode
+        self.lambda_matched_anchor = float(lambda_matched_anchor)
+        if anchor_loss_mode not in ("sinkhorn", "matched"):
+            raise ValueError("Unknown anchor loss mode")
+        from .pc_balanced_loss import BalancedPatchLoss
+        self.balanced_loss = BalancedPatchLoss(local_patch_count, assignment_backend) if anchor_loss_mode == "matched" else None
+        if anchor_loss_mode == "matched" and (lambda_anc != 0 or lambda_anc_cd != 0 or lambda_delta != 0 or local_loss != "ot"):
+            raise ValueError("Matched patches use local OT, zero legacy anchor/delta weights")
         from .pc_local_loss import LocalPatchLoss
         self.local_loss = LocalPatchLoss(local_loss, local_patch_count, local_radius_scale)
 
@@ -330,6 +342,9 @@ class PointCloudAELoss(nn.Module):
         gt_rgb: torch.Tensor,
         centers: Optional[torch.Tensor] = None,
         fps_xyz: Optional[torch.Tensor] = None,
+        patch_indices: Optional[torch.Tensor] = None,
+        query_indices: Optional[torch.Tensor] = None,
+        patch_keys=None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         # Unweighted direction means for logging; weighted sum enters the loss.
         pred_to_tgt, tgt_to_pred, idx_p2t, idx_t2p = nearest_neighbor_distances(
@@ -380,6 +395,45 @@ class PointCloudAELoss(nn.Module):
         }
 
         have_anchors = centers is not None and fps_xyz is not None
+        if self.balanced_loss is not None:
+            if not have_anchors or patch_indices is None:
+                raise ValueError("Matched patch loss requires anchors, queries and offline patches")
+            anc, local, stats = self.balanced_loss(pred_xyz, centers, gt_xyz, fps_xyz, patch_indices, patch_keys)
+            if self.lambda_matched_anchor < 0:
+                # Use a near-target probe. Cold-start many-to-one NN coverage
+                # gradients can be unusually large and must not set a permanent
+                # matched-loss weight. No live graph or model RNG is consumed.
+                with torch.enable_grad():
+                    with torch.no_grad():
+                        queries = fps_xyz.detach().float()
+                        spacing = torch.cdist(queries, queries)
+                        spacing.diagonal(dim1=-2, dim2=-1).fill_(float("inf"))
+                        amplitude = .1 * spacing.min(-1).values.clamp_min(1e-4)
+                        if queries.shape[1] == 1:
+                            amplitude = torch.full_like(amplitude, 1e-3)
+                        phase = torch.arange(queries.shape[1], device=queries.device).float() + 1
+                        direction = torch.stack([phase.sin(), phase.cos(), (.7 * phase + 2).sin()], -1)
+                        direction = direction / direction.norm(dim=-1, keepdim=True)
+                        probe_value = queries + amplitude[..., None] * direction
+                    probe = probe_value.requires_grad_(True)
+                    old = (.01 * sinkhorn_matching_loss(probe, fps_xyz.detach(),
+                            epsilon=self.sinkhorn_eps, n_iters=self.sinkhorn_iters)
+                           + 10 * chamfer_distance(probe, fps_xyz.detach())[0])
+                    old_grad = torch.autograd.grad(old, probe)[0]
+                    with torch.no_grad():
+                        plan = self.balanced_loss.anchor_solver(torch.cdist(probe.detach(), fps_xyz.detach()).square())
+                        target = fps_xyz.detach().gather(1, plan[..., None].expand(-1, -1, 3))
+                        new_grad = 2 * (probe.detach() - target) / (probe.shape[0] * probe.shape[1])
+                        ratio = old_grad.norm() / new_grad.norm().clamp_min(1e-12)
+                        if not torch.isfinite(ratio) or ratio <= 0:
+                            raise RuntimeError("Matched anchor gradient calibration failed")
+                        self.lambda_matched_anchor = float(ratio)
+                import logging
+                logging.getLogger(__name__).warning("Matched anchor weight calibrated to %.8g (near-target probe, old .01 Sinkhorn + 10 anchor CD gradient norm)", self.lambda_matched_anchor)
+            total = total + self.lambda_matched_anchor * anc + self.lambda_local * local
+            extras.update(stats)
+            extras.update(loss_anc=anc.detach(), _anc=anc, loss_local=local.detach(), _local=local,
+                          **{"matched/anchor_weight": pred_xyz.new_tensor(self.lambda_matched_anchor)})
         if have_anchors and self.lambda_anc > 0:
             anc = sinkhorn_matching_loss(
                 centers,
@@ -416,7 +470,7 @@ class PointCloudAELoss(nn.Module):
             extras["loss_delta"] = d_loss.detach()
             extras["_delta"] = d_loss
 
-        if have_anchors and self.local_loss.mode != "none" and self.lambda_local > 0:
+        if self.balanced_loss is None and have_anchors and self.local_loss.mode != "none" and self.lambda_local > 0:
             local, stats = self.local_loss(pred_xyz, centers, gt_xyz, fps_xyz)
             total = total + self.lambda_local * local
             extras["loss_local"] = local.detach()
@@ -436,6 +490,8 @@ class PointCloudAELoss(nn.Module):
             terms["rgb"] = self.lambda_rgb * extras["_rgb"]
         if self.lambda_anc > 0 and "_anc" in extras:
             terms["anc"] = self.lambda_anc * extras["_anc"]
+        if self.balanced_loss is not None:
+            terms["matched_anchor"] = self.lambda_matched_anchor * extras["_anc"]
         if self.lambda_anc_cd > 0 and "_anc_cd" in extras:
             terms["anc_cd"] = self.lambda_anc_cd * extras["_anc_cd"]
         if self.lambda_delta > 0 and "_delta" in extras:

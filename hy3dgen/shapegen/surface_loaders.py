@@ -685,13 +685,13 @@ def sharp_sample_pointcloud_with_color(
     return samples, normals, colors
 
 
-def _append_sharp_label_block(xyz_nrm_rgb: np.ndarray, label_value: float) -> np.ndarray:
+def _append_sharp_label_block(xyz_nrm_rgb: np.ndarray, label_value: float, dtype=np.float16) -> np.ndarray:
     """Insert sharp_label after normals: xyz | normals | label | rgb."""
     xyz = xyz_nrm_rgb[:, :3]
     nrm = xyz_nrm_rgb[:, 3:6]
     rgb = xyz_nrm_rgb[:, 6:9]
     label = np.full((xyz_nrm_rgb.shape[0], 1), label_value, dtype=xyz_nrm_rgb.dtype)
-    return np.concatenate([xyz, nrm, label, rgb], axis=1).astype(np.float16)
+    return np.concatenate([xyz, nrm, label, rgb], axis=1).astype(dtype)
 
 
 def load_surface_sharpedge_rgb(
@@ -701,6 +701,7 @@ def load_surface_sharpedge_rgb(
     seed: Optional[int] = None,
     include_sharp_label: bool = False,
     gobjaverse_meta: Optional[dict] = None,
+    sample_dtype=np.float16,
 ):
     """Build a colored surface tensor for ShapeGSAE.
 
@@ -730,16 +731,16 @@ def load_surface_sharpedge_rgb(
         pts, nrm, clr = _sample_parts_with_color(parts, uniform_counts)
         sharp_pts, sharp_nrm, sharp_clr = _sharp_sample_parts_with_color(parts, sharp_counts, rng)
 
-        surface = np.concatenate([pts, nrm, clr], axis=1).astype(np.float16)
+        surface = np.concatenate([pts, nrm, clr], axis=1).astype(sample_dtype)
 
         if len(sharp_pts) == 0:
             sharp_pts, sharp_nrm, sharp_clr = _sample_parts_with_color(parts, sharp_counts)
 
-        sharp_surface = np.concatenate([sharp_pts, sharp_nrm, sharp_clr], axis=1).astype(np.float16)
+        sharp_surface = np.concatenate([sharp_pts, sharp_nrm, sharp_clr], axis=1).astype(sample_dtype)
 
         if include_sharp_label:
-            surface = _append_sharp_label_block(surface, 0.0)
-            sharp_surface = _append_sharp_label_block(sharp_surface, 1.0)
+            surface = _append_sharp_label_block(surface, 0.0, sample_dtype)
+            sharp_surface = _append_sharp_label_block(sharp_surface, 1.0, sample_dtype)
 
         if surface.shape[0] < num_points:
             raise ValueError(

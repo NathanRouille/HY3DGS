@@ -130,9 +130,16 @@ class SurfaceRenderDataset(Dataset):
         filter_missing_views: bool = True,
         strict_load: bool = False,
         internscenes_pack: bool = False,
+        prepared_surface_root: Optional[str] = None,
+        patch_variant: str = "features",
     ):
         self.mesh_paths = mesh_paths
         self.internscenes_pack = bool(internscenes_pack)
+        self.prepared_surface_root = Path(prepared_surface_root) if prepared_surface_root else None
+        self.patch_variant = patch_variant
+        self._prepared_patch_cache = {}
+        if self.prepared_surface_root and not internscenes_pack:
+            raise ValueError("Prepared patches currently require an InternScenes pack")
         self.room_view_pools = (
             normalize_room_view_pools(room_view_pools) if room_view_pools else None
         )
@@ -190,6 +197,7 @@ class SurfaceRenderDataset(Dataset):
                 num_sharp_points=pc_sharpedge_size,
                 seed=seed,
                 include_sharp_label=include_sharp_label,
+                prepared_surface_root=prepared_surface_root,
             )
         else:
             self.surface_loader = RGBSharpEdgeSurfaceLoader(
@@ -496,6 +504,21 @@ class SurfaceRenderDataset(Dataset):
                 logger.warning("Skipping %s view %s: %s", path, view_idx, e)
         raise RuntimeError(f"All {n} samples failed to load")
 
+    def _patch_fields(self, path):
+        if not self.prepared_surface_root:
+            return {}
+        room = Path(path).name
+        if room not in self._prepared_patch_cache:
+            from .pc_patches import validate_partition
+            with np.load(self.prepared_surface_root / room / f"patches_{self.patch_variant}.npz") as data:
+                indices, queries = data["indices"].copy(), data["queries"].copy()
+            validate_partition(indices, queries,
+                               self.surface_loader.num_uniform_points + self.surface_loader.num_sharp_points)
+            self._prepared_patch_cache[room] = {
+                "patch_indices": torch.from_numpy(indices).long(),
+                "query_indices": torch.from_numpy(queries).long()}
+        return self._prepared_patch_cache[room]
+
     def _load_single_view_sample(self, path: str, view_idx: int) -> Dict:
         surface = self.surface_loader(
             path, gobjaverse_meta=self._surface_meta(path)
@@ -528,6 +551,7 @@ class SurfaceRenderDataset(Dataset):
             out["align_mode"] = self.align_mode
             if mz is not None:
                 out["gt_depth_mean_z"] = torch.tensor(mz, dtype=torch.float32)
+        out.update(self._patch_fields(path))
         return out
 
     def _load_multi_view_sample(self, path: str, view_ids: List[int]) -> Dict:
@@ -586,6 +610,7 @@ class SurfaceRenderDataset(Dataset):
             out["vggt_cache"] = joint_cached
         if mz is not None:
             out["gt_depth_mean_z"] = torch.tensor(mz, dtype=torch.float32)
+        out.update(self._patch_fields(path))
         return out
 
 
@@ -604,6 +629,11 @@ def collate_surface_render(batch: List[Dict]) -> Dict:
             dim=0,
         ),
     }
+    for key in ("patch_indices", "query_indices"):
+        if all(key in b for b in batch):
+            out[key] = torch.stack([b[key] for b in batch])
+        elif any(key in b for b in batch):
+            raise ValueError(f"Inconsistent {key} across batch")
     if "rgb" in batch[0]:
         out["rgb"] = torch.stack([b["rgb"] for b in batch], dim=0)
         out["depth"] = torch.stack([b["depth"] for b in batch], dim=0)
@@ -724,6 +754,8 @@ def build_internscenes_render_dataset(
     align_mode: str = "c_meanrms",
     filter_missing_views: bool = True,
     strict_load: bool = False,
+    prepared_surface_root: Optional[str] = None,
+    patch_variant: str = "features",
 ) -> SurfaceRenderDataset:
     """InternScenes bathroom pack (or any ``pack/rooms/<id>/`` layout)."""
     if align_mode not in ("cross", "fair_gobK", "c_meanrms"):
@@ -770,4 +802,6 @@ def build_internscenes_render_dataset(
         filter_missing_views=filter_missing_views,
         strict_load=strict_load,
         internscenes_pack=True,
+        prepared_surface_root=prepared_surface_root,
+        patch_variant=patch_variant,
     )

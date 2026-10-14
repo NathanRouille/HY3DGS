@@ -17,6 +17,8 @@ if __name__ == "__main__":
     for name in ("ckpt", "data_dir", "room_view_pools_json", "vggt_cache_root", "output_dir"):
         p.add_argument("--" + name, required=True)
     p.add_argument("--device", default="cuda")
+    p.add_argument("--prepared_surface_root", default=None)
+    p.add_argument("--patch_variant", choices=["geometry", "features"], default=None)
     p.add_argument("--sample_steps", type=int, default=50)
     p.add_argument("--gen_seeds", nargs="+", type=int, default=[0, 1, 2])
     args = p.parse_args()
@@ -28,6 +30,8 @@ if __name__ == "__main__":
         views_per_sample=2, view_sample_mode="random", seed=saved.get("seed", 0),
         align_mode="c_meanrms", strict_load=True, include_sharp_label=True,
         pc_size=saved["pc_size"], pc_sharpedge_size=saved["pc_sharpedge_size"],
+        prepared_surface_root=args.prepared_surface_root or saved.get("prepared_surface_root"),
+        patch_variant=args.patch_variant or saved.get("patch_variant", "features"),
         vggt_cache_root=args.vggt_cache_root, use_joint_vggt_cache=True)
     pooled = PooledSurfaceDataset(source, keep_context=True)
     evaluate_joint_pairs(model, builder, pooled.items, _build_weak_context,

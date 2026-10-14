@@ -161,11 +161,13 @@ class InternScenesNPSurfaceLoader:
         *,
         seed: Optional[int] = None,
         include_sharp_label: bool = False,
+        prepared_surface_root: Optional[str] = None,
     ):
         self.num_uniform_points = int(num_uniform_points)
         self.num_sharp_points = int(num_sharp_points)
         self.seed = seed
         self.include_sharp_label = bool(include_sharp_label)
+        self.prepared_surface_root = Path(prepared_surface_root) if prepared_surface_root else None
 
     def __call__(
         self,
@@ -178,7 +180,7 @@ class InternScenesNPSurfaceLoader:
         nu = self.num_uniform_points if num_uniform_points is None else num_uniform_points
         ns = self.num_sharp_points if num_sharp_points is None else num_sharp_points
         rd = Path(room_path)
-        data = np.load(rd / "surface.npz")
+        data = np.load((self.prepared_surface_root / rd.name if self.prepared_surface_root else rd) / "surface.npz")
         xyz = glb_yup_to_traj_zup(data["xyz"])
         nrm = glb_yup_to_traj_zup_normals(data["normals"])
         sharp = np.asarray(data["sharp"], dtype=np.float32).reshape(-1)
@@ -205,11 +207,18 @@ class InternScenesNPSurfaceLoader:
                 return rng.choice(idxs, size=n, replace=False)
             return rng.choice(idxs, size=n, replace=True)
 
-        si = _pick(sharp_idx, int(ns))
-        ui = _pick(uniform_idx, int(nu))
-        # Hunyuan / PointCrossAttentionEncoder layout: first pc_size = uniform,
-        # next pc_sharpedge_size = sharp. Do not shuffle — FPS splits by row range.
-        pick = np.concatenate([ui, si], axis=0)
+        if self.prepared_surface_root:
+            if len(xyz) != int(nu) + int(ns):
+                raise ValueError("Prepared surface size differs from configured input budget")
+            # Offline indices refer to this immutable row order. Never resample
+            # or seed this selection using a checkout-dependent room path.
+            pick = np.arange(len(xyz))
+        else:
+            si = _pick(sharp_idx, int(ns))
+            ui = _pick(uniform_idx, int(nu))
+            # Legacy uniform|sharp ordering. Prepared data retains its own
+            # immutable ordering and actual sharp-label channel.
+            pick = np.concatenate([ui, si], axis=0)
 
         xyz_p = xyz[pick]
         nrm_p = nrm[pick]

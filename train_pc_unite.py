@@ -367,6 +367,14 @@ def _log_visuals(
 
 
 def train(args):
+    if args.query_sample_mode == "balanced_patches":
+        if not args.prepared_surface_root or args.anchor_loss_mode != "matched":
+            raise ValueError("balanced_patches requires prepared_surface_root and matched anchor supervision")
+        registers = args.num_registers if args.num_registers is not None else args.num_latents
+        if registers != args.num_latents or args.pc_size + args.pc_sharpedge_size != registers * args.num_points_per_anchor:
+            raise ValueError("Balanced supervision requires input N = queries R × decoded K, and R registers")
+    elif args.anchor_loss_mode == "matched":
+        raise ValueError("Matched anchors require balanced_patches queries")
     if args.recon_only and args.freeze_recon:
         raise ValueError("--recon_only cannot be combined with --freeze_recon")
     if args.cache_fixed_surfaces and (not args.recon_only or args.tokenizer_use_weak_context):
@@ -432,6 +440,7 @@ def train(args):
         num_points_per_anchor=args.num_points_per_anchor,
         deterministic_encoder=args.deterministic_encoder,
         query_sample_mode=args.query_sample_mode,
+        patch_descriptor_mode=args.patch_descriptor_mode,
         fps_density_k=args.fps_density_k,
         fps_sharp_beta=args.fps_sharp_beta,
         fps_density_clip_low=args.fps_density_clip_low,
@@ -560,6 +569,9 @@ def train(args):
         lambda_local=args.lambda_local,
         local_patch_count=args.local_patch_count,
         local_radius_scale=args.local_radius_scale,
+        anchor_loss_mode=args.anchor_loss_mode,
+        lambda_matched_anchor=args.lambda_matched_anchor,
+        assignment_backend=args.assignment_backend,
     )
     criterion.local_loss.cache_max_items = args.local_target_cache_items
     logger.info(
@@ -639,6 +651,8 @@ def train(args):
             ]
         dataset = build_internscenes_render_dataset(
             str(data_path),
+            prepared_surface_root=args.prepared_surface_root,
+            patch_variant=args.patch_variant,
             split=str(getattr(args, "internscenes_split", "train")),
             room_ids=room_ids,
             max_items=args.max_items,
@@ -740,12 +754,17 @@ def train(args):
     ckpt_has_denoiser_pe = False
     if args.resume_ckpt:
         ckpt = torch.load(args.resume_ckpt, map_location="cpu", weights_only=False)
-        if args.recon_only:
+        if args.anchor_loss_mode == "matched":
+            saved_weight = (ckpt.get("args") or {}).get("lambda_matched_anchor", -1.)
+            if saved_weight > 0:
+                criterion.lambda_matched_anchor = args.lambda_matched_anchor = saved_weight
+        if args.recon_only or args.query_sample_mode == "balanced_patches":
             # Fail before optimization instead of silently loading another shape.
             critical = ("num_latents", "num_registers", "embed_dim", "width", "heads",
                         "num_ge_layers", "num_decoder_layers", "num_points_per_anchor",
                         "pc_size", "pc_sharpedge_size", "point_feats", "query_sample_mode",
-                        "geometry_only", "tokenizer_use_weak_context", "adaln_camera_cond")
+                        "geometry_only", "tokenizer_use_weak_context", "adaln_camera_cond",
+                        "patch_descriptor_mode", "patch_variant", "anchor_loss_mode")
             saved_args = ckpt.get("args") or {}
             for key in critical:
                 if key in saved_args and saved_args[key] != getattr(args, key):
@@ -758,7 +777,7 @@ def train(args):
         if ckpt_has_tokenizer_ge and model.tokenizer_ge is None:
             model.freeze_tokenizer_ge(replace=True)
         missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
-        if args.recon_only and (missing or unexpected):
+        if (args.recon_only or args.query_sample_mode == "balanced_patches") and (missing or unexpected):
             raise ValueError(f"Reconstruction resume requires an exact checkpoint: missing={missing}, unexpected={unexpected}")
         if not ckpt_has_denoiser_pe:
             model.sync_denoiser_pos_embed_from_tokenizer()
@@ -876,6 +895,8 @@ def train(args):
             batch = next(data_iter)
 
         surface = batch["surface"].to(device, non_blocking=True)
+        from hy3dgen.shapegen.pc_recon_runtime import patch_batch_kwargs
+        patch_kwargs = patch_batch_kwargs(batch, device)
         # Surflo global-cam keeps per-view cameras in the sequence; only the
         # legacy --adaln_camera_cond path removes them.
         include_cams_in_seq = not args.adaln_camera_cond
@@ -907,6 +928,7 @@ def train(args):
                 if log_recon:
                     z, fps_xyz, xyz, rgb, centers = model.forward_tokenizer(
                         surface,
+                        **patch_kwargs,
                         weak_context=weak_ctx,
                         weak_context_keep=ctx_keep,
                     )
@@ -922,6 +944,8 @@ def train(args):
                         gt_rgb,
                         centers=centers,
                         fps_xyz=fps_xyz.detach(),
+                        **patch_kwargs,
+                        patch_keys=batch["mesh_path"],
                     )
                     recon_loss = recon_loss.detach()
                     extras = {
@@ -931,6 +955,7 @@ def train(args):
                 else:
                     z, fps_xyz, _ = model.encode_tokenizer(
                         surface,
+                        **patch_kwargs,
                         weak_context=weak_ctx,
                         weak_context_keep=ctx_keep,
                     )
@@ -940,6 +965,7 @@ def train(args):
             with autocast_context(device, args.precision):
                 z, fps_xyz, xyz, rgb, centers = model.forward_tokenizer(
                     surface, weak_context=weak_ctx, weak_context_keep=ctx_keep,
+                    **patch_kwargs,
                 )
             # All reconstruction geometry, RGB matching and OT arithmetic stays FP32.
             xyz, centers, fps_xyz = xyz.float(), centers.float(), fps_xyz.float()
@@ -950,8 +976,13 @@ def train(args):
                 include_rgb=not args.geometry_only,
             )
             recon_loss, extras = criterion(
-                xyz, rgb, gt_xyz, gt_rgb, centers=centers, fps_xyz=fps_xyz.detach()
+                xyz, rgb, gt_xyz, gt_rgb, centers=centers, fps_xyz=fps_xyz.detach(),
+                **patch_kwargs, patch_keys=batch["mesh_path"],
             )
+            if args.anchor_loss_mode == "matched" and args.lambda_matched_anchor != criterion.lambda_matched_anchor:
+                args.lambda_matched_anchor = criterion.lambda_matched_anchor
+                with open(output_dir / "args.json", "w") as f:
+                    json.dump(vars(args), f, indent=2, default=str)
             if args.recon_only and args.local_loss != "none" and args.lambda_local > 0 and step == start_step:
                 used = float(extras.get("local/used_patches", 0.0))
                 if used < 8:
@@ -1077,7 +1108,8 @@ def train(args):
                             loss_rgb=float(extras["loss_rgb"]),
                             loss_anc=float(extras["loss_anc"]),
                             lambda_rgb=args.lambda_rgb,
-                            lambda_anc=args.lambda_anc,
+                            lambda_anc=(criterion.lambda_matched_anchor
+                                        if criterion.balanced_loss is not None else args.lambda_anc),
                             loss_anc_cd=float(extras.get("loss_anc_cd", 0.0)),
                             lambda_anc_cd=args.lambda_anc_cd,
                             loss_delta=float(extras.get("loss_delta", 0.0)),
@@ -1112,6 +1144,9 @@ def train(args):
                     for k, v in grad_norms.items():
                         log_dict[f"grad_norm/{k}"] = v
                 log_dict["runtime/precision"] = args.precision
+                log_dict.update({k: float(v) for k, v in extras.items() if k.startswith("matched/")})
+                if args.anchor_loss_mode == "matched":
+                    log_dict["train/anc_weighted"] = criterion.lambda_matched_anchor * float(extras["loss_anc"])
                 log_dict["runtime/recon_only"] = args.recon_only
                 log_dict["runtime/seconds_per_step"] = (time.time() - t0 - evaluation_seconds) / max(step - start_step, 1)
                 log_dict["runtime/evaluation_seconds"] = evaluation_seconds
@@ -1204,7 +1239,10 @@ def train(args):
             evaluation_file.write(json.dumps(summary) + "\n")
         (output_dir / "runtime_summary.json").write_text(json.dumps({
             "updates": step - start_step, "training_seconds": time.time() - t0 - evaluation_seconds,
-            "evaluation_seconds": evaluation_seconds, "wall_seconds": time.time() - t0}, indent=2))
+            "evaluation_seconds": evaluation_seconds, "wall_seconds": time.time() - t0,
+            "assignment_backends": ({"anchors": criterion.balanced_loss.anchor_solver.evidence,
+                                     "locals": criterion.balanced_loss.point_solver.evidence}
+                                    if criterion.balanced_loss is not None else None)}, indent=2))
     logger.info("Training done: %s", output_dir / "ckpt_final.pt")
 
 
@@ -1334,7 +1372,7 @@ def parse_args():
         "--query_sample_mode",
         type=str,
         default="split_fps",
-        choices=["split_fps", "weighted_fps"],
+        choices=["split_fps", "weighted_fps", "balanced_patches"],
         help=(
             "Encoder query selection. 'split_fps' (default): Hunyuan independent "
             "FPS on uniform|sharp pools. 'weighted_fps': single density-weighted "
@@ -1699,6 +1737,12 @@ def parse_args():
         default=True,
         help="Optimizer state roughly triples checkpoint size; disable for sweeps.",
     )
+    p.add_argument("--prepared_surface_root", default=None, help="Immutable prepared distinct surfaces/patches; original render pack is unchanged")
+    p.add_argument("--patch_variant", choices=["geometry", "features"], default="features")
+    p.add_argument("--patch_descriptor_mode", choices=["none", "scale", "scale_cov"], default="none")
+    p.add_argument("--anchor_loss_mode", choices=["sinkhorn", "matched"], default="sinkhorn")
+    p.add_argument("--lambda_matched_anchor", type=float, default=-1., help="Mean matched anchor squared distance; -1 calibrates a near-target gradient probe against old .01 Sinkhorn + 10 anchor CD")
+    p.add_argument("--assignment_backend", choices=["auto", "scipy", "gpu"], default="auto")
     p.add_argument("--resume_ckpt", type=str, default=None)
     p.add_argument(
         "--reset_optimizer_on_resume",

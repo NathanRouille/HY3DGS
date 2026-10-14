@@ -233,6 +233,7 @@ def load_unite_model(ckpt_path: str, device: torch.device, overrides: Optional[D
         num_points_per_anchor=int(args.get("num_points_per_anchor", 8)),
         deterministic_encoder=bool(args.get("deterministic_encoder", True)),
         query_sample_mode=str(args.get("query_sample_mode", "split_fps")),
+        patch_descriptor_mode=str(args.get("patch_descriptor_mode", "none")),
         fps_density_k=int(args.get("fps_density_k", 16)),
         fps_sharp_beta=float(args.get("fps_sharp_beta", 0.2)),
         fps_density_clip_low=float(args.get("fps_density_clip_low", 5.0)),
@@ -421,6 +422,8 @@ def evaluate(args):
             ]
         dataset = build_internscenes_render_dataset(
             str(data_path),
+            prepared_surface_root=train_args.get("prepared_surface_root"),
+            patch_variant=train_args.get("patch_variant", "features"),
             split=str(
                 getattr(args, "internscenes_split", None)
                 or train_args.get("internscenes_split", "train")
@@ -546,6 +549,7 @@ def evaluate(args):
         )
         z, fps_xyz = model.encode(
             surface,
+            **{k: batch[k].to(device) for k in ("patch_indices", "query_indices") if k in batch},
             weak_context=weak,
             weak_context_keep=keep,
             register_noise=register_noise,

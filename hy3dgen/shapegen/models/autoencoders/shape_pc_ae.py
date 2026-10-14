@@ -1,6 +1,6 @@
 """UNITE-style Shape Point-Cloud Autoencoder (ShapePCAE).
 
-FPS cross-attn local tokens + noise registers through a Generative Encoder,
+FPS or balanced-patch cross-attn tokens + noise registers through a Generative Encoder,
 64-d bottleneck (no KL), anchor-aligned colored point decoder.
 
 Parallel to ShapeGSAE — does not modify the 3DGS path.
@@ -72,6 +72,7 @@ class ShapePCAE(nn.Module):
         fps_sharp_beta: float = 0.2,
         fps_density_clip_low: float = 5.0,
         fps_density_clip_high: float = 95.0,
+        patch_descriptor_mode: str = "none",
         ckpt_path=None,
     ):
         super().__init__()
@@ -87,6 +88,7 @@ class ShapePCAE(nn.Module):
         self.fps_sharp_beta = float(fps_sharp_beta)
         self.fps_density_clip_low = float(fps_density_clip_low)
         self.fps_density_clip_high = float(fps_density_clip_high)
+        self.patch_descriptor_mode = patch_descriptor_mode
         # Channels the decoder emits per point: xyz, plus rgb unless geometry-only.
         self.point_out_channels = 3 if self.geometry_only else 6
         if register_noise_mode not in REGISTER_NOISE_MODES:
@@ -125,6 +127,7 @@ class ShapePCAE(nn.Module):
             fps_sharp_beta=self.fps_sharp_beta,
             fps_density_clip_low=self.fps_density_clip_low,
             fps_density_clip_high=self.fps_density_clip_high,
+            patch_descriptor_mode=patch_descriptor_mode,
         )
 
         ge_ctx = self.num_registers + self.num_latents
@@ -252,6 +255,8 @@ class ShapePCAE(nn.Module):
         surface: torch.FloatTensor,
         *,
         register_noise: Optional[torch.Tensor] = None,
+        patch_indices=None,
+        query_indices=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Encode surface to register latents.
 
@@ -260,7 +265,8 @@ class ShapePCAE(nn.Module):
             fps_xyz: [B, L, 3] FPS query positions (for anchor aux loss)
         """
         pc, feats = self.encoder_inputs(surface)
-        locals_tok, pc_infos = self.encoder(pc, feats)
+        locals_tok, pc_infos = (self.encoder(pc, feats, patch_indices=patch_indices, query_indices=query_indices)
+                               if self.query_sample_mode == "balanced_patches" else self.encoder(pc, feats))
         fps_xyz = pc_infos[0]
 
         register_noise = self.resolve_register_noise(
@@ -330,8 +336,11 @@ class ShapePCAE(nn.Module):
         surface: torch.FloatTensor,
         *,
         register_noise: Optional[torch.Tensor] = None,
+        patch_indices=None,
+        query_indices=None,
     ):
-        latents, fps_xyz = self.encode(surface, register_noise=register_noise)
+        latents, fps_xyz = self.encode(surface, register_noise=register_noise,
+                                      patch_indices=patch_indices, query_indices=query_indices)
         xyz, rgb, centers = self.decode(latents)
         return xyz, rgb, centers, fps_xyz, latents
 

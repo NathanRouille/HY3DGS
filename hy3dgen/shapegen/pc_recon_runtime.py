@@ -14,7 +14,7 @@ class FixedSurfaceDataset(Dataset):
             raise ValueError("Surface caching requires a fixed seed and first-view sampling")
         self.mesh_paths = source.mesh_paths
         self.samples = source.samples
-        keys = ("surface", "mesh_path", "surface_frame", "view_idx", "view_indices")
+        keys = ("surface", "mesh_path", "surface_frame", "view_idx", "view_indices", "patch_indices", "query_indices")
         self.items = [{k: v for k, v in source[i].items() if k in keys}
                       for i in range(len(source))]
 
@@ -41,7 +41,7 @@ class PooledSurfaceDataset(Dataset):
         self.source = source
         self.mesh_paths, self.samples = source.mesh_paths, source.samples
         self.items = {}
-        keys = {"surface", "mesh_path", "surface_frame", "view_idx", "view_indices", "align_mode"}
+        keys = {"surface", "mesh_path", "surface_frame", "view_idx", "view_indices", "align_mode", "patch_indices", "query_indices"}
         if keep_context:
             keys.add("vggt_cache")
         for path, _ in self.samples:
@@ -60,6 +60,11 @@ class PooledSurfaceDataset(Dataset):
         views = tuple(self.source._choose_views(path, index))
         return {k: v.clone() if torch.is_tensor(v) else v
                 for k, v in self.items[path, views].items()}
+
+
+def patch_batch_kwargs(batch, device):
+    return {k: batch[k].to(device, non_blocking=True)
+            for k in ("patch_indices", "query_indices") if k in batch}
 
 
 def autocast_context(device, precision):

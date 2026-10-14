@@ -39,7 +39,8 @@ def evaluate_joint_pairs(model, builder, items, build_context, *, output_dir,
             builder.eval()
             for (_, pair), item in items.items():
                 surface = item["surface"][None].to(device)
-                z, fps, xyz, rgb, anchors = model.forward_tokenizer(surface, representation_phase=False)
+                patch_kwargs = {k: item[k][None].to(device) for k in ("patch_indices", "query_indices") if k in item}
+                z, fps, xyz, rgb, anchors = model.forward_tokenizer(surface, representation_phase=False, **patch_kwargs)
                 gt, gt_rgb = ShapePCAE.surface_gt_points(surface, include_sharp_label=True)
                 room = Path(item["mesh_path"]).name
                 score, dp, dq = _metrics(xyz, rgb, gt, gt_rgb)
@@ -48,6 +49,11 @@ def evaluate_joint_pairs(model, builder, items, build_context, *, output_dir,
                 obj = out / room
                 if primary:
                     obj.mkdir(exist_ok=True)
+                    patch_metrics = {}
+                    if "patch_indices" in item:
+                        from .pc_patch_metrics import owned_patch_metrics
+                        patch_metrics["recon"] = owned_patch_metrics(xyz[0], anchors[0], gt[0],
+                            item["patch_indices"], item["query_indices"])
                     for name, points, colors in (("gt", gt, gt_rgb), ("recon", xyz, rgb)):
                         export_xyz_pointcloud_ply(points[0], obj / f"{name}.ply", colors=colors[0])
                     export_xyz_pointcloud_ply(fps[0], obj / "fps.ply", rgb=(0, 255, 255))
@@ -67,10 +73,14 @@ def evaluate_joint_pairs(model, builder, items, build_context, *, output_dir,
                     generated = model.sample_latents(weak, batch_size=1, num_steps=sample_steps,
                         guidance_scale=1, noise=noise, context_keep=keep, cam_cond=cam,
                         device=device, dtype=z.dtype, renorm_output=False)
-                    gx, gc, _ = model.decode(generated, representation_phase=False)
+                    gx, gc, ga = model.decode(generated, representation_phase=False)
                     record["generation"].append({"seed": seed, **_metrics(gx, gc, gt, gt_rgb)[0]})
                     if primary and seed == gen_seeds[0]:
                         export_xyz_pointcloud_ply(gx[0], obj / "gen_cfg1.ply", colors=gc[0])
+                        if "patch_indices" in item:
+                            patch_metrics["gen_seed0"] = owned_patch_metrics(gx[0], ga[0], gt[0],
+                                item["patch_indices"], item["query_indices"])
+                            (obj / "owned_patch_metrics.json").write_text(json.dumps(patch_metrics, indent=2))
                 records.append(record)
                 exported.add(room)
                 if len(records) % 12 == 0:

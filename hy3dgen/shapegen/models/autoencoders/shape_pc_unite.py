@@ -304,10 +304,13 @@ class ShapePCUnite(ShapePCAE):
         register_noise: Optional[torch.Tensor] = None,
         weak_context: Optional[torch.Tensor] = None,
         weak_context_keep: Optional[torch.Tensor] = None,
+        patch_indices=None,
+        query_indices=None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Strong-context tokenizer pass → normalized latents."""
         pc, feats = self.encoder_inputs(surface)
-        locals_tok, pc_infos = self.encoder(pc, feats)
+        locals_tok, pc_infos = (self.encoder(pc, feats, patch_indices=patch_indices, query_indices=query_indices)
+                               if self.query_sample_mode == "balanced_patches" else self.encoder(pc, feats))
         fps_xyz = pc_infos[0]
 
         b = surface.shape[0]
@@ -371,12 +374,16 @@ class ShapePCUnite(ShapePCAE):
         register_noise=None,
         weak_context: Optional[torch.Tensor] = None,
         weak_context_keep: Optional[torch.Tensor] = None,
+        patch_indices=None,
+        query_indices=None,
     ):
         z, fps_xyz, _ = self.encode_tokenizer(
             surface,
             register_noise=register_noise,
             weak_context=weak_context,
             weak_context_keep=weak_context_keep,
+            patch_indices=patch_indices,
+            query_indices=query_indices,
         )
         return z, fps_xyz
 
@@ -562,6 +569,8 @@ class ShapePCUnite(ShapePCAE):
         representation_phase: Optional[bool] = None,
         weak_context: Optional[torch.Tensor] = None,
         weak_context_keep: Optional[torch.Tensor] = None,
+        patch_indices=None,
+        query_indices=None,
     ) -> Tuple[torch.Tensor, Dict]:
         """Encode + decode surface.
 
@@ -575,6 +584,8 @@ class ShapePCUnite(ShapePCAE):
             surface,
             weak_context=weak_context,
             weak_context_keep=weak_context_keep,
+            patch_indices=patch_indices,
+            query_indices=query_indices,
         )
         xyz, rgb, centers = self.decode(z, representation_phase=representation_phase)
         return z, fps_xyz, xyz, rgb, centers
@@ -586,11 +597,15 @@ class ShapePCUnite(ShapePCAE):
         context_keep: Optional[torch.Tensor] = None,
         cam_cond: Optional[torch.Tensor] = None,
         raw_camera_tokens: Optional[torch.Tensor] = None,
+        patch_indices=None,
+        query_indices=None,
     ) -> Dict[str, torch.Tensor]:
         z, fps_xyz, xyz, rgb, centers = self.forward_tokenizer(
             surface,
             weak_context=weak_context,
             weak_context_keep=context_keep,
+            patch_indices=patch_indices,
+            query_indices=query_indices,
         )
         out = {
             "z": z,
